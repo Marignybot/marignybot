@@ -77,6 +77,28 @@ async def get_crypto_news() -> list:
         return []
 
 
+async def get_reddit_top() -> list:
+    """Récupère les 3 posts les plus populaires sur r/CryptoCurrency (24h)"""
+    url = "https://www.reddit.com/r/CryptoCurrency/top.json?limit=3&t=day"
+    headers = {"User-Agent": "MarignyCryptoBot/1.0"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json()
+                posts = data.get("data", {}).get("children", [])
+                return [
+                    {
+                        "title": p["data"].get("title", ""),
+                        "url": f"https://reddit.com{p['data'].get('permalink', '')}",
+                        "score": p["data"].get("score", 0)
+                    }
+                    for p in posts
+                ]
+    except Exception as e:
+        logger.error(f"Erreur Reddit: {e}")
+        return []
+
+
 async def get_hyperliquid_positions() -> list:
     """Récupère les positions ouvertes sur Hyperliquid"""
     url = "https://api.hyperliquid.xyz/info"
@@ -178,14 +200,10 @@ def format_positions(positions: list, balance: dict) -> str:
     return "\n".join(lines)
 
 
-def format_daily_summary(prices: dict, positions: list, balance: dict, news: list) -> str:
+def format_daily_summary(news: list, reddit: list) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
-        f"🌅 *Résumé quotidien — {now}*\n",
-        "━━━━━━━━━━━━━━━━━━━━",
-        format_prices(prices),
-        "━━━━━━━━━━━━━━━━━━━━",
-        format_positions(positions, balance),
+        f"🌅 *Résumé Crypto — {now}*\n",
         "━━━━━━━━━━━━━━━━━━━━",
         "📰 *3 Actus Crypto du Jour*\n",
     ]
@@ -194,6 +212,15 @@ def format_daily_summary(prices: dict, positions: list, balance: dict, news: lis
             lines.append(f"{i}. [{n['title']}]({n['url']})\n")
     else:
         lines.append("_Actualités indisponibles pour le moment._\n")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔥 *Top 3 Reddit Crypto (24h)*\n")
+    if reddit:
+        for i, r in enumerate(reddit, 1):
+            lines.append(f"{i}. [{r['title']}]({r['url']})\n   👍 {r['score']} upvotes\n")
+    else:
+        lines.append("_Reddit indisponible pour le moment._\n")
+
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("_Bonne journée depuis Vallauris! 🌴_")
     return "\n".join(lines)
@@ -284,13 +311,11 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Préparation du résumé...", parse_mode="Markdown")
-    prices, positions, balance, news = await asyncio.gather(
-        get_crypto_prices(),
-        get_hyperliquid_positions(),
-        get_hyperliquid_balance(),
-        get_crypto_news()
+    news, reddit = await asyncio.gather(
+        get_crypto_news(),
+        get_reddit_top()
     )
-    msg = format_daily_summary(prices, positions, balance, news)
+    msg = format_daily_summary(news, reddit)
     await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 
@@ -331,13 +356,11 @@ async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
 
 async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
     """Envoie le résumé quotidien automatiquement"""
-    prices, positions, balance, news = await asyncio.gather(
-        get_crypto_prices(),
-        get_hyperliquid_positions(),
-        get_hyperliquid_balance(),
-        get_crypto_news()
+    news, reddit = await asyncio.gather(
+        get_crypto_news(),
+        get_reddit_top()
     )
-    msg = format_daily_summary(prices, positions, balance, news)
+    msg = format_daily_summary(news, reddit)
     await context.bot.send_message(
         chat_id=context.job.chat_id,
         text=msg,
