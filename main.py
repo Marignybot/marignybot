@@ -121,7 +121,7 @@ async def get_crypto_trending() -> list:
 
 
 async def get_hyperliquid_positions() -> list:
-    """Récupère les positions ouvertes sur Hyperliquid"""
+    """Récupère les positions ouvertes sur Hyperliquid (perp classique)"""
     url = "https://api.hyperliquid.xyz/info"
     payload = {
         "type": "clearinghouseState",
@@ -135,6 +135,31 @@ async def get_hyperliquid_positions() -> list:
     except Exception as e:
         logger.error(f"Erreur Hyperliquid: {e}")
         return []
+
+
+async def get_hyena_positions() -> tuple:
+    """Récupère les positions ouvertes sur HyENA (dex: hyna)"""
+    url = "https://api.hyperliquid.xyz/info"
+    payload = {
+        "type": "clearinghouseState",
+        "user": HYPERLIQUID_ADDRESS,
+        "dex": "hyna"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json()
+                positions = data.get("assetPositions", [])
+                margin = data.get("marginSummary", {})
+                balance = {
+                    "accountValue": float(margin.get("accountValue", 0)),
+                    "totalMarginUsed": float(margin.get("totalMarginUsed", 0)),
+                    "totalUnrealizedPnl": float(margin.get("totalUnrealizedPnl", 0)),
+                }
+                return positions, balance
+    except Exception as e:
+        logger.error(f"Erreur HyENA: {e}")
+        return [], {}
 
 
 async def get_hyperliquid_balance() -> dict:
@@ -300,6 +325,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Voici les commandes disponibles:\n\n"
         "📊 /prix — Prix en temps réel\n"
         "📈 /positions — Tes positions Hyperliquid\n"
+        "🐾 /hyena — Tes positions HyENA\n"
         "🎯 /setup — Analyse de setups de trade\n"
         "📋 /resume — Résumé complet du marché\n"
         "ℹ️ /aide — Affiche ce message\n\n"
@@ -325,7 +351,49 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def format_hyena_positions(positions: list, balance: dict) -> str:
+    lines = ["🐾 *Positions HyENA*\n"]
+
+    if balance and balance.get("accountValue", 0) > 0:
+        pnl = balance.get("totalUnrealizedPnl", 0)
+        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        lines.append(
+            f"💼 *Compte HyENA*\n"
+            f"   Valeur totale: ${balance.get('accountValue', 0):,.2f}\n"
+            f"   Marge utilisée: ${balance.get('totalMarginUsed', 0):,.2f}\n"
+            f"   {pnl_emoji} PnL non réalisé: ${pnl:+,.2f}\n"
+        )
+
+    open_positions = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
+
+    if not open_positions:
+        lines.append("_Aucune position ouverte sur HyENA._")
+    else:
+        lines.append(f"*{len(open_positions)} position(s) ouverte(s):*\n")
+        for p in open_positions:
+            pos = p.get("position", {})
+            coin = pos.get("coin", "?").replace("hyna:", "")
+            size = float(pos.get("szi", 0))
+            entry = float(pos.get("entryPx", 0))
+            upnl = float(pos.get("unrealizedPnl", 0))
+            direction = "LONG 🟢" if size > 0 else "SHORT 🔴"
+            upnl_emoji = "✅" if upnl >= 0 else "❌"
+            lines.append(
+                f"*{coin}* — {direction}\n"
+                f"   Taille: {abs(size)}\n"
+                f"   Entrée: ${entry:,.4f}\n"
+                f"   {upnl_emoji} PnL: ${upnl:+,.2f}\n"
+            )
+
+    lines.append(f"_Mis à jour: {datetime.now().strftime('%H:%M:%S')}_")
+    return "\n".join(lines)
+
+
+async def cmd_hyena(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Connexion à HyENA...", parse_mode="Markdown")
+    positions, balance = await get_hyena_positions()
+    msg = format_hyena_positions(positions, balance)
+    await update.message.reply_text(msg, parse_mode="Markdown")
     await update.message.reply_text("⏳ Analyse en cours...", parse_mode="Markdown")
     prices = await get_crypto_prices()
     msg = analyze_setup(prices)
@@ -447,6 +515,7 @@ def main():
     app.add_handler(CommandHandler("aide", cmd_aide))
     app.add_handler(CommandHandler("prix", cmd_prix))
     app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("hyena", cmd_hyena))
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("alertes", cmd_activer_alertes))
