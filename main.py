@@ -27,6 +27,7 @@ WATCHED_TOKENS = {
 ALERT_THRESHOLD_PERCENT = 5.0
 DAILY_SUMMARY_HOUR = 8
 DAILY_SUMMARY_MIN = 0
+AUTHORIZED_USER_ID = 1429797974
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -35,6 +36,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 last_prices = {}
+
+def is_authorized(update) -> bool:
+    return update.effective_user.id == AUTHORIZED_USER_ID
+
 
 async def get_crypto_prices() -> dict:
     ids = ",".join(WATCHED_TOKENS.keys())
@@ -248,6 +253,7 @@ def analyze_setup(prices: dict) -> str:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     msg = (
         "👋 *Bienvenue sur MarignyCryptoBot!*\n\n"
         "Voici les commandes disponibles:\n\n"
@@ -262,6 +268,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     await update.message.reply_text("⏳ Récupération des prix...", parse_mode="Markdown")
     prices = await get_crypto_prices()
     msg = format_prices(prices)
@@ -269,6 +276,7 @@ async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     await update.message.reply_text("⏳ Connexion à Hyperliquid...", parse_mode="Markdown")
     positions, balance = await asyncio.gather(
         get_hyperliquid_positions(),
@@ -279,6 +287,7 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     await update.message.reply_text("⏳ Analyse en cours...", parse_mode="Markdown")
     prices = await get_crypto_prices()
     msg = analyze_setup(prices)
@@ -286,6 +295,7 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     await update.message.reply_text("⏳ Préparation du résumé...", parse_mode="Markdown")
     news, trending = await asyncio.gather(
         get_crypto_news(),
@@ -296,6 +306,7 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     await cmd_start(update, context)
 
 
@@ -340,6 +351,7 @@ async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     chat_id = update.effective_chat.id
     job_queue = context.job_queue
     current_jobs = job_queue.get_jobs_by_name(f"alert_{chat_id}")
@@ -368,6 +380,7 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
     chat_id = update.effective_chat.id
     for name in [f"alert_{chat_id}", f"daily_{chat_id}"]:
         for job in context.job_queue.get_jobs_by_name(name):
