@@ -6,52 +6,37 @@ Auteur: Pour Tabac Le Marigny, Vallauris
 
 import asyncio
 import logging
-import json
+import re
 from datetime import datetime, time
 import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ============================================================
-# CONFIGURATION — MODIFIE CES VALEURS
+# CONFIGURATION
 # ============================================================
-TELEGRAM_TOKEN = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"  # Token Marignybot
+TELEGRAM_TOKEN = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"
 HYPERLIQUID_ADDRESS = "0x6e89b986FBB4B985AcCC9B3CfEE4c7B5301D9a5C"
 
-# Tokens à surveiller (symboles CoinGecko)
 WATCHED_TOKENS = {
     "bitcoin": "BTC",
     "ethereum": "ETH",
     "hyperliquid": "HYPE",
 }
 
-# Alertes de prix — seuil en % pour déclencher une alerte
-ALERT_THRESHOLD_PERCENT = 5.0  # Alerte si variation > 5% en 1h
-
-# Heure du résumé quotidien (format 24h)
-DAILY_SUMMARY_HOUR = 8   # 8h00 du matin
+ALERT_THRESHOLD_PERCENT = 5.0
+DAILY_SUMMARY_HOUR = 8
 DAILY_SUMMARY_MIN = 0
 
-# ============================================================
-# SETUP LOGGING
-# ============================================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# STOCKAGE TEMPORAIRE DES PRIX (pour calcul variation)
-# ============================================================
 last_prices = {}
 
-# ============================================================
-# FONCTIONS API
-# ============================================================
-
 async def get_crypto_prices() -> dict:
-    """Récupère les prix en temps réel via CoinGecko"""
     ids = ",".join(WATCHED_TOKENS.keys())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd,eur&include_24hr_change=true"
     headers = {
@@ -61,23 +46,19 @@ async def get_crypto_prices() -> dict:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                data = await resp.json()
-                return data
+                return await resp.json()
     except Exception as e:
         logger.error(f"Erreur CoinGecko: {e}")
         return {}
 
 
 async def get_crypto_news() -> list:
-    """Récupère les dernières actus crypto via CoinDesk RSS"""
     url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; MarignyCryptoBot/1.0)"}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 text = await resp.text()
-                import re
-                # Extrait les blocs <item>
                 items_raw = re.findall(r'<item>(.*?)</item>', text, re.DOTALL)
                 results = []
                 for item in items_raw[:3]:
@@ -90,12 +71,11 @@ async def get_crypto_news() -> list:
                         })
                 return results
     except Exception as e:
-        logger.error(f"Erreur news CoinDesk: {e}")
+        logger.error(f"Erreur news: {e}")
         return []
 
 
 async def get_crypto_trending() -> list:
-    """Récupère les tokens trending via CoinGecko"""
     url = "https://api.coingecko.com/api/v3/search/trending"
     headers = {
         "Accept": "application/json",
@@ -121,12 +101,8 @@ async def get_crypto_trending() -> list:
 
 
 async def get_hyperliquid_positions() -> list:
-    """Récupère les positions ouvertes sur Hyperliquid (perp classique)"""
     url = "https://api.hyperliquid.xyz/info"
-    payload = {
-        "type": "clearinghouseState",
-        "user": HYPERLIQUID_ADDRESS
-    }
+    payload = {"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -137,38 +113,9 @@ async def get_hyperliquid_positions() -> list:
         return []
 
 
-async def get_hyena_positions() -> tuple:
-    """Récupère les positions ouvertes sur HyENA (dex: hyna)"""
-    url = "https://api.hyperliquid.xyz/info"
-    payload = {
-        "type": "clearinghouseState",
-        "user": HYPERLIQUID_ADDRESS,
-        "dex": "hyna"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-                positions = data.get("assetPositions", [])
-                margin = data.get("marginSummary", {})
-                balance = {
-                    "accountValue": float(margin.get("accountValue", 0)),
-                    "totalMarginUsed": float(margin.get("totalMarginUsed", 0)),
-                    "totalUnrealizedPnl": float(margin.get("totalUnrealizedPnl", 0)),
-                }
-                return positions, balance
-    except Exception as e:
-        logger.error(f"Erreur HyENA: {e}")
-        return [], {}
-
-
 async def get_hyperliquid_balance() -> dict:
-    """Récupère le solde du compte Hyperliquid"""
     url = "https://api.hyperliquid.xyz/info"
-    payload = {
-        "type": "clearinghouseState",
-        "user": HYPERLIQUID_ADDRESS
-    }
+    payload = {"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -183,14 +130,10 @@ async def get_hyperliquid_balance() -> dict:
         logger.error(f"Erreur Hyperliquid balance: {e}")
         return {}
 
-# ============================================================
-# FORMATAGE DES MESSAGES
-# ============================================================
 
 def format_prices(prices: dict) -> str:
     if not prices:
         return "❌ Impossible de récupérer les prix."
-    
     lines = ["📊 *Prix en temps réel*\n"]
     for coin_id, symbol in WATCHED_TOKENS.items():
         if coin_id in prices:
@@ -210,7 +153,6 @@ def format_prices(prices: dict) -> str:
 
 def format_positions(positions: list, balance: dict) -> str:
     lines = ["📈 *Positions Hyperliquid*\n"]
-    
     if balance:
         pnl = balance.get("totalUnrealizedPnl", 0)
         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
@@ -220,9 +162,7 @@ def format_positions(positions: list, balance: dict) -> str:
             f"   Marge utilisée: ${balance.get('totalMarginUsed', 0):,.2f}\n"
             f"   {pnl_emoji} PnL non réalisé: ${pnl:+,.2f}\n"
         )
-
     open_positions = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
-    
     if not open_positions:
         lines.append("_Aucune position ouverte en ce moment._")
     else:
@@ -241,7 +181,6 @@ def format_positions(positions: list, balance: dict) -> str:
                 f"   Entrée: ${entry:,.4f}\n"
                 f"   {upnl_emoji} PnL: ${upnl:+,.2f}\n"
             )
-    
     lines.append(f"_Mis à jour: {datetime.now().strftime('%H:%M:%S')}_")
     return "\n".join(lines)
 
@@ -258,7 +197,6 @@ def format_daily_summary(news: list, trending: list) -> str:
             lines.append(f"{i}. [{n['title']}]({n['url']})\n")
     else:
         lines.append("_Actualités indisponibles pour le moment._\n")
-
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("🔥 *Top 3 Tokens Trending (24h)*\n")
     if trending:
@@ -268,25 +206,19 @@ def format_daily_summary(news: list, trending: list) -> str:
             lines.append(f"{i}. *{t['name']}* (${t['symbol']}) — Rank #{t['rank']} {emoji} {change:+.1f}%\n")
     else:
         lines.append("_Trending indisponible pour le moment._\n")
-
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("_Bonne journée depuis Vallauris! 🌴_")
     return "\n".join(lines)
 
 
 def analyze_setup(prices: dict) -> str:
-    """Analyse simple de setup de trade basée sur les variations 24h"""
     lines = ["🎯 *Analyse Setups de Trade*\n"]
-    
     if not prices:
         return "❌ Données indisponibles pour l'analyse."
-    
     for coin_id, symbol in WATCHED_TOKENS.items():
         if coin_id not in prices:
             continue
         change = prices[coin_id].get("usd_24h_change", 0)
-        price = prices[coin_id].get("usd", 0)
-        
         if change <= -8:
             lines.append(
                 f"🔥 *{symbol}* — Possible rebond\n"
@@ -311,13 +243,9 @@ def analyze_setup(prices: dict) -> str:
                 f"   Variation 24h: {change:.2f}%\n"
                 f"   ➡️ Prudence. Pas de signal fort.\n"
             )
-    
     lines.append("\n⚠️ _Ceci n'est pas un conseil financier. DYOR._")
     return "\n".join(lines)
 
-# ============================================================
-# COMMANDES TELEGRAM
-# ============================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -325,7 +253,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Voici les commandes disponibles:\n\n"
         "📊 /prix — Prix en temps réel\n"
         "📈 /positions — Tes positions Hyperliquid\n"
-        "🐾 /hyena — Tes positions HyENA\n"
         "🎯 /setup — Analyse de setups de trade\n"
         "📋 /resume — Résumé complet du marché\n"
         "ℹ️ /aide — Affiche ce message\n\n"
@@ -351,49 +278,7 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-def format_hyena_positions(positions: list, balance: dict) -> str:
-    lines = ["🐾 *Positions HyENA*\n"]
-
-    if balance and balance.get("accountValue", 0) > 0:
-        pnl = balance.get("totalUnrealizedPnl", 0)
-        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-        lines.append(
-            f"💼 *Compte HyENA*\n"
-            f"   Valeur totale: ${balance.get('accountValue', 0):,.2f}\n"
-            f"   Marge utilisée: ${balance.get('totalMarginUsed', 0):,.2f}\n"
-            f"   {pnl_emoji} PnL non réalisé: ${pnl:+,.2f}\n"
-        )
-
-    open_positions = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
-
-    if not open_positions:
-        lines.append("_Aucune position ouverte sur HyENA._")
-    else:
-        lines.append(f"*{len(open_positions)} position(s) ouverte(s):*\n")
-        for p in open_positions:
-            pos = p.get("position", {})
-            coin = pos.get("coin", "?").replace("hyna:", "")
-            size = float(pos.get("szi", 0))
-            entry = float(pos.get("entryPx", 0))
-            upnl = float(pos.get("unrealizedPnl", 0))
-            direction = "LONG 🟢" if size > 0 else "SHORT 🔴"
-            upnl_emoji = "✅" if upnl >= 0 else "❌"
-            lines.append(
-                f"*{coin}* — {direction}\n"
-                f"   Taille: {abs(size)}\n"
-                f"   Entrée: ${entry:,.4f}\n"
-                f"   {upnl_emoji} PnL: ${upnl:+,.2f}\n"
-            )
-
-    lines.append(f"_Mis à jour: {datetime.now().strftime('%H:%M:%S')}_")
-    return "\n".join(lines)
-
-
-async def cmd_hyena(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Connexion à HyENA...", parse_mode="Markdown")
-    positions, balance = await get_hyena_positions()
-    msg = format_hyena_positions(positions, balance)
-    await update.message.reply_text(msg, parse_mode="Markdown")
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Analyse en cours...", parse_mode="Markdown")
     prices = await get_crypto_prices()
     msg = analyze_setup(prices)
@@ -413,17 +298,12 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
-# ============================================================
-# TÂCHES AUTOMATIQUES
-# ============================================================
 
 async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
-    """Vérifie les variations importantes et envoie une alerte"""
     global last_prices
     prices = await get_crypto_prices()
     if not prices:
         return
-
     for coin_id, symbol in WATCHED_TOKENS.items():
         if coin_id not in prices:
             continue
@@ -446,7 +326,6 @@ async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
-    """Envoie le résumé quotidien automatiquement"""
     news, trending = await asyncio.gather(
         get_crypto_news(),
         get_crypto_trending()
@@ -461,16 +340,11 @@ async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Active les alertes automatiques pour ce chat"""
     chat_id = update.effective_chat.id
     job_queue = context.job_queue
-    
-    # Supprime les anciens jobs si existants
     current_jobs = job_queue.get_jobs_by_name(f"alert_{chat_id}")
     for job in current_jobs:
         job.schedule_removal()
-    
-    # Alerte toutes les heures
     job_queue.run_repeating(
         job_price_alert,
         interval=3600,
@@ -478,15 +352,12 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
         chat_id=chat_id,
         name=f"alert_{chat_id}"
     )
-    
-    # Résumé quotidien à 8h
     job_queue.run_daily(
         job_daily_summary,
         time=time(DAILY_SUMMARY_HOUR, DAILY_SUMMARY_MIN),
         chat_id=chat_id,
         name=f"daily_{chat_id}"
     )
-    
     await update.message.reply_text(
         "✅ *Alertes activées!*\n\n"
         f"• Alerte prix si variation > {ALERT_THRESHOLD_PERCENT}% / heure\n"
@@ -503,24 +374,17 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
             job.schedule_removal()
     await update.message.reply_text("🔕 Alertes désactivées.")
 
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Commandes
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("aide", cmd_aide))
     app.add_handler(CommandHandler("prix", cmd_prix))
     app.add_handler(CommandHandler("positions", cmd_positions))
-    app.add_handler(CommandHandler("hyena", cmd_hyena))
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("alertes", cmd_activer_alertes))
     app.add_handler(CommandHandler("desactiver_alertes", cmd_desactiver_alertes))
-    
     logger.info("🤖 MarignyCryptoBot démarré!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
