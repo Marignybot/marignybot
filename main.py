@@ -51,35 +51,20 @@ last_prices = {}
 # ============================================================
 
 async def get_crypto_prices() -> dict:
-    """Récupère les prix via Binance (pas de clé API nécessaire)"""
-    symbols = {
-        "bitcoin": ("BTCUSDT", "BTC"),
-        "ethereum": ("ETHUSDT", "ETH"),
-        "hyperliquid": ("HYPEUSDT", "HYPE"),
+    """Récupère les prix en temps réel via CoinGecko"""
+    ids = ",".join(WATCHED_TOKENS.keys())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd,eur&include_24hr_change=true"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    result = {}
     try:
         async with aiohttp.ClientSession() as session:
-            for coin_id, (pair, symbol) in symbols.items():
-                if coin_id not in WATCHED_TOKENS:
-                    continue
-                # Prix actuel
-                url_price = f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}"
-                async with session.get(url_price, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        usd = float(data.get("lastPrice", 0))
-                        change = float(data.get("priceChangePercent", 0))
-                        # Conversion EUR approximative (taux fixe, suffisant pour affichage)
-                        eur = usd * 0.92
-                        result[coin_id] = {
-                            "usd": usd,
-                            "eur": eur,
-                            "usd_24h_change": change
-                        }
-        return result
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                return data
     except Exception as e:
-        logger.error(f"Erreur Binance: {e}")
+        logger.error(f"Erreur CoinGecko: {e}")
         return {}
 
 
@@ -110,32 +95,28 @@ async def get_crypto_news() -> list:
 
 
 async def get_crypto_trending() -> list:
-    """Récupère les top gainers 24h via Binance"""
-    url = "https://api.binance.com/api/v3/ticker/24hr"
+    """Récupère les tokens trending via CoinGecko"""
+    url = "https://api.coingecko.com/api/v3/search/trending"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 data = await resp.json()
-                # Filtre les paires USDT avec volume significatif
-                usdt_pairs = [
-                    d for d in data
-                    if d["symbol"].endswith("USDT")
-                    and float(d.get("quoteVolume", 0)) > 1_000_000
-                    and float(d.get("lastPrice", 0)) > 0
-                ]
-                # Trie par variation 24h décroissante
-                top = sorted(usdt_pairs, key=lambda x: float(x.get("priceChangePercent", 0)), reverse=True)[:3]
+                coins = data.get("coins", [])[:3]
                 return [
                     {
-                        "name": t["symbol"].replace("USDT", ""),
-                        "symbol": t["symbol"].replace("USDT", ""),
-                        "rank": "—",
-                        "change": float(t.get("priceChangePercent", 0))
+                        "name": c["item"].get("name", ""),
+                        "symbol": c["item"].get("symbol", ""),
+                        "rank": c["item"].get("market_cap_rank", "?"),
+                        "change": c["item"].get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0) or 0
                     }
-                    for t in top
+                    for c in coins
                 ]
     except Exception as e:
-        logger.error(f"Erreur trending Binance: {e}")
+        logger.error(f"Erreur trending: {e}")
         return []
 
 
