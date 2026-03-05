@@ -64,23 +64,32 @@ async def get_crypto_prices() -> dict:
 
 
 async def get_crypto_news() -> list:
-    """Récupère les 3 dernières actus crypto via CryptoPanic (gratuit)"""
-    url = "https://cryptopanic.com/api/v1/posts/?auth_token=public&kind=news&currencies=BTC,ETH,HYPE&public=true"
+    """Récupère les dernières actus crypto via CoinDesk RSS"""
+    url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MarignyCryptoBot/1.0)"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-                results = data.get("results", [])[:3]
-                return [{"title": r.get("title", ""), "url": r.get("url", "")} for r in results]
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                text = await resp.text()
+                items = []
+                import re
+                titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', text)
+                links = re.findall(r'<link>(https://www\.coindesk\.com[^<]+)</link>', text)
+                for i in range(min(3, len(titles), len(links))):
+                    items.append({"title": titles[i], "url": links[i]})
+                return items
     except Exception as e:
-        logger.error(f"Erreur news: {e}")
+        logger.error(f"Erreur news CoinDesk: {e}")
         return []
 
 
 async def get_reddit_top() -> list:
     """Récupère les 3 posts les plus populaires sur r/CryptoCurrency (24h)"""
     url = "https://www.reddit.com/r/CryptoCurrency/top.json?limit=3&t=day"
-    headers = {"User-Agent": "MarignyCryptoBot/1.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
