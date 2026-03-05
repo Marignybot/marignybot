@@ -71,40 +71,43 @@ async def get_crypto_news() -> list:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 text = await resp.text()
-                items = []
                 import re
-                titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', text)
-                links = re.findall(r'<link>(https://www\.coindesk\.com[^<]+)</link>', text)
-                for i in range(min(3, len(titles), len(links))):
-                    items.append({"title": titles[i], "url": links[i]})
-                return items
+                # Extrait les blocs <item>
+                items_raw = re.findall(r'<item>(.*?)</item>', text, re.DOTALL)
+                results = []
+                for item in items_raw[:3]:
+                    title_match = re.search(r'<title><!\[CDATA\[(.*?)\]\]></title>', item)
+                    link_match = re.search(r'<link>(.*?)</link>', item)
+                    if title_match and link_match:
+                        results.append({
+                            "title": title_match.group(1).strip(),
+                            "url": link_match.group(1).strip()
+                        })
+                return results
     except Exception as e:
         logger.error(f"Erreur news CoinDesk: {e}")
         return []
 
 
-async def get_reddit_top() -> list:
-    """Récupère les 3 posts les plus populaires sur r/CryptoCurrency (24h)"""
-    url = "https://www.reddit.com/r/CryptoCurrency/top.json?limit=3&t=day"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-    }
+async def get_crypto_trending() -> list:
+    """Récupère les tokens trending via CoinGecko (gratuit)"""
+    url = "https://api.coingecko.com/api/v3/search/trending"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
-                posts = data.get("data", {}).get("children", [])
+                coins = data.get("coins", [])[:3]
                 return [
                     {
-                        "title": p["data"].get("title", ""),
-                        "url": f"https://reddit.com{p['data'].get('permalink', '')}",
-                        "score": p["data"].get("score", 0)
+                        "name": c["item"].get("name", ""),
+                        "symbol": c["item"].get("symbol", ""),
+                        "rank": c["item"].get("market_cap_rank", "?"),
+                        "change": c["item"].get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0)
                     }
-                    for p in posts
+                    for c in coins
                 ]
     except Exception as e:
-        logger.error(f"Erreur Reddit: {e}")
+        logger.error(f"Erreur trending: {e}")
         return []
 
 
@@ -209,7 +212,7 @@ def format_positions(positions: list, balance: dict) -> str:
     return "\n".join(lines)
 
 
-def format_daily_summary(news: list, reddit: list) -> str:
+def format_daily_summary(news: list, trending: list) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
         f"🌅 *Résumé Crypto — {now}*\n",
@@ -223,12 +226,14 @@ def format_daily_summary(news: list, reddit: list) -> str:
         lines.append("_Actualités indisponibles pour le moment._\n")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🔥 *Top 3 Reddit Crypto (24h)*\n")
-    if reddit:
-        for i, r in enumerate(reddit, 1):
-            lines.append(f"{i}. [{r['title']}]({r['url']})\n   👍 {r['score']} upvotes\n")
+    lines.append("🔥 *Top 3 Tokens Trending (24h)*\n")
+    if trending:
+        for i, t in enumerate(trending, 1):
+            change = t.get("change", 0) or 0
+            emoji = "🟢" if change >= 0 else "🔴"
+            lines.append(f"{i}. *{t['name']}* (${t['symbol']}) — Rank #{t['rank']} {emoji} {change:+.1f}%\n")
     else:
-        lines.append("_Reddit indisponible pour le moment._\n")
+        lines.append("_Trending indisponible pour le moment._\n")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("_Bonne journée depuis Vallauris! 🌴_")
@@ -320,11 +325,11 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Préparation du résumé...", parse_mode="Markdown")
-    news, reddit = await asyncio.gather(
+    news, trending = await asyncio.gather(
         get_crypto_news(),
-        get_reddit_top()
+        get_crypto_trending()
     )
-    msg = format_daily_summary(news, reddit)
+    msg = format_daily_summary(news, trending)
     await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 
@@ -365,11 +370,11 @@ async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
 
 async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
     """Envoie le résumé quotidien automatiquement"""
-    news, reddit = await asyncio.gather(
+    news, trending = await asyncio.gather(
         get_crypto_news(),
-        get_reddit_top()
+        get_crypto_trending()
     )
-    msg = format_daily_summary(news, reddit)
+    msg = format_daily_summary(news, trending)
     await context.bot.send_message(
         chat_id=context.job.chat_id,
         text=msg,
