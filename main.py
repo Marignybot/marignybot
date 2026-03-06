@@ -18,10 +18,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TELEGRAM_TOKEN = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"
 HYPERLIQUID_ADDRESS = "0x6e89b986FBB4B985AcCC9B3CfEE4c7B5301D9a5C"
 
+# Mapping coin -> symbole Binance
 WATCHED_TOKENS = {
-    "bitcoin": "BTC",
-    "ethereum": "ETH",
-    "hyperliquid": "HYPE",
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "HYPE": "HYPEUSDT",
 }
 
 ALERT_THRESHOLD_PERCENT = 5.0
@@ -42,111 +43,64 @@ def is_authorized(update) -> bool:
 
 
 # ============================================================
-# API CRYPTO PRICES
+# API BINANCE — PRIX TEMPS REEL
 # ============================================================
 async def get_crypto_prices() -> dict:
-    ids = ",".join(WATCHED_TOKENS.keys())
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd,eur&include_24hr_change=true"
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    """Recupere les prix via Binance (pas de rate limit strict)."""
+    result = {}
+    headers = {"Accept": "application/json"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                return await resp.json()
+            for symbol, pair in WATCHED_TOKENS.items():
+                try:
+                    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}"
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        data = await resp.json()
+                        if "lastPrice" in data:
+                            usd = float(data["lastPrice"])
+                            change = float(data["priceChangePercent"])
+                            result[symbol] = {
+                                "usd": usd,
+                                "eur": usd * 0.92,  # taux EUR approximatif
+                                "usd_24h_change": change,
+                                "volume": float(data.get("quoteVolume", 0)),
+                            }
+                except Exception as e:
+                    logger.error(f"Erreur Binance prix {symbol}: {e}")
     except Exception as e:
-        logger.error(f"Erreur CoinGecko: {e}")
+        logger.error(f"Erreur session Binance: {e}")
+    return result
+
+
+# ============================================================
+# API BINANCE — OHLCV POUR ANALYSE TECHNIQUE
+# ============================================================
+async def get_ohlcv(symbol: str, interval: str = "4h", limit: int = 50) -> dict:
+    """Recupere les bougies Binance pour les indicateurs techniques."""
+    pair = WATCHED_TOKENS.get(symbol)
+    if not pair:
         return {}
-
-
-# ============================================================
-# API NEWS
-# ============================================================
-async def get_crypto_news() -> list:
-    url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; MarignyCryptoBot/1.0)"}
+    url = f"https://api.binance.com/api/v3/klines?symbol={pair}&interval={interval}&limit={limit}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                text = await resp.text()
-                items_raw = re.findall(r'<item>(.*?)</item>', text, re.DOTALL)
-                results = []
-                for item in items_raw[:3]:
-                    title_match = re.search(r'<title><!\[CDATA\[(.*?)\]\]></title>', item)
-                    link_match = re.search(r'<link>(.*?)</link>', item)
-                    if title_match and link_match:
-                        results.append({
-                            "title": title_match.group(1).strip(),
-                            "url": link_match.group(1).strip()
-                        })
-                return results
-    except Exception as e:
-        logger.error(f"Erreur news: {e}")
-        return []
-
-
-# ============================================================
-# API TRENDING
-# ============================================================
-async def get_crypto_trending() -> list:
-    url = "https://api.coingecko.com/api/v3/search/trending"
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
-                coins = data.get("coins", [])[:3]
-                return [
-                    {
-                        "name": c["item"].get("name", ""),
-                        "symbol": c["item"].get("symbol", ""),
-                        "rank": c["item"].get("market_cap_rank", "?"),
-                        "change": c["item"].get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0) or 0
-                    }
-                    for c in coins
-                ]
+                if not data or not isinstance(data, list):
+                    return {}
+                # Binance klines: [timestamp, open, high, low, close, volume, ...]
+                closes  = [float(k[4]) for k in data]
+                highs   = [float(k[2]) for k in data]
+                lows    = [float(k[3]) for k in data]
+                volumes = [float(k[5]) for k in data]
+                return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
     except Exception as e:
-        logger.error(f"Erreur trending: {e}")
-        return []
-
-
-# ============================================================
-# OHLCV + INDICATEURS TECHNIQUES
-# ============================================================
-async def get_ohlcv(coin_id: str, days: int = 14) -> dict:
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            ohlc_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
-            async with session.get(ohlc_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                ohlc_data = await resp.json()
-
-            if not ohlc_data or not isinstance(ohlc_data, list):
-                return {}
-
-            closes = [c[4] for c in ohlc_data]
-            highs  = [c[2] for c in ohlc_data]
-            lows   = [c[3] for c in ohlc_data]
-
-            vol_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}&interval=daily"
-            volumes = []
-            async with session.get(vol_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp2:
-                vol_data = await resp2.json()
-                volumes = [v[1] for v in vol_data.get("total_volumes", [])]
-
-            return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
-    except Exception as e:
-        logger.error(f"Erreur OHLCV {coin_id}: {e}")
+        logger.error(f"Erreur OHLCV Binance {symbol}: {e}")
         return {}
 
 
+# ============================================================
+# INDICATEURS TECHNIQUES
+# ============================================================
 def compute_rsi(closes: list, period: int = 14) -> float:
     if len(closes) < period + 1:
         return 50.0
@@ -174,7 +128,7 @@ def compute_ema(closes: list, period: int) -> float:
 def find_support_resistance(highs: list, lows: list, closes: list) -> dict:
     if not highs or not lows or not closes:
         return {}
-    window      = min(7, len(highs))
+    window      = min(20, len(highs))
     recent_high = max(highs[-window:])
     recent_low  = min(lows[-window:])
     current     = closes[-1]
@@ -191,9 +145,9 @@ def find_support_resistance(highs: list, lows: list, closes: list) -> dict:
 
 
 def volume_signal(volumes: list) -> str:
-    if len(volumes) < 3:
+    if len(volumes) < 5:
         return "normal"
-    avg   = sum(volumes[:-1]) / len(volumes[:-1])
+    avg   = sum(volumes[-6:-1]) / 5
     last  = volumes[-1]
     ratio = last / avg if avg > 0 else 1
     if ratio >= 1.5:
@@ -236,6 +190,7 @@ def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
         lows    = ohlcv.get("lows", [])
         volumes = ohlcv.get("volumes", [])
 
+        # RSI
         rsi = compute_rsi(closes)
         if rsi >= 70:
             rsi_label = f"{rsi} — Surachat ⚠️"
@@ -245,12 +200,14 @@ def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
             rsi_label = f"{rsi} — Neutre"
         lines.append(f"   RSI(14): {rsi_label}")
 
+        # EMA
         ema9  = compute_ema(closes, 9)
         ema21 = compute_ema(closes, 21)
         current_price = closes[-1] if closes else 0
         ema_trend = "haussier 🟢" if ema9 > ema21 else "baissier 🔴"
         lines.append(f"   EMA9/EMA21: ${ema9:,.2f} / ${ema21:,.2f} — {ema_trend}")
 
+        # Support / Resistance / Fibo
         sr = find_support_resistance(highs, lows, closes)
         if sr:
             dist_sup = ((current_price - sr['support'])    / current_price * 100) if current_price else 0
@@ -265,12 +222,67 @@ def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
             elif current_price <= sr['support'] * 1.01:
                 lines.append(f"   🚨 TEST DU SUPPORT EN COURS")
 
+        # Volume
         vol = volume_signal(volumes)
         vol_emoji = "🔊" if vol == "fort" else ("🔇" if vol == "faible" else "📊")
         lines.append(f"   Volume: {vol} {vol_emoji}")
 
     lines.append(f"   ➡️ {conseil}")
     return "\n".join(lines)
+
+
+# ============================================================
+# API NEWS (CoinDesk RSS — pas de rate limit)
+# ============================================================
+async def get_crypto_news() -> list:
+    url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; MarignyCryptoBot/1.0)"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                text = await resp.text()
+                items_raw = re.findall(r'<item>(.*?)</item>', text, re.DOTALL)
+                results = []
+                for item in items_raw[:3]:
+                    title_match = re.search(r'<title><!\[CDATA\[(.*?)\]\]></title>', item)
+                    link_match  = re.search(r'<link>(.*?)</link>', item)
+                    if title_match and link_match:
+                        results.append({
+                            "title": title_match.group(1).strip(),
+                            "url":   link_match.group(1).strip()
+                        })
+                return results
+    except Exception as e:
+        logger.error(f"Erreur news: {e}")
+        return []
+
+
+# ============================================================
+# API TRENDING (CoinGecko — 1 seul appel, moins de risque)
+# ============================================================
+async def get_crypto_trending() -> list:
+    url = "https://api.coingecko.com/api/v3/search/trending"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                coins = data.get("coins", [])[:3]
+                return [
+                    {
+                        "name":   c["item"].get("name", ""),
+                        "symbol": c["item"].get("symbol", ""),
+                        "rank":   c["item"].get("market_cap_rank", "?"),
+                        "change": c["item"].get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0) or 0
+                    }
+                    for c in coins
+                ]
+    except Exception as e:
+        logger.error(f"Erreur trending: {e}")
+        return []
 
 
 # ============================================================
@@ -337,11 +349,11 @@ async def get_hyperliquid_balance() -> dict:
 # ============================================================
 def format_prices(prices: dict) -> str:
     if not prices:
-        return "Impossible de recuperer les prix."
+        return "❌ Impossible de recuperer les prix."
     lines = ["📊 *Prix en temps reel*\n"]
-    for coin_id, symbol in WATCHED_TOKENS.items():
-        if coin_id in prices:
-            data   = prices[coin_id]
+    for symbol in WATCHED_TOKENS.keys():
+        if symbol in prices:
+            data   = prices[symbol]
             usd    = data.get("usd", 0)
             eur    = data.get("eur", 0)
             change = data.get("usd_24h_change", 0)
@@ -430,13 +442,13 @@ async def analyze_setup(prices: dict, trending: list) -> str:
     lines = ["🎯 *Analyse Setups de Trade*\n"]
 
     if not prices:
-        return "Donnees indisponibles pour l'analyse."
+        return "❌ Donnees indisponibles pour l'analyse."
 
-    for coin_id, symbol in WATCHED_TOKENS.items():
-        if coin_id not in prices:
+    for symbol in WATCHED_TOKENS.keys():
+        if symbol not in prices:
             continue
-        change = prices[coin_id].get("usd_24h_change", 0)
-        ohlcv  = await get_ohlcv(coin_id, days=14)
+        change = prices[symbol].get("usd_24h_change", 0)
+        ohlcv  = await get_ohlcv(symbol, interval="4h", limit=50)
         bloc   = build_token_analysis(symbol, change, ohlcv)
         lines.append(bloc)
         lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -451,7 +463,6 @@ async def analyze_setup(prices: dict, trending: list) -> str:
         lines.append("_Trending indisponible pour le moment._\n")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Ceci n'est pas un conseil financier. DYOR._")
     return "\n".join(lines)
 
 
@@ -527,12 +538,12 @@ async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
     prices = await get_crypto_prices()
     if not prices:
         return
-    for coin_id, symbol in WATCHED_TOKENS.items():
-        if coin_id not in prices:
+    for symbol in WATCHED_TOKENS.keys():
+        if symbol not in prices:
             continue
-        current = prices[coin_id].get("usd", 0)
-        if coin_id in last_prices and last_prices[coin_id] > 0:
-            variation = ((current - last_prices[coin_id]) / last_prices[coin_id]) * 100
+        current = prices[symbol].get("usd", 0)
+        if symbol in last_prices and last_prices[symbol] > 0:
+            variation = ((current - last_prices[symbol]) / last_prices[symbol]) * 100
             if abs(variation) >= ALERT_THRESHOLD_PERCENT:
                 emoji = "🚀" if variation > 0 else "💥"
                 msg = (
@@ -545,7 +556,7 @@ async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
                     text=msg,
                     parse_mode="Markdown"
                 )
-        last_prices[coin_id] = current
+        last_prices[symbol] = current
 
 
 async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
