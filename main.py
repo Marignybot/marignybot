@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 MarignyCryptoBot - Bot Telegram pour suivi crypto & Hyperliquid
-Auteur: Pour Tabac Le Marigny, Vallauris
 """
 
 import asyncio
@@ -594,7 +593,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔔 /alertes — Activer les alertes auto\n"
         "🔕 /desactiver\\_alertes — Stopper les alertes\n"
         "ℹ️ /aide — Affiche ce message\n\n"
-        "_Bot cree pour Tabac Le Marigny, Vallauris 🌴_"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -689,13 +687,13 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
     job_queue.run_repeating(job_price_alert, interval=3600, first=10, chat_id=chat_id, name=f"alert_{chat_id}")
 
     # Resume quotidien 8h
-    job_queue.run_daily(job_daily_summary, time=time(8, 0), chat_id=chat_id, name=f"daily_{chat_id}")
+    job_queue.run_daily(job_daily_summary, time=time(7, 35), chat_id=chat_id, name=f"daily_{chat_id}")
 
     # Check S/R + liquidation a 8h heure francaise (UTC+1 = 7h UTC)
-    job_queue.run_daily(job_twice_daily, time=time(7, 30), chat_id=chat_id, name=f"sr_{chat_id}_8")
+    job_queue.run_daily(job_twice_daily, time=time(7, 35), chat_id=chat_id, name=f"sr_{chat_id}_8")
 
     # Check S/R + liquidation a 20h heure francaise (UTC+1 = 19h UTC)
-    job_queue.run_daily(job_twice_daily, time=time(19, 30), chat_id=chat_id, name=f"sr_{chat_id}_20")
+    job_queue.run_daily(job_twice_daily, time=time(19, 0), chat_id=chat_id, name=f"sr_{chat_id}_20")
 
     await update.message.reply_text(
         "✅ *Alertes activees!*\n\n"
