@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MarignyCryptoBot - Bot Telegram pour suivi crypto & Hyperliquid
-Auteur: Pour Tabac Le Marigny, Vallauris
+Auteur:Le Marigny, Vallauris
 """
 
 import asyncio
