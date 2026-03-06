@@ -41,12 +41,15 @@ def is_authorized(update) -> bool:
     return update.effective_user.id == AUTHORIZED_USER_ID
 
 
+# ============================================================
+# API CRYPTO PRICES
+# ============================================================
 async def get_crypto_prices() -> dict:
     ids = ",".join(WATCHED_TOKENS.keys())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd,eur&include_24hr_change=true"
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -57,6 +60,9 @@ async def get_crypto_prices() -> dict:
         return {}
 
 
+# ============================================================
+# API NEWS
+# ============================================================
 async def get_crypto_news() -> list:
     url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; MarignyCryptoBot/1.0)"}
@@ -80,11 +86,14 @@ async def get_crypto_news() -> list:
         return []
 
 
+# ============================================================
+# API TRENDING
+# ============================================================
 async def get_crypto_trending() -> list:
     url = "https://api.coingecko.com/api/v3/search/trending"
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -105,6 +114,168 @@ async def get_crypto_trending() -> list:
         return []
 
 
+# ============================================================
+# OHLCV + INDICATEURS TECHNIQUES
+# ============================================================
+async def get_ohlcv(coin_id: str, days: int = 14) -> dict:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            ohlc_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc?vs_currency=usd&days={days}"
+            async with session.get(ohlc_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                ohlc_data = await resp.json()
+
+            if not ohlc_data or not isinstance(ohlc_data, list):
+                return {}
+
+            closes = [c[4] for c in ohlc_data]
+            highs  = [c[2] for c in ohlc_data]
+            lows   = [c[3] for c in ohlc_data]
+
+            vol_url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={days}&interval=daily"
+            volumes = []
+            async with session.get(vol_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp2:
+                vol_data = await resp2.json()
+                volumes = [v[1] for v in vol_data.get("total_volumes", [])]
+
+            return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+    except Exception as e:
+        logger.error(f"Erreur OHLCV {coin_id}: {e}")
+        return {}
+
+
+def compute_rsi(closes: list, period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0 for d in deltas[-period:]]
+    losses = [-d if d < 0 else 0 for d in deltas[-period:]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+
+def compute_ema(closes: list, period: int) -> float:
+    if len(closes) < period:
+        return closes[-1] if closes else 0
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 2)
+
+
+def find_support_resistance(highs: list, lows: list, closes: list) -> dict:
+    if not highs or not lows or not closes:
+        return {}
+    window      = min(7, len(highs))
+    recent_high = max(highs[-window:])
+    recent_low  = min(lows[-window:])
+    current     = closes[-1]
+    diff        = recent_high - recent_low
+    fib_382     = round(recent_low + diff * 0.382, 2)
+    fib_618     = round(recent_low + diff * 0.618, 2)
+    return {
+        "support":    round(recent_low, 2),
+        "resistance": round(recent_high, 2),
+        "fib_382":    fib_382,
+        "fib_618":    fib_618,
+        "current":    round(current, 2),
+    }
+
+
+def volume_signal(volumes: list) -> str:
+    if len(volumes) < 3:
+        return "normal"
+    avg   = sum(volumes[:-1]) / len(volumes[:-1])
+    last  = volumes[-1]
+    ratio = last / avg if avg > 0 else 1
+    if ratio >= 1.5:
+        return "fort"
+    elif ratio <= 0.6:
+        return "faible"
+    return "normal"
+
+
+def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
+    lines = []
+
+    if change <= -8:
+        tendance = "Possible rebond — chute importante"
+        conseil  = "Zone de support potentielle. Surveille un retournement haussier."
+        t_emoji  = "🔥"
+    elif change >= 8:
+        tendance = "Momentum haussier fort"
+        conseil  = "Breakout en cours. Attention au retrace avant continuation."
+        t_emoji  = "⚡"
+    elif 3 < change < 8:
+        tendance = "Tendance haussiere moderee"
+        conseil  = "Momentum positif. Attends confirmation au-dessus de la resistance."
+        t_emoji  = "📈"
+    elif -8 < change <= -3:
+        tendance = "Tendance baissiere moderee"
+        conseil  = "Prudence. Surveille le support. Pas de signal fort."
+        t_emoji  = "📉"
+    else:
+        tendance = "Consolidation / Range"
+        conseil  = "Range serre. Attends une cassure claire pour trader."
+        t_emoji  = "⏸"
+
+    lines.append(f"{t_emoji} *{symbol}* — {tendance}")
+    lines.append(f"   Variation 24h: {change:+.2f}%")
+
+    if ohlcv:
+        closes  = ohlcv.get("closes", [])
+        highs   = ohlcv.get("highs", [])
+        lows    = ohlcv.get("lows", [])
+        volumes = ohlcv.get("volumes", [])
+
+        rsi = compute_rsi(closes)
+        if rsi >= 70:
+            rsi_label = f"{rsi} — Surachat ⚠️"
+        elif rsi <= 30:
+            rsi_label = f"{rsi} — Survendu, opportunite 🛒"
+        else:
+            rsi_label = f"{rsi} — Neutre"
+        lines.append(f"   RSI(14): {rsi_label}")
+
+        ema9  = compute_ema(closes, 9)
+        ema21 = compute_ema(closes, 21)
+        current_price = closes[-1] if closes else 0
+        ema_trend = "haussier 🟢" if ema9 > ema21 else "baissier 🔴"
+        lines.append(f"   EMA9/EMA21: ${ema9:,.2f} / ${ema21:,.2f} — {ema_trend}")
+
+        sr = find_support_resistance(highs, lows, closes)
+        if sr:
+            dist_sup = ((current_price - sr['support'])    / current_price * 100) if current_price else 0
+            dist_res = ((sr['resistance'] - current_price) / current_price * 100) if current_price else 0
+            lines.append(f"   Support:    ${sr['support']:,.2f}  (-{dist_sup:.1f}%)")
+            lines.append(f"   Resistance: ${sr['resistance']:,.2f}  (+{dist_res:.1f}%)")
+            lines.append(f"   Fibo 38.2%: ${sr['fib_382']:,.2f}")
+            lines.append(f"   Fibo 61.8%: ${sr['fib_618']:,.2f}")
+
+            if current_price >= sr['resistance'] * 0.99:
+                lines.append(f"   🚨 CASSURE RESISTANCE IMMINENTE")
+            elif current_price <= sr['support'] * 1.01:
+                lines.append(f"   🚨 TEST DU SUPPORT EN COURS")
+
+        vol = volume_signal(volumes)
+        vol_emoji = "🔊" if vol == "fort" else ("🔇" if vol == "faible" else "📊")
+        lines.append(f"   Volume: {vol} {vol_emoji}")
+
+    lines.append(f"   ➡️ {conseil}")
+    return "\n".join(lines)
+
+
+# ============================================================
+# API HYPERLIQUID
+# ============================================================
 async def get_hyperliquid_positions() -> list:
     url = "https://api.hyperliquid.xyz/info"
     payload = {"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS}
@@ -127,28 +298,23 @@ async def get_hyperliquid_balance() -> dict:
                 data = await resp.json()
                 logger.info(f"Hyperliquid raw response keys: {list(data.keys())}")
 
-                # Hyperliquid peut retourner les données sous différentes clés selon le type de compte
-                # On essaie dans l'ordre : crossMarginSummary, marginSummary, puis directement à la racine
                 margin = (
                     data.get("crossMarginSummary")
                     or data.get("marginSummary")
                     or {}
                 )
 
-                account_value = float(margin.get("accountValue", 0))
-                total_margin_used = float(margin.get("totalMarginUsed", 0))
+                account_value        = float(margin.get("accountValue", 0))
+                total_margin_used    = float(margin.get("totalMarginUsed", 0))
                 total_unrealized_pnl = float(margin.get("totalUnrealizedPnl", 0))
 
-                # Fallback : si accountValue est toujours 0, on cherche dans d'autres champs
                 if account_value == 0:
-                    # Certains comptes ont withdrawable ou crossAccountValue
                     account_value = float(
                         data.get("crossAccountValue", 0)
                         or data.get("withdrawable", 0)
                         or 0
                     )
 
-                # Calcul du PnL réel depuis les positions si toujours 0
                 if total_unrealized_pnl == 0:
                     positions = data.get("assetPositions", [])
                     total_unrealized_pnl = sum(
@@ -157,8 +323,8 @@ async def get_hyperliquid_balance() -> dict:
                     )
 
                 return {
-                    "accountValue": account_value,
-                    "totalMarginUsed": total_margin_used,
+                    "accountValue":       account_value,
+                    "totalMarginUsed":    total_margin_used,
                     "totalUnrealizedPnl": total_unrealized_pnl,
                 }
     except Exception as e:
@@ -166,33 +332,36 @@ async def get_hyperliquid_balance() -> dict:
         return {}
 
 
+# ============================================================
+# FORMATTERS
+# ============================================================
 def format_prices(prices: dict) -> str:
     if not prices:
-        return "❌ Impossible de récupérer les prix."
-    lines = ["📊 *Prix en temps réel*\n"]
+        return "Impossible de recuperer les prix."
+    lines = ["📊 *Prix en temps reel*\n"]
     for coin_id, symbol in WATCHED_TOKENS.items():
         if coin_id in prices:
-            data = prices[coin_id]
-            usd = data.get("usd", 0)
-            eur = data.get("eur", 0)
+            data   = prices[coin_id]
+            usd    = data.get("usd", 0)
+            eur    = data.get("eur", 0)
             change = data.get("usd_24h_change", 0)
-            emoji = "🟢" if change >= 0 else "🔴"
+            emoji  = "🟢" if change >= 0 else "🔴"
             lines.append(
                 f"{emoji} *{symbol}*\n"
                 f"   💵 ${usd:,.2f}  |  💶 €{eur:,.2f}\n"
                 f"   24h: {change:+.2f}%\n"
             )
-    lines.append(f"_Mis à jour: {datetime.now().strftime('%H:%M:%S')}_")
+    lines.append(f"_Mis a jour: {datetime.now().strftime('%H:%M:%S')}_")
     return "\n".join(lines)
 
 
 def format_positions(positions: list, balance: dict) -> str:
     lines = ["📈 *Positions Hyperliquid*\n"]
     if balance:
-        pnl = balance.get("totalUnrealizedPnl", 0)
+        pnl           = balance.get("totalUnrealizedPnl", 0)
         account_value = balance.get("accountValue", 0)
-        margin_used = balance.get("totalMarginUsed", 0)
-        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+        margin_used   = balance.get("totalMarginUsed", 0)
+        pnl_emoji     = "🟢" if pnl >= 0 else "🔴"
 
         lines.append("💼 *Compte*")
         if account_value > 0:
@@ -201,12 +370,12 @@ def format_positions(positions: list, balance: dict) -> str:
             lines.append(f"   Valeur totale: _non disponible_")
 
         if margin_used > 0:
-            lines.append(f"   Marge utilisée: ${margin_used:,.2f}")
+            lines.append(f"   Marge utilisee: ${margin_used:,.2f}")
 
         if pnl != 0:
-            lines.append(f"   {pnl_emoji} PnL non réalisé: ${pnl:+,.2f}\n")
+            lines.append(f"   {pnl_emoji} PnL non realise: ${pnl:+,.2f}\n")
         else:
-            lines.append(f"   PnL non réalisé: $0.00\n")
+            lines.append(f"   PnL non realise: $0.00\n")
 
     open_positions = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
     if not open_positions:
@@ -214,27 +383,27 @@ def format_positions(positions: list, balance: dict) -> str:
     else:
         lines.append(f"*{len(open_positions)} position(s) ouverte(s):*\n")
         for p in open_positions:
-            pos = p.get("position", {})
-            coin = pos.get("coin", "?")
-            size = float(pos.get("szi", 0))
-            entry = float(pos.get("entryPx", 0))
-            upnl = float(pos.get("unrealizedPnl", 0))
-            direction = "LONG 🟢" if size > 0 else "SHORT 🔴"
+            pos        = p.get("position", {})
+            coin       = pos.get("coin", "?")
+            size       = float(pos.get("szi", 0))
+            entry      = float(pos.get("entryPx", 0))
+            upnl       = float(pos.get("unrealizedPnl", 0))
+            direction  = "LONG 🟢" if size > 0 else "SHORT 🔴"
             upnl_emoji = "✅" if upnl >= 0 else "❌"
             lines.append(
                 f"*{coin}* — {direction}\n"
                 f"   Taille: {abs(size)}\n"
-                f"   Entrée: ${entry:,.4f}\n"
+                f"   Entree: ${entry:,.4f}\n"
                 f"   {upnl_emoji} PnL: ${upnl:+,.2f}\n"
             )
-    lines.append(f"_Mis à jour: {datetime.now().strftime('%H:%M:%S')}_")
+    lines.append(f"_Mis a jour: {datetime.now().strftime('%H:%M:%S')}_")
     return "\n".join(lines)
 
 
 def format_daily_summary(news: list, trending: list) -> str:
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
-        f"🌅 *Résumé Crypto — {now}*\n",
+        f"🌅 *Resume Crypto — {now}*\n",
         "━━━━━━━━━━━━━━━━━━━━",
         "📰 *3 Actus Crypto du Jour*\n",
     ]
@@ -242,85 +411,71 @@ def format_daily_summary(news: list, trending: list) -> str:
         for i, n in enumerate(news, 1):
             lines.append(f"{i}. [{n['title']}]({n['url']})\n")
     else:
-        lines.append("_Actualités indisponibles pour le moment._\n")
+        lines.append("_Actualites indisponibles pour le moment._\n")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("🔥 *Top 3 Tokens Trending (24h)*\n")
     if trending:
         for i, t in enumerate(trending, 1):
             change = t.get("change", 0) or 0
-            emoji = "🟢" if change >= 0 else "🔴"
+            emoji  = "🟢" if change >= 0 else "🔴"
             lines.append(f"{i}. *{t['name']}* (${t['symbol']}) — Rank #{t['rank']} {emoji} {change:+.1f}%\n")
     else:
         lines.append("_Trending indisponible pour le moment._\n")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_Bonne journée depuis Vallauris! 🌴_")
+    lines.append("_Bonne journee depuis Vallauris! 🌴_")
     return "\n".join(lines)
 
 
-def analyze_setup(prices: dict, trending: list) -> str:
+async def analyze_setup(prices: dict, trending: list) -> str:
     lines = ["🎯 *Analyse Setups de Trade*\n"]
+
     if not prices:
-        return "❌ Données indisponibles pour l'analyse."
+        return "Donnees indisponibles pour l'analyse."
+
     for coin_id, symbol in WATCHED_TOKENS.items():
         if coin_id not in prices:
             continue
         change = prices[coin_id].get("usd_24h_change", 0)
-        if change <= -8:
-            lines.append(
-                f"🔥 *{symbol}* — Possible rebond\n"
-                f"   Variation 24h: {change:.2f}%\n"
-                f"   ➡️ Zone de support potentielle. Surveille un retournement.\n"
-            )
-        elif change >= 8:
-            lines.append(
-                f"⚡ *{symbol}* — Momentum haussier\n"
-                f"   Variation 24h: {change:.2f}%\n"
-                f"   ➡️ Breakout possible. Attention au retrace.\n"
-            )
-        elif -3 <= change <= 3:
-            lines.append(
-                f"⏸️ *{symbol}* — Consolidation\n"
-                f"   Variation 24h: {change:.2f}%\n"
-                f"   ➡️ Range serré. Attends une cassure claire.\n"
-            )
-        else:
-            lines.append(
-                f"📉 *{symbol}* — Tendance baissière modérée\n"
-                f"   Variation 24h: {change:.2f}%\n"
-                f"   ➡️ Prudence. Pas de signal fort.\n"
-            )
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+        ohlcv  = await get_ohlcv(coin_id, days=14)
+        bloc   = build_token_analysis(symbol, change, ohlcv)
+        lines.append(bloc)
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+
     lines.append("🔥 *Top 3 Tokens Trending (24h)*\n")
     if trending:
         for i, t in enumerate(trending, 1):
             change = t.get("change", 0) or 0
-            emoji = "🟢" if change >= 0 else "🔴"
+            emoji  = "🟢" if change >= 0 else "🔴"
             lines.append(f"{i}. *{t['name']}* (${t['symbol']}) — Rank #{t['rank']} {emoji} {change:+.1f}%\n")
     else:
         lines.append("_Trending indisponible pour le moment._\n")
+
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("\n⚠️ _Ceci n'est pas un conseil financier. DYOR._")
+    lines.append("⚠️ _Ceci n'est pas un conseil financier. DYOR._")
     return "\n".join(lines)
 
 
+# ============================================================
+# COMMANDES BOT
+# ============================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
     msg = (
         "👋 *Bienvenue sur MarignyCryptoBot!*\n\n"
         "Voici les commandes disponibles:\n\n"
-        "📊 /prix — Prix en temps réel\n"
+        "📊 /prix — Prix en temps reel\n"
         "📈 /positions — Tes positions Hyperliquid\n"
-        "🎯 /setup — Analyse de setups de trade\n"
-        "📋 /resume — Résumé complet du marché\n"
+        "🎯 /setup — Analyse technique complete\n"
+        "📋 /resume — Resume complet du marche\n"
         "ℹ️ /aide — Affiche ce message\n\n"
-        "_Bot créé pour Tabac Le Marigny, Vallauris 🌴_"
+        "_Bot cree pour Tabac Le Marigny, Vallauris 🌴_"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
-    await update.message.reply_text("⏳ Récupération des prix...", parse_mode="Markdown")
+    await update.message.reply_text("⏳ Recuperation des prix...", parse_mode="Markdown")
     prices = await get_crypto_prices()
     msg = format_prices(prices)
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -328,7 +483,7 @@ async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
-    await update.message.reply_text("⏳ Connexion à Hyperliquid...", parse_mode="Markdown")
+    await update.message.reply_text("⏳ Connexion a Hyperliquid...", parse_mode="Markdown")
     positions, balance = await asyncio.gather(
         get_hyperliquid_positions(),
         get_hyperliquid_balance()
@@ -339,18 +494,18 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
-    await update.message.reply_text("⏳ Analyse en cours...", parse_mode="Markdown")
+    await update.message.reply_text("⏳ Analyse technique en cours (RSI, EMA, S/R, Fibo, Volume)...", parse_mode="Markdown")
     prices, trending = await asyncio.gather(
         get_crypto_prices(),
         get_crypto_trending()
     )
-    msg = analyze_setup(prices, trending)
+    msg = await analyze_setup(prices, trending)
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
-    await update.message.reply_text("⏳ Préparation du résumé...", parse_mode="Markdown")
+    await update.message.reply_text("⏳ Preparation du resume...", parse_mode="Markdown")
     news, trending = await asyncio.gather(
         get_crypto_news(),
         get_crypto_trending()
@@ -364,6 +519,9 @@ async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_start(update, context)
 
 
+# ============================================================
+# JOBS AUTOMATIQUES
+# ============================================================
 async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
     global last_prices
     prices = await get_crypto_prices()
@@ -425,9 +583,9 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
         name=f"daily_{chat_id}"
     )
     await update.message.reply_text(
-        "✅ *Alertes activées!*\n\n"
+        "✅ *Alertes activees!*\n\n"
         f"• Alerte prix si variation > {ALERT_THRESHOLD_PERCENT}% / heure\n"
-        f"• Résumé quotidien à {DAILY_SUMMARY_HOUR:02d}h{DAILY_SUMMARY_MIN:02d}\n\n"
+        f"• Resume quotidien a {DAILY_SUMMARY_HOUR:02d}h{DAILY_SUMMARY_MIN:02d}\n\n"
         "Utilise /desactiver\\_alertes pour stopper.",
         parse_mode="Markdown"
     )
@@ -439,9 +597,12 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
     for name in [f"alert_{chat_id}", f"daily_{chat_id}"]:
         for job in context.job_queue.get_jobs_by_name(name):
             job.schedule_removal()
-    await update.message.reply_text("🔕 Alertes désactivées.")
+    await update.message.reply_text("🔕 Alertes desactivees.")
 
 
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -452,7 +613,7 @@ def main():
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("alertes", cmd_activer_alertes))
     app.add_handler(CommandHandler("desactiver_alertes", cmd_desactiver_alertes))
-    logger.info("🤖 MarignyCryptoBot démarré!")
+    logger.info("🤖 MarignyCryptoBot demarre!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
