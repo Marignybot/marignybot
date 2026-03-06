@@ -7,6 +7,7 @@ Auteur: Pour Tabac Le Marigny, Vallauris
 import asyncio
 import logging
 import re
+import time as time_module
 from datetime import datetime, time
 import aiohttp
 from telegram import Update
@@ -17,13 +18,9 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ============================================================
 TELEGRAM_TOKEN = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"
 HYPERLIQUID_ADDRESS = "0x6e89b986FBB4B985AcCC9B3CfEE4c7B5301D9a5C"
+HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 
-# Symboles Binance pour les prix, Kraken pour OHLCV
-WATCHED_TOKENS = {
-    "BTC": {"binance": "BTCUSDT", "kraken": "XBTUSD"},
-    "ETH": {"binance": "ETHUSDT", "kraken": "ETHUSD"},
-    "HYPE": {"binance": "HYPEUSDT", "kraken": None},  # HYPE pas sur Kraken
-}
+WATCHED_TOKENS = ["BTC", "ETH", "HYPE"]
 
 ALERT_THRESHOLD_PERCENT = 5.0
 DAILY_SUMMARY_HOUR = 8
@@ -43,101 +40,104 @@ def is_authorized(update) -> bool:
 
 
 # ============================================================
-# API BINANCE — PRIX TEMPS REEL
+# HYPERLIQUID — PRIX EN TEMPS REEL
 # ============================================================
 async def get_crypto_prices() -> dict:
-    result = {}
-    headers = {"Accept": "application/json"}
+    """Prix mid de tous les tokens via Hyperliquid allMids."""
     try:
         async with aiohttp.ClientSession() as session:
-            for symbol, pairs in WATCHED_TOKENS.items():
-                pair = pairs["binance"]
-                try:
-                    url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={pair}"
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        data = await resp.json()
-                        if isinstance(data, dict) and "lastPrice" in data:
-                            usd = float(data["lastPrice"])
-                            change = float(data["priceChangePercent"])
-                            result[symbol] = {
-                                "usd": usd,
-                                "eur": usd * 0.92,
-                                "usd_24h_change": change,
-                                "volume": float(data.get("quoteVolume", 0)),
-                            }
-                        else:
-                            logger.warning(f"Binance réponse inattendue pour {symbol}: {data}")
-                except Exception as e:
-                    logger.error(f"Erreur Binance prix {symbol}: {e}")
-    except Exception as e:
-        logger.error(f"Erreur session Binance: {e}")
-    return result
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "allMids"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                all_mids = await resp.json()
+                # all_mids = {"BTC": "84500.0", "ETH": "2100.0", ...}
 
+            # Variation 24h via metaAndAssetCtxs
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp2:
+                meta_data = await resp2.json()
 
-# ============================================================
-# KRAKEN — OHLCV POUR BTC ET ETH
-# ============================================================
-async def get_ohlcv_kraken(kraken_pair: str, interval: int = 240, count: int = 50) -> dict:
-    """Recupere les bougies Kraken. interval en minutes : 240 = 4h"""
-    url = f"https://api.kraken.com/0/public/OHLC?pair={kraken_pair}&interval={interval}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                data = await resp.json()
-                if data.get("error"):
-                    logger.error(f"Erreur Kraken {kraken_pair}: {data['error']}")
-                    return {}
-                result_data = data.get("result", {})
-                # La clé du result est le nom de la paire (peut varier)
-                pair_key = [k for k in result_data.keys() if k != "last"]
-                if not pair_key:
-                    return {}
-                candles = result_data[pair_key[0]][-count:]
-                # Kraken: [time, open, high, low, close, vwap, volume, count]
-                closes  = [float(c[4]) for c in candles]
-                highs   = [float(c[2]) for c in candles]
-                lows    = [float(c[3]) for c in candles]
-                volumes = [float(c[6]) for c in candles]
-                return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+        result = {}
+        # meta_data[0] = meta (liste des assets avec nom)
+        # meta_data[1] = liste des ctxs (prix, volume, funding, etc.)
+        universe = meta_data[0].get("universe", []) if isinstance(meta_data, list) else []
+        ctxs     = meta_data[1] if isinstance(meta_data, list) and len(meta_data) > 1 else []
+
+        # Construire un index nom -> ctx
+        ctx_by_name = {}
+        for i, asset in enumerate(universe):
+            name = asset.get("name", "")
+            if i < len(ctxs):
+                ctx_by_name[name] = ctxs[i]
+
+        for symbol in WATCHED_TOKENS:
+            mid = all_mids.get(symbol)
+            if mid is None:
+                continue
+            usd = float(mid)
+            ctx = ctx_by_name.get(symbol, {})
+            # prevDayPx = prix il y a 24h
+            prev = float(ctx.get("prevDayPx", usd) or usd)
+            change = ((usd - prev) / prev * 100) if prev else 0
+            volume = float(ctx.get("dayNtlVlm", 0) or 0)
+            result[symbol] = {
+                "usd": usd,
+                "eur": usd * 0.92,
+                "usd_24h_change": round(change, 2),
+                "volume": volume,
+            }
+
+        return result
     except Exception as e:
-        logger.error(f"Erreur OHLCV Kraken {kraken_pair}: {e}")
+        logger.error(f"Erreur Hyperliquid prix: {e}")
         return {}
 
 
-async def get_ohlcv_binance(binance_pair: str, interval: str = "4h", limit: int = 50) -> dict:
-    """Fallback Binance pour HYPE et si Kraken echoue."""
-    url = f"https://api.binance.com/api/v3/klines?symbol={binance_pair}&interval={interval}&limit={limit}"
+# ============================================================
+# HYPERLIQUID — OHLCV (BOUGIES) POUR ANALYSE TECHNIQUE
+# ============================================================
+async def get_ohlcv(symbol: str, interval: str = "4h", count: int = 50) -> dict:
+    """Recupere les bougies OHLCV depuis Hyperliquid candleSnapshot."""
+    # startTime = maintenant - count * interval en ms
+    interval_ms = {
+        "1h": 3600000, "4h": 14400000, "1d": 86400000
+    }.get(interval, 14400000)
+    start_time = int(time_module.time() * 1000) - (count * interval_ms)
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json()
-                if not data or not isinstance(data, list):
-                    return {}
-                closes  = [float(k[4]) for k in data]
-                highs   = [float(k[2]) for k in data]
-                lows    = [float(k[3]) for k in data]
-                volumes = [float(k[5]) for k in data]
-                return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+            async with session.post(
+                HYPERLIQUID_API,
+                json={
+                    "type": "candleSnapshot",
+                    "req": {
+                        "coin": symbol,
+                        "interval": interval,
+                        "startTime": start_time
+                    }
+                },
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                candles = await resp.json()
+
+        if not candles or not isinstance(candles, list):
+            return {}
+
+        # Hyperliquid candle: {"t": timestamp, "o": open, "h": high, "l": low, "c": close, "v": volume}
+        closes  = [float(c["c"]) for c in candles]
+        highs   = [float(c["h"]) for c in candles]
+        lows    = [float(c["l"]) for c in candles]
+        volumes = [float(c["v"]) for c in candles]
+        return {"closes": closes, "highs": highs, "lows": lows, "volumes": volumes}
+
     except Exception as e:
-        logger.error(f"Erreur OHLCV Binance {binance_pair}: {e}")
+        logger.error(f"Erreur OHLCV Hyperliquid {symbol}: {e}")
         return {}
-
-
-async def get_ohlcv(symbol: str) -> dict:
-    """Choisit la meilleure source OHLCV selon le token."""
-    token = WATCHED_TOKENS.get(symbol, {})
-    kraken_pair = token.get("kraken")
-    binance_pair = token.get("binance")
-
-    if kraken_pair:
-        ohlcv = await get_ohlcv_kraken(kraken_pair)
-        if ohlcv:
-            return ohlcv
-
-    if binance_pair:
-        return await get_ohlcv_binance(binance_pair)
-
-    return {}
 
 
 # ============================================================
@@ -326,29 +326,33 @@ async def get_crypto_trending() -> list:
 
 
 # ============================================================
-# API HYPERLIQUID
+# HYPERLIQUID — POSITIONS & BALANCE
 # ============================================================
 async def get_hyperliquid_positions() -> list:
-    url = "https://api.hyperliquid.xyz/info"
-    payload = {"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 data = await resp.json()
                 return data.get("assetPositions", [])
     except Exception as e:
-        logger.error(f"Erreur Hyperliquid: {e}")
+        logger.error(f"Erreur Hyperliquid positions: {e}")
         return []
 
 
 async def get_hyperliquid_balance() -> dict:
-    url = "https://api.hyperliquid.xyz/info"
-    payload = {"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "clearinghouseState", "user": HYPERLIQUID_ADDRESS},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 data = await resp.json()
-                logger.info(f"Hyperliquid raw response keys: {list(data.keys())}")
+                logger.info(f"Hyperliquid keys: {list(data.keys())}")
                 margin = (
                     data.get("crossMarginSummary")
                     or data.get("marginSummary")
@@ -386,7 +390,7 @@ def format_prices(prices: dict) -> str:
     if not prices:
         return "❌ Impossible de recuperer les prix."
     lines = ["📊 *Prix en temps reel*\n"]
-    for symbol in WATCHED_TOKENS.keys():
+    for symbol in WATCHED_TOKENS:
         if symbol in prices:
             data   = prices[symbol]
             usd    = data.get("usd", 0)
@@ -410,16 +414,10 @@ def format_positions(positions: list, balance: dict) -> str:
         margin_used   = balance.get("totalMarginUsed", 0)
         pnl_emoji     = "🟢" if pnl >= 0 else "🔴"
         lines.append("💼 *Compte*")
-        if account_value > 0:
-            lines.append(f"   Valeur totale: ${account_value:,.2f}")
-        else:
-            lines.append(f"   Valeur totale: _non disponible_")
+        lines.append(f"   Valeur totale: ${account_value:,.2f}" if account_value > 0 else "   Valeur totale: _non disponible_")
         if margin_used > 0:
             lines.append(f"   Marge utilisee: ${margin_used:,.2f}")
-        if pnl != 0:
-            lines.append(f"   {pnl_emoji} PnL non realise: ${pnl:+,.2f}\n")
-        else:
-            lines.append(f"   PnL non realise: $0.00\n")
+        lines.append(f"   {pnl_emoji} PnL non realise: ${pnl:+,.2f}\n")
 
     open_positions = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
     if not open_positions:
@@ -476,12 +474,12 @@ async def analyze_setup(prices: dict, trending: list) -> str:
     if not prices:
         return "❌ Donnees de prix indisponibles."
 
-    for symbol in WATCHED_TOKENS.keys():
+    for symbol in WATCHED_TOKENS:
         if symbol not in prices:
             lines.append(f"_⚠️ {symbol} indisponible_\n")
             continue
         change = prices[symbol].get("usd_24h_change", 0)
-        ohlcv  = await get_ohlcv(symbol)
+        ohlcv  = await get_ohlcv(symbol, interval="4h", count=50)
         bloc   = build_token_analysis(symbol, change, ohlcv)
         lines.append(bloc)
         lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -571,7 +569,7 @@ async def job_price_alert(context: ContextTypes.DEFAULT_TYPE):
     prices = await get_crypto_prices()
     if not prices:
         return
-    for symbol in WATCHED_TOKENS.keys():
+    for symbol in WATCHED_TOKENS:
         if symbol not in prices:
             continue
         current = prices[symbol].get("usd", 0)
@@ -610,8 +608,7 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_authorized(update): return
     chat_id = update.effective_chat.id
     job_queue = context.job_queue
-    current_jobs = job_queue.get_jobs_by_name(f"alert_{chat_id}")
-    for job in current_jobs:
+    for job in job_queue.get_jobs_by_name(f"alert_{chat_id}"):
         job.schedule_removal()
     job_queue.run_repeating(
         job_price_alert,
