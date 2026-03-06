@@ -22,10 +22,16 @@ HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 WATCHED_TOKENS = ["BTC", "ETH", "HYPE"]
 
 ALERT_THRESHOLD_PERCENT = 5.0
-LIQUIDATION_ALERT_PERCENT = 15.0  # alerte si prix a moins de 15% du prix de liquidation
-DAILY_SUMMARY_HOUR = 8
-DAILY_SUMMARY_MIN = 0
+LIQUIDATION_ALERT_PERCENT = 15.0
 AUTHORIZED_USER_ID = 1429797974
+
+# Heures UTC (France = UTC+1 en hiver, UTC+2 en ete)
+# 9h00 France hiver = 8h00 UTC
+# 21h00 France hiver = 20h00 UTC
+MORNING_HOUR_UTC   = 8
+MORNING_MIN_UTC    = 0
+EVENING_HOUR_UTC   = 20
+EVENING_MIN_UTC    = 0
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -72,9 +78,9 @@ async def get_crypto_prices() -> dict:
             mid = all_mids.get(symbol)
             if mid is None:
                 continue
-            usd  = float(mid)
-            ctx  = ctx_by_name.get(symbol, {})
-            prev = float(ctx.get("prevDayPx", usd) or usd)
+            usd    = float(mid)
+            ctx    = ctx_by_name.get(symbol, {})
+            prev   = float(ctx.get("prevDayPx", usd) or usd)
             change = ((usd - prev) / prev * 100) if prev else 0
             volume = float(ctx.get("dayNtlVlm", 0) or 0)
             result[symbol] = {
@@ -199,7 +205,7 @@ def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
 
         sr = find_support_resistance(highs, lows, closes)
         if sr:
-            cp = closes[-1]
+            cp       = closes[-1]
             dist_sup = ((cp - sr['support'])    / cp * 100) if cp else 0
             dist_res = ((sr['resistance'] - cp) / cp * 100) if cp else 0
             lines.append(f"   Support:    ${sr['support']:,.2f}  (-{dist_sup:.1f}%)")
@@ -233,11 +239,7 @@ async def get_fear_greed() -> dict:
             ) as resp:
                 data = await resp.json()
                 item = data["data"][0]
-                return {
-                    "value":      int(item["value"]),
-                    "label":      item["value_classification"],
-                    "timestamp":  item["timestamp"]
-                }
+                return {"value": int(item["value"]), "label": item["value_classification"]}
     except Exception as e:
         logger.error(f"Erreur Fear & Greed: {e}")
         return {}
@@ -250,24 +252,17 @@ def format_fear_greed(fg: dict) -> str:
     label = fg["label"]
 
     if value <= 20:
-        emoji = "😱"
-        comment = "Panique extreme — souvent une opportunite d'achat historique."
+        emoji, comment = "😱", "Panique extreme — souvent une opportunite d'achat historique."
     elif value <= 40:
-        emoji = "😨"
-        comment = "Peur sur le marche — les mains faibles vendent."
+        emoji, comment = "😨", "Peur sur le marche — les mains faibles vendent."
     elif value <= 60:
-        emoji = "😐"
-        comment = "Marche neutre — pas de signal fort."
+        emoji, comment = "😐", "Marche neutre — pas de signal fort."
     elif value <= 80:
-        emoji = "😏"
-        comment = "Cupidite — attention aux retournements."
+        emoji, comment = "😏", "Cupidite — attention aux retournements."
     else:
-        emoji = "🤑"
-        comment = "Cupidite extreme — le marche est euphorique, sois prudent."
+        emoji, comment = "🤑", "Cupidite extreme — le marche est euphorique, sois prudent."
 
-    bar_filled = round(value / 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-
+    bar = "█" * round(value / 10) + "░" * (10 - round(value / 10))
     return (
         f"🧠 *Fear & Greed Index*\n\n"
         f"   {emoji} *{value}/100 — {label}*\n"
@@ -281,11 +276,9 @@ def format_fear_greed(fg: dict) -> str:
 # ALERTES SUPPORT / RESISTANCE
 # ============================================================
 async def check_sr_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Verifie si BTC/ETH/HYPE cassent un support ou une resistance."""
     prices = await get_crypto_prices()
     if not prices:
         return
-
     alerts = []
     for symbol in WATCHED_TOKENS:
         if symbol not in prices:
@@ -297,8 +290,6 @@ async def check_sr_alerts(context: ContextTypes.DEFAULT_TYPE):
         sr = find_support_resistance(ohlcv["highs"], ohlcv["lows"], ohlcv["closes"])
         if not sr:
             continue
-
-        # Cassure resistance
         if current >= sr["resistance"] * 0.995:
             alerts.append(
                 f"🚀 *{symbol} — CASSURE RESISTANCE*\n"
@@ -306,7 +297,6 @@ async def check_sr_alerts(context: ContextTypes.DEFAULT_TYPE):
                 f"   Resistance: ${sr['resistance']:,.2f}\n"
                 f"   ➡️ Breakout potentiel a la hausse !"
             )
-        # Cassure support
         elif current <= sr["support"] * 1.005:
             alerts.append(
                 f"💥 *{symbol} — CASSURE SUPPORT*\n"
@@ -314,12 +304,10 @@ async def check_sr_alerts(context: ContextTypes.DEFAULT_TYPE):
                 f"   Support: ${sr['support']:,.2f}\n"
                 f"   ➡️ Risque de continuation baissiere !"
             )
-
     if alerts:
-        msg = "⚠️ *Alertes Niveaux Cles*\n\n" + "\n\n".join(alerts)
         await context.bot.send_message(
             chat_id=context.job.chat_id,
-            text=msg,
+            text="⚠️ *Alertes Niveaux Cles*\n\n" + "\n\n".join(alerts),
             parse_mode="Markdown"
         )
     else:
@@ -330,7 +318,6 @@ async def check_sr_alerts(context: ContextTypes.DEFAULT_TYPE):
 # ALERTE LIQUIDATION
 # ============================================================
 async def check_liquidation_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Alerte si une position ouverte approche son prix de liquidation."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -342,51 +329,42 @@ async def check_liquidation_alerts(context: ContextTypes.DEFAULT_TYPE):
 
         positions = data.get("assetPositions", [])
         open_pos  = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
-
         if not open_pos:
             return
 
-        prices  = await get_crypto_prices()
-        alerts  = []
-
+        prices = await get_crypto_prices()
+        alerts = []
         for p in open_pos:
-            pos        = p.get("position", {})
-            coin       = pos.get("coin", "?")
-            liq_px     = float(pos.get("liquidationPx") or 0)
-            size       = float(pos.get("szi", 0))
-            current    = prices.get(coin, {}).get("usd", 0)
-
+            pos       = p.get("position", {})
+            coin      = pos.get("coin", "?")
+            liq_px    = float(pos.get("liquidationPx") or 0)
+            size      = float(pos.get("szi", 0))
+            current   = prices.get(coin, {}).get("usd", 0)
             if liq_px == 0 or current == 0:
                 continue
-
-            dist_pct = abs((current - liq_px) / current * 100)
+            dist_pct  = abs((current - liq_px) / current * 100)
             direction = "LONG" if size > 0 else "SHORT"
-
             if dist_pct <= LIQUIDATION_ALERT_PERCENT:
                 alerts.append(
                     f"🔴 *{coin} {direction} — DANGER LIQUIDATION*\n"
-                    f"   Prix actuel:    ${current:,.2f}\n"
+                    f"   Prix actuel:      ${current:,.2f}\n"
                     f"   Prix liquidation: ${liq_px:,.2f}\n"
                     f"   Distance: {dist_pct:.1f}% — AGIS VITE !"
                 )
-
         if alerts:
-            msg = "🚨 *ALERTE LIQUIDATION*\n\n" + "\n\n".join(alerts)
             await context.bot.send_message(
                 chat_id=context.job.chat_id,
-                text=msg,
+                text="🚨 *ALERTE LIQUIDATION*\n\n" + "\n\n".join(alerts),
                 parse_mode="Markdown"
             )
-
     except Exception as e:
         logger.error(f"Erreur check liquidation: {e}")
 
 
 # ============================================================
-# JOB COMBINE 8H ET 20H
+# JOB COMBINE MATIN ET SOIR
 # ============================================================
 async def job_twice_daily(context: ContextTypes.DEFAULT_TYPE):
-    """Lance les checks S/R et liquidation a 8h et 20h."""
     await check_sr_alerts(context)
     await check_liquidation_alerts(context)
 
@@ -489,8 +467,8 @@ def format_prices(prices: dict) -> str:
     lines = ["📊 *Prix en temps reel*\n"]
     for symbol in WATCHED_TOKENS:
         if symbol in prices:
-            d      = prices[symbol]
-            emoji  = "🟢" if d["usd_24h_change"] >= 0 else "🔴"
+            d     = prices[symbol]
+            emoji = "🟢" if d["usd_24h_change"] >= 0 else "🔴"
             lines.append(
                 f"{emoji} *{symbol}*\n"
                 f"   💵 ${d['usd']:,.2f}  |  💶 €{d['eur']:,.2f}\n"
@@ -503,9 +481,9 @@ def format_prices(prices: dict) -> str:
 def format_positions(positions: list, balance: dict) -> str:
     lines = ["📈 *Positions Hyperliquid*\n"]
     if balance:
-        pnl   = balance.get("totalUnrealizedPnl", 0)
-        av    = balance.get("accountValue", 0)
-        mu    = balance.get("totalMarginUsed", 0)
+        pnl = balance.get("totalUnrealizedPnl", 0)
+        av  = balance.get("accountValue", 0)
+        mu  = balance.get("totalMarginUsed", 0)
         lines.append("💼 *Compte*")
         lines.append(f"   Valeur totale: ${av:,.2f}" if av > 0 else "   Valeur totale: _non disponible_")
         if mu > 0:
@@ -592,7 +570,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧠 /peur — Fear & Greed Index\n"
         "🔔 /alertes — Activer les alertes auto\n"
         "🔕 /desactiver\\_alertes — Stopper les alertes\n"
-        "ℹ️ /aide — Affiche ce message\n\n"
+        "ℹ️ /aide — Affiche ce message\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -629,9 +607,8 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_peur(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
     await update.message.reply_text("⏳ Recuperation du Fear & Greed Index...", parse_mode="Markdown")
-    fg  = await get_fear_greed()
-    msg = format_fear_greed(fg)
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    fg = await get_fear_greed()
+    await update.message.reply_text(format_fear_greed(fg), parse_mode="Markdown")
 
 
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -678,28 +655,25 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id   = update.effective_chat.id
     job_queue = context.job_queue
 
-    # Supprime les anciens jobs
-    for name in [f"alert_{chat_id}", f"daily_{chat_id}", f"sr_{chat_id}_8", f"sr_{chat_id}_20"]:
+    for name in [f"alert_{chat_id}", f"daily_{chat_id}", f"sr_{chat_id}_matin", f"sr_{chat_id}_soir"]:
         for job in job_queue.get_jobs_by_name(name):
             job.schedule_removal()
 
     # Alerte prix toutes les heures
     job_queue.run_repeating(job_price_alert, interval=3600, first=10, chat_id=chat_id, name=f"alert_{chat_id}")
 
-    # Resume quotidien 8h
-    job_queue.run_daily(job_daily_summary, time=time(7, 35), chat_id=chat_id, name=f"daily_{chat_id}")
+    # Resume quotidien + check S/R a 9h00 heure francaise (8h00 UTC)
+    job_queue.run_daily(job_daily_summary,  time=time(MORNING_HOUR_UTC, MORNING_MIN_UTC), chat_id=chat_id, name=f"daily_{chat_id}")
+    job_queue.run_daily(job_twice_daily,    time=time(MORNING_HOUR_UTC, MORNING_MIN_UTC), chat_id=chat_id, name=f"sr_{chat_id}_matin")
 
-    # Check S/R + liquidation a 8h heure francaise (UTC+1 = 7h UTC)
-    job_queue.run_daily(job_twice_daily, time=time(7, 35), chat_id=chat_id, name=f"sr_{chat_id}_8")
-
-    # Check S/R + liquidation a 20h heure francaise (UTC+1 = 19h UTC)
-    job_queue.run_daily(job_twice_daily, time=time(19, 0), chat_id=chat_id, name=f"sr_{chat_id}_20")
+    # Check S/R + liquidation a 21h00 heure francaise (20h00 UTC)
+    job_queue.run_daily(job_twice_daily,    time=time(EVENING_HOUR_UTC, EVENING_MIN_UTC), chat_id=chat_id, name=f"sr_{chat_id}_soir")
 
     await update.message.reply_text(
         "✅ *Alertes activees!*\n\n"
         f"• Alerte prix si variation > {ALERT_THRESHOLD_PERCENT}% / heure\n"
-        f"• Resume quotidien a 8h\n"
-        f"• Check S/R + liquidation a 8h et 20h (heure francaise)\n\n"
+        f"• Resume + Check S/R a *9h00* (heure francaise)\n"
+        f"• Check S/R + liquidation a *21h00* (heure francaise)\n\n"
         "Utilise /desactiver\\_alertes pour stopper.",
         parse_mode="Markdown"
     )
@@ -708,7 +682,7 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
     chat_id = update.effective_chat.id
-    for name in [f"alert_{chat_id}", f"daily_{chat_id}", f"sr_{chat_id}_8", f"sr_{chat_id}_20"]:
+    for name in [f"alert_{chat_id}", f"daily_{chat_id}", f"sr_{chat_id}_matin", f"sr_{chat_id}_soir"]:
         for job in context.job_queue.get_jobs_by_name(name):
             job.schedule_removal()
     await update.message.reply_text("🔕 Toutes les alertes sont desactivees.")
