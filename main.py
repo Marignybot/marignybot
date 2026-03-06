@@ -125,11 +125,41 @@ async def get_hyperliquid_balance() -> dict:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
-                margin = data.get("marginSummary", {})
+                logger.info(f"Hyperliquid raw response keys: {list(data.keys())}")
+
+                # Hyperliquid peut retourner les données sous différentes clés selon le type de compte
+                # On essaie dans l'ordre : crossMarginSummary, marginSummary, puis directement à la racine
+                margin = (
+                    data.get("crossMarginSummary")
+                    or data.get("marginSummary")
+                    or {}
+                )
+
+                account_value = float(margin.get("accountValue", 0))
+                total_margin_used = float(margin.get("totalMarginUsed", 0))
+                total_unrealized_pnl = float(margin.get("totalUnrealizedPnl", 0))
+
+                # Fallback : si accountValue est toujours 0, on cherche dans d'autres champs
+                if account_value == 0:
+                    # Certains comptes ont withdrawable ou crossAccountValue
+                    account_value = float(
+                        data.get("crossAccountValue", 0)
+                        or data.get("withdrawable", 0)
+                        or 0
+                    )
+
+                # Calcul du PnL réel depuis les positions si toujours 0
+                if total_unrealized_pnl == 0:
+                    positions = data.get("assetPositions", [])
+                    total_unrealized_pnl = sum(
+                        float(p.get("position", {}).get("unrealizedPnl", 0))
+                        for p in positions
+                    )
+
                 return {
-                    "accountValue": float(margin.get("accountValue", 0)),
-                    "totalMarginUsed": float(margin.get("totalMarginUsed", 0)),
-                    "totalUnrealizedPnl": float(margin.get("totalUnrealizedPnl", 0)),
+                    "accountValue": account_value,
+                    "totalMarginUsed": total_margin_used,
+                    "totalUnrealizedPnl": total_unrealized_pnl,
                 }
     except Exception as e:
         logger.error(f"Erreur Hyperliquid balance: {e}")
@@ -160,13 +190,24 @@ def format_positions(positions: list, balance: dict) -> str:
     lines = ["📈 *Positions Hyperliquid*\n"]
     if balance:
         pnl = balance.get("totalUnrealizedPnl", 0)
+        account_value = balance.get("accountValue", 0)
+        margin_used = balance.get("totalMarginUsed", 0)
         pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-        lines.append(
-            f"💼 *Compte*\n"
-            f"   Valeur totale: ${balance.get('accountValue', 0):,.2f}\n"
-            f"   Marge utilisée: ${balance.get('totalMarginUsed', 0):,.2f}\n"
-            f"   {pnl_emoji} PnL non réalisé: ${pnl:+,.2f}\n"
-        )
+
+        lines.append("💼 *Compte*")
+        if account_value > 0:
+            lines.append(f"   Valeur totale: ${account_value:,.2f}")
+        else:
+            lines.append(f"   Valeur totale: _non disponible_")
+
+        if margin_used > 0:
+            lines.append(f"   Marge utilisée: ${margin_used:,.2f}")
+
+        if pnl != 0:
+            lines.append(f"   {pnl_emoji} PnL non réalisé: ${pnl:+,.2f}\n")
+        else:
+            lines.append(f"   PnL non réalisé: $0.00\n")
+
     open_positions = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
     if not open_positions:
         lines.append("_Aucune position ouverte en ce moment._")
