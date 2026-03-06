@@ -257,7 +257,7 @@ def format_daily_summary(news: list, trending: list) -> str:
     return "\n".join(lines)
 
 
-def analyze_setup(prices: dict) -> str:
+def analyze_setup(prices: dict, trending: list) -> str:
     lines = ["🎯 *Analyse Setups de Trade*\n"]
     if not prices:
         return "❌ Données indisponibles pour l'analyse."
@@ -289,6 +289,16 @@ def analyze_setup(prices: dict) -> str:
                 f"   Variation 24h: {change:.2f}%\n"
                 f"   ➡️ Prudence. Pas de signal fort.\n"
             )
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🔥 *Top 3 Tokens Trending (24h)*\n")
+    if trending:
+        for i, t in enumerate(trending, 1):
+            change = t.get("change", 0) or 0
+            emoji = "🟢" if change >= 0 else "🔴"
+            lines.append(f"{i}. *{t['name']}* (${t['symbol']}) — Rank #{t['rank']} {emoji} {change:+.1f}%\n")
+    else:
+        lines.append("_Trending indisponible pour le moment._\n")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append("\n⚠️ _Ceci n'est pas un conseil financier. DYOR._")
     return "\n".join(lines)
 
@@ -330,8 +340,11 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
     await update.message.reply_text("⏳ Analyse en cours...", parse_mode="Markdown")
-    prices = await get_crypto_prices()
-    msg = analyze_setup(prices)
+    prices, trending = await asyncio.gather(
+        get_crypto_prices(),
+        get_crypto_trending()
+    )
+    msg = analyze_setup(prices, trending)
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
