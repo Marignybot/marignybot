@@ -552,6 +552,8 @@ async def fetch_top_traders_hl() -> list:
         # Structure reelle: {"leaderboardRows": [[adresse, {windowPerformances:[...]}], ...]}
         raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
         logger.info(f"Traders bruts: {len(raw_rows)}")
+        if raw_rows:
+            logger.info(f"Exemple row[0]: {str(raw_rows[0])[:500]}")
 
         traders = []
         for row in raw_rows[:100]:
