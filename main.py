@@ -616,13 +616,18 @@ async def fetch_top_traders_hl() -> list:
 
 
 def apply_exclusion_filters(traders: list) -> list:
-    """Applique les filtres d'exclusion obligatoires."""
-    return [
-        t for t in traders
-        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN
-        and t["n_trades"] >= TRADEBOT_MIN_TRADES
-        and t["pnl"] > 0
-    ]
+    """Applique les filtres d'exclusion."""
+    filtered = []
+    for t in traders:
+        # Exclure seulement si MDD catastrophique ou PnL negatif
+        if t["mdd"] > TRADEBOT_MAX_DRAWDOWN:
+            continue
+        if t["pnl"] <= 0:
+            continue
+        # n_trades optionnel — API ne le fournit pas toujours
+        filtered.append(t)
+    logger.info(f"Apres filtres: {len(filtered)}/{len(traders)} traders")
+    return filtered
 
 
 def rank_and_score_traders(traders: list) -> list:
