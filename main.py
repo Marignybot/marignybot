@@ -635,7 +635,7 @@ async def fetch_top_traders_hl() -> list:
                 continue
 
         candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = candidates[:150]
+        top_candidates = candidates[:100]
         logger.info(f"{len(candidates)} candidats qualifiés | top 150 retenus")
 
         async def fetch_portfolio(session, address):
@@ -946,7 +946,7 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Analyse par asset en cours...")
 
     # *** FIX PRINCIPAL : récupérer les traders ENRICHIS avec asset_pnl ***
-    asset_report, enriched_ranked = await build_asset_report(ranked[:20])
+    asset_report, enriched_ranked = await build_asset_report(ranked[:100])
     await update.message.reply_text(asset_report, parse_mode="Markdown")
 
     # *** Stocker les traders ENRICHIS — asset_pnl est maintenant rempli ***
@@ -1654,7 +1654,7 @@ async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ranked = rank_and_score_traders(filtered)
         # *** FIX : enrichir asset_pnl même dans le fallback ***
         await update.message.reply_text("🔍 Enrichissement par asset en cours...", parse_mode="Markdown")
-        _, enriched_ranked = await build_asset_report(ranked[:20])
+        _, enriched_ranked = await build_asset_report(ranked[:100])
         copy_state["last_ranked"] = enriched_ranked
         await update.message.reply_text(build_top5_report(ranked[:5]), parse_mode="Markdown")
 
