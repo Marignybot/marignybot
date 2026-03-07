@@ -833,7 +833,7 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Message 2 : Top 2 par asset avec userFills (appels rapides sur top 20 seulement)
     await update.message.reply_text("🔍 Analyse par asset en cours...")
-    asset_report = await build_asset_report(scored[:20])
+    asset_report = await build_asset_report(ranked[:20])
     await update.message.reply_text(asset_report, parse_mode="Markdown")
 
 
