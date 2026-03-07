@@ -678,9 +678,22 @@ async def fetch_top_traders_hl() -> list:
                     if dd > max_dd:
                         max_dd = dd
 
-                # Filtre MDD < 40%
-                if max_dd > 40:
+                # MDD allTime aussi
+                peak_at2 = acv_hist_at[0] if acv_hist_at else 0
+                max_dd_at = 0.0
+                for v in acv_hist_at:
+                    if v > peak_at2:
+                        peak_at2 = v
+                    dd = (peak_at2 - v) / peak_at2 * 100 if peak_at2 > 0 else 0
+                    if dd > max_dd_at:
+                        max_dd_at = dd
+
+                # Filtre MDD < 40% sur 30j ET allTime
+                worst_mdd = max(max_dd, max_dd_at)
+                if worst_mdd > 40:
+                    logger.info(f"MDD trop élevé {address[:12]}... (30j:{max_dd:.0f}% / allTime:{max_dd_at:.0f}%)")
                     return None
+                max_dd = worst_mdd
 
                 # Consistance 30j (% points avec PnL croissant)
                 pos_moves = sum(1 for i in range(1, len(pnl_hist_30)) if pnl_hist_30[i] > pnl_hist_30[i-1])
