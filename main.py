@@ -1230,7 +1230,11 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         if price <= 0:
             return {"error": f"Prix {asset} introuvable"}
 
-        limit_px = round(price * (1.005 if is_buy else 0.995), 6)
+        raw_px   = price * (1.005 if is_buy else 0.995)
+        # Hyperliquid: max 5 chiffres significatifs
+        magnitude = len(str(int(raw_px)))
+        decimals  = max(0, 5 - magnitude)
+        limit_px  = float(round(raw_px, decimals))
 
         # SDK gère la signature EIP-712 correctement
         loop = asyncio.get_event_loop()
