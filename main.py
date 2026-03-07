@@ -612,6 +612,15 @@ async def fetch_top_traders_hl() -> list:
                 if pnl_final <= 0:
                     return None
 
+                # Filtre activite : dernier trade dans les 15 derniers jours
+                raw_at = at.get("pnlHistory", [])
+                if raw_at:
+                    last_ts_ms = raw_at[-1][0]  # timestamp en millisecondes
+                    days_since = (datetime.now().timestamp() * 1000 - last_ts_ms) / (1000 * 86400)
+                    if days_since > 15:
+                        logger.info(f"Inactif {address[:10]}... ({days_since:.0f}j sans trade)")
+                        return None
+
                 initial_value = acv_history[0] if acv_history[0] > 0 else 1
                 roi = (pnl_final / initial_value) * 100
 
