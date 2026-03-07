@@ -1236,14 +1236,28 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         decimals  = max(0, 5 - magnitude)
         limit_px  = float(round(raw_px, decimals))
 
-        # SDK gère la signature EIP-712 correctement
+        # Taille minimale et décimales par asset (règles Hyperliquid)
+        SIZE_RULES = {
+            "BTC":  {"min": 0.001,  "decimals": 3},
+            "ETH":  {"min": 0.01,   "decimals": 2},
+            "SOL":  {"min": 0.1,    "decimals": 1},
+            "HYPE": {"min": 1.0,    "decimals": 0},
+            "TAO":  {"min": 0.01,   "decimals": 2},
+        }
+        rules = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
+        sz    = round(size, rules["decimals"])
+        sz    = max(sz, rules["min"])
+        if sz * price < 10:
+            sz = max(round(11.0 / price, rules["decimals"]), rules["min"])
+        logger.info(f"Ordre {asset} size={sz} prix={price} ~${sz*price:.1f}")
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             lambda: exchange.order(
                 asset,
                 is_buy,
-                round(size, 6),
+                sz,
                 limit_px,
                 {"limit": {"tif": "Ioc"}}
             )
