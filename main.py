@@ -1175,71 +1175,6 @@ async def send_copy_notification(app, message: str):
         logger.error(f"Notification copy trading erreur: {e}")
 
 
-async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
-    try:
-        if not HL_PRIVATE_KEY:
-            logger.error("HL_PRIVATE_KEY non définie")
-            return {"error": "Clé privée manquante"}
-
-        from eth_account import Account
-        from eth_account.messages import encode_defunct
-        import hashlib, struct
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "allMids"},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                mids = await resp.json()
-
-        price = float(mids.get(asset, 0))
-        if price <= 0:
-            return {"error": f"Prix {asset} introuvable"}
-
-        limit_px = price * (1.005 if is_buy else 0.995)
-        limit_px = round(limit_px, 2)
-
-        timestamp = int(datetime.now().timestamp() * 1000)
-
-        order_payload = {
-            "action": {
-                "type": "order",
-                "orders": [{
-                    "a": await get_asset_index(asset),
-                    "b": is_buy,
-                    "p": str(limit_px),
-                    "s": str(round(size, 6)),
-                    "r": False,
-                    "t": {"limit": {"tif": "Ioc"}}
-                }],
-                "grouping": "na"
-            },
-            "nonce": timestamp,
-            "vaultAddress": None
-        }
-
-        account = Account.from_key(HL_PRIVATE_KEY)
-        signature = sign_order(account, order_payload["action"], timestamp)
-        order_payload["signature"] = signature
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.hyperliquid.xyz/exchange",
-                json=order_payload,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                result = await resp.json()
-
-        logger.info(f"Ordre {asset} {'BUY' if is_buy else 'SELL'} {size} → {result}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Erreur place_order {asset}: {e}")
-        return {"error": str(e)}
-
-
 async def get_asset_index(asset: str) -> int:
     try:
         async with aiohttp.ClientSession() as session:
@@ -1259,23 +1194,116 @@ async def get_asset_index(asset: str) -> int:
         return -1
 
 
-def sign_order(account, action: dict, nonce: int) -> dict:
-    import json as json_mod
-    import hashlib
+def sign_l1_action(account, action: dict, vault_address, nonce: int) -> dict:
+    """
+    Signature EIP-712 correcte pour Hyperliquid L1.
+    Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
+    """
+    import msgpack
     from eth_account.messages import encode_defunct
+    from eth_utils import keccak
 
-    action_str = json_mod.dumps(action, separators=(',', ':'), sort_keys=True)
-    action_hash = hashlib.sha256(action_str.encode()).hexdigest()
+    # Encoder l'action avec msgpack (format requis par HL)
+    action_bytes = msgpack.packb(action, use_bin_type=True)
+    action_hash  = keccak(action_bytes)
 
-    msg = f"\x19Hyperliquid SignedAction\n{action_hash}\n{nonce}\n"
-    msg_hash = encode_defunct(text=msg)
-    signed = account.sign_message(msg_hash)
+    # Encoder vault_address (None → 0x0000...0000)
+    if vault_address:
+        vault_bytes = bytes.fromhex(vault_address[2:].lower().zfill(40))
+    else:
+        vault_bytes = b'\x00' * 20
+
+    # Nonce en big-endian 8 bytes
+    nonce_bytes = nonce.to_bytes(8, 'big')
+
+    # Flag: 0 si pas de vault, 1 si vault
+    flag_byte = b'\x01' if vault_address else b'\x00'
+
+    # Hash final
+    payload = action_hash + nonce_bytes + flag_byte + vault_bytes
+    final_hash = keccak(payload)
+
+    # Signer avec eth_account
+    msg = encode_defunct(final_hash)
+    signed = account.sign_message(msg)
 
     return {
         "r": hex(signed.r),
         "s": hex(signed.s),
-        "v": signed.v
+        "v": signed.v,
     }
+
+
+async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
+    try:
+        if not HL_PRIVATE_KEY:
+            logger.error("HL_PRIVATE_KEY non définie")
+            return {"error": "Clé privée manquante"}
+
+        from eth_account import Account
+
+        account = Account.from_key(HL_PRIVATE_KEY)
+        logger.info(f"place_order — wallet dérivé: {account.address}")
+
+        # Prix actuel
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "allMids"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                mids = await resp.json()
+
+        price = float(mids.get(asset, 0))
+        if price <= 0:
+            return {"error": f"Prix {asset} introuvable"}
+
+        # Slippage 0.5%
+        limit_px = round(price * (1.005 if is_buy else 0.995), 6)
+
+        asset_idx = await get_asset_index(asset)
+        if asset_idx < 0:
+            return {"error": f"Asset {asset} introuvable"}
+
+        timestamp = int(datetime.now().timestamp() * 1000)
+
+        action = {
+            "type": "order",
+            "orders": [{
+                "a": asset_idx,
+                "b": is_buy,
+                "p": str(limit_px),
+                "s": str(round(size, 6)),
+                "r": False,
+                "t": {"limit": {"tif": "Ioc"}}
+            }],
+            "grouping": "na"
+        }
+
+        signature = sign_l1_action(account, action, None, timestamp)
+
+        payload = {
+            "action":       action,
+            "nonce":        timestamp,
+            "signature":    signature,
+            "vaultAddress": None
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/exchange",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                result = await resp.json()
+
+        logger.info(f"Ordre {asset} {'BUY' if is_buy else 'SELL'} {size} → {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Erreur place_order {asset}: {e}")
+        return {"error": str(e)}
 
 
 async def get_my_positions() -> dict:
