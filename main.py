@@ -1519,9 +1519,9 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
         if my_capital <= 0:
             my_capital = 1000.0  # fallback
 
-        # Ratio proportionnel
+        # Ratio proportionnel — diviseur x5 (trader 10% → moi 2%)
         ratio        = trader_pos_value / max(trader_capital, 1)
-        my_usd_value = ratio * my_capital
+        my_usd_value = (ratio / 5) * my_capital
         my_usd_value = max(my_usd_value, 11.0)  # minimum $11
 
         SIZE_RULES = {
