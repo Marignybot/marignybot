@@ -505,9 +505,13 @@ def score_consistency(v: float) -> float:
 
 def score_drawdown(mdd: float) -> float:
     if mdd <= 5:  return 100.0
-    if mdd <= 10: return 80.0
+    if mdd <= 10: return 85.0
+    if mdd <= 15: return 70.0
     if mdd <= 20: return 55.0
-    if mdd <= 30: return 25.0
+    if mdd <= 25: return 40.0
+    if mdd <= 30: return 30.0
+    if mdd <= 35: return 20.0
+    if mdd <= 40: return 10.0
     return 0.0
 
 
@@ -775,7 +779,7 @@ def build_top5_report(top5: list) -> str:
         "",
     ]
     for i, t in enumerate(top5, 1):
-        verdict = "🟢 FORT" if t["score"] >= 70 else ("🟡 MOYEN" if t["score"] >= 55 else "🔴 FAIBLE")
+        verdict = "🟢 FORT" if t["score"] >= 65 else ("🟡 MOYEN" if t["score"] >= 45 else "🔴 FAIBLE")
         lines.append(f"*#{i}* — Score: *{t['score']}/100* {verdict}")
         lines.append(f"ROI 30j: {t.get('roi',0):.0f}% | ROE all: {t.get('roe_at',0):.0f}%")
         lines.append(f"MDD: {t['mdd']:.0f}% | WinRate: {t['winrate']:.0f}% | PnL 30j: ${t['pnl']:+,.0f}")
@@ -851,7 +855,7 @@ async def build_asset_report(traders: list) -> str:
 
         lines.append(f"— *{asset}* —")
         if not top2:
-            lines.append("  Aucun trader qualifié")
+            lines.append("  _Aucun spécialiste identifié parmi le top 20_")
         else:
             for rank, (apnl, t) in enumerate(top2, 1):
                 assigned.add(t["address"])
