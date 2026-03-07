@@ -546,7 +546,16 @@ async def fetch_top_traders_hl() -> list:
                 "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
+                logger.info(f"Leaderboard status: {resp.status}")
                 data = await resp.json()
+
+        logger.info(f"Leaderboard type: {type(data)}")
+        if isinstance(data, dict):
+            logger.info(f"Leaderboard keys: {list(data.keys())}")
+        elif isinstance(data, list):
+            logger.info(f"Leaderboard rows: {len(data)}")
+            if data:
+                logger.info(f"First row keys: {list(data[0].keys())}")
 
         traders = []
         rows = data if isinstance(data, list) else data.get("leaderboardRows", [])
