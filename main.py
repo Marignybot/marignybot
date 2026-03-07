@@ -804,62 +804,94 @@ def build_top5_report(top5: list) -> str:
 
 async def build_asset_report(traders: list) -> tuple:
     """
-    Top 2 par asset via userFills.
+    Top 2 par asset.
+    Méthode : userFills (trades fermés) + clearinghouseState (positions ouvertes).
+    Les positions ouvertes comptent comme PnL non réalisé pour identifier les spécialistes.
     Retourne (rapport_texte, traders_enrichis_avec_asset_pnl).
-    *** FIX : retourne maintenant un tuple pour que last_ranked soit enrichi ***
     """
     ASSETS = ["BTC", "ETH", "SOL", "HYPE", "TAO"]
 
-    async def get_asset_pnl(session, trader):
+    # Mapping exhaustif des noms de coins Hyperliquid → nom canonique
+    COIN_MAP = {
+        "BTC": "BTC", "WBTC": "BTC", "BTC-PERP": "BTC",
+        "ETH": "ETH", "WETH": "ETH", "ETH-PERP": "ETH",
+        "SOL": "SOL", "kSOL": "SOL", "SOL-PERP": "SOL",
+        "HYPE": "HYPE", "kHYPE": "HYPE", "HYPE-PERP": "HYPE",
+        "TAO": "TAO", "kTAO": "TAO", "TAO-PERP": "TAO",
+    }
+
+    async def enrich_trader(session, trader):
+        asset_pnl = {}
         try:
+            # 1. Trades fermés via userFills
             async with session.post(
                 "https://api-ui.hyperliquid.xyz/info",
                 json={"type": "userFills", "user": trader["address"]},
-                timeout=aiohttp.ClientTimeout(total=8)
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 fills = await resp.json()
-            asset_pnl = {}
-            COIN_MAP = {
-                "BTC":    "BTC", "WBTC":  "BTC",
-                "ETH":    "ETH", "WETH":  "ETH",
-                "SOL":    "SOL", "kSOL":  "SOL",
-                "HYPE":   "HYPE","kHYPE": "HYPE",
-                "TAO":    "TAO", "kTAO":  "TAO",
-            }
-            all_coins = set()
+
             if isinstance(fills, list):
                 for fill in fills:
                     if not isinstance(fill, dict):
                         continue
                     coin_raw = fill.get("coin", "")
-                    all_coins.add(coin_raw)
                     coin = COIN_MAP.get(coin_raw, coin_raw)
                     pnl_fill = float(fill.get("closedPnl", 0) or 0)
                     if coin:
                         asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pnl_fill
-            if all_coins:
-                logger.info(f"Coins trouvés pour {trader['address'][:10]}: {sorted(all_coins)[:15]}")
-            return {**trader, "asset_pnl": asset_pnl}
-        except Exception:
-            return {**trader, "asset_pnl": {}}
+
+            # 2. Positions ouvertes via clearinghouseState
+            # Une position ouverte prouve que le trader est actif sur cet asset
+            # On ajoute le PnL non réalisé pour ne pas exclure les positions récentes
+            async with session.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "clearinghouseState", "user": trader["address"]},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp2:
+                state = await resp2.json()
+
+            if isinstance(state, dict):
+                for pos in state.get("assetPositions", []):
+                    p = pos.get("position", {})
+                    sz = float(p.get("szi", 0) or 0)
+                    if sz == 0:
+                        continue
+                    coin_raw = p.get("coin", "")
+                    coin = COIN_MAP.get(coin_raw, coin_raw)
+                    upnl = float(p.get("unrealizedPnl", 0) or 0)
+                    if coin:
+                        # Ajouter le PnL non réalisé — si position ouverte et profitable,
+                        # le trader compte comme spécialiste même sans trades fermés récents
+                        existing = asset_pnl.get(coin, 0.0)
+                        # On garde le max entre fills et upnl pour ne pas dégrader un bon trader
+                        asset_pnl[coin] = existing + (upnl if upnl > 0 else 0)
+                        # Garantir au minimum 1.0 si position ouverte (pour détection spécialiste)
+                        if asset_pnl[coin] <= 0 and sz != 0:
+                            asset_pnl[coin] = 1.0
+
+            logger.info(f"Trader {trader['address'][:10]}: asset_pnl={asset_pnl}")
+
+        except Exception as e:
+            logger.warning(f"enrich_trader {trader['address'][:12]}: {e}")
+
+        return {**trader, "asset_pnl": asset_pnl}
 
     async with aiohttp.ClientSession() as session:
-        tasks = [get_asset_pnl(session, t) for t in traders]
-        enriched = await asyncio.gather(*tasks)
+        tasks = [enrich_trader(session, t) for t in traders]
+        enriched = list(await asyncio.gather(*tasks))
 
-    # Convertir en liste (asyncio.gather retourne un tuple)
-    enriched = list(enriched)
-
-    lines = ["🎯 *TOP 2 PAR ASSET* (30j)", ""]
-    assigned = set()
+    n = len(enriched)
+    lines = [f"🎯 *TOP 2 PAR ASSET* (top {n} traders analysés)", ""]
 
     for asset in ASSETS:
-        candidates = []
-        for t in enriched:
-            apnl = t.get("asset_pnl", {}).get(asset, 0.0)
-            if apnl > 0:
-                candidates.append((apnl, t))
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        # Trier par PnL sur cet asset décroissant
+        candidates = sorted(
+            [(t.get("asset_pnl", {}).get(asset, 0.0), t) for t in enriched if t.get("asset_pnl", {}).get(asset, 0.0) > 0],
+            key=lambda x: x[0],
+            reverse=True
+        )
+
         seen = set()
         top2 = []
         for apnl, t in candidates:
@@ -871,15 +903,13 @@ async def build_asset_report(traders: list) -> tuple:
 
         lines.append(f"— *{asset}* —")
         if not top2:
-            lines.append("  _Aucun spécialiste identifié parmi le top 20_")
+            lines.append(f"  _Aucun spécialiste identifié parmi les {n} traders_")
         else:
             for rank, (apnl, t) in enumerate(top2, 1):
-                assigned.add(t["address"])
                 lines.append(f"*#{rank}* PnL {asset}: ${apnl:+,.0f} | Score: {t['score']}/100")
                 lines.append(f"`{t['address']}`")
         lines.append("")
 
-    # *** RETOURNE LE TUPLE (texte, enriched) ***
     return "\n".join(lines), enriched
 
 
