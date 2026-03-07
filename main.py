@@ -618,48 +618,46 @@ async def fetch_top_traders_hl() -> list:
                 ) as resp:
                     portfolio = await resp.json()
 
+                # Parser les windows
                 windows = {}
                 for item in portfolio:
                     if isinstance(item, list) and len(item) == 2:
                         windows[item[0]] = item[1]
 
-                # --- Filtre activité : window "day" doit avoir eu du PnL récent ---
+                # --- Filtre activité 15j ---
+                now_ms     = datetime.now().timestamp() * 1000
+                cutoff_ms  = now_ms - (15 * 86400 * 1000)
+                recent_activity = False
+
                 day_data = windows.get("perpDay") or windows.get("day", {})
-                day_pnl_hist = day_data.get("pnlHistory", [])
-                # Chercher si au moins un point des 15 derniers jours a un PnL non nul
-                now_ms = datetime.now().timestamp() * 1000
-                cutoff_ms = now_ms - (15 * 86400 * 1000)
-                recent_activity = any(
-                    p[0] >= cutoff_ms and float(p[1]) != 0.0
-                    for p in day_pnl_hist
-                    if isinstance(p, list) and len(p) == 2
-                )
-                # Fallback : vérifier le dernier timestamp du month
+                for p in day_data.get("pnlHistory", []):
+                    if isinstance(p, list) and len(p) == 2 and p[0] >= cutoff_ms and float(p[1]) != 0.0:
+                        recent_activity = True
+                        break
+
                 if not recent_activity:
                     month_data = windows.get("perpMonth") or windows.get("month", {})
                     month_hist = month_data.get("pnlHistory", [])
                     if month_hist:
-                        last_ts = month_hist[-1][0]
+                        last_ts  = month_hist[-1][0]
                         days_ago = (now_ms - last_ts) / (86400 * 1000)
                         recent_activity = days_ago <= 15
 
                 if not recent_activity:
-                    logger.info(f"Inactif (>15j): {address[:12]}...")
                     return None
 
-                # --- Métriques depuis window month (30j) ---
-                m30 = windows.get("perpMonth") or windows.get("month", {})
-                pnl_hist_30 = [float(p[1]) for p in m30.get("pnlHistory", []) if isinstance(p, list)]
-                acv_hist_30 = [float(p[1]) for p in m30.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
+                # --- Métriques 30j ---
+                m30          = windows.get("perpMonth") or windows.get("month", {})
+                pnl_hist_30  = [float(p[1]) for p in m30.get("pnlHistory", []) if isinstance(p, list)]
+                acv_hist_30  = [float(p[1]) for p in m30.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
 
                 if not pnl_hist_30 or not acv_hist_30:
                     return None
 
-                pnl_30d  = pnl_hist_30[-1]
+                pnl_30d = pnl_hist_30[-1]
                 if pnl_30d <= 0:
                     return None
 
-                # Capital actuel
                 current_value = acv_hist_30[-1]
                 if current_value < 10000:
                     return None
@@ -668,38 +666,42 @@ async def fetch_top_traders_hl() -> list:
                 base_30 = max(current_value - pnl_30d, 1)
                 roi_30d = min((pnl_30d / base_30) * 100, 2000)
 
-                # Max Drawdown 30j
-                peak = acv_hist_30[0]
-                max_dd = 0.0
+                # MDD 30j
+                peak   = acv_hist_30[0]
+                mdd_30 = 0.0
                 for v in acv_hist_30:
                     if v > peak:
                         peak = v
                     dd = (peak - v) / peak * 100 if peak > 0 else 0
-                    if dd > max_dd:
-                        max_dd = dd
+                    if dd > mdd_30:
+                        mdd_30 = dd
 
-                # MDD allTime aussi
-                peak_at2 = acv_hist_at[0] if acv_hist_at else 0
-                max_dd_at = 0.0
-                for v in acv_hist_at:
-                    if v > peak_at2:
-                        peak_at2 = v
-                    dd = (peak_at2 - v) / peak_at2 * 100 if peak_at2 > 0 else 0
-                    if dd > max_dd_at:
-                        max_dd_at = dd
+                # --- Métriques allTime ---
+                at_data     = windows.get("perpAllTime") or windows.get("allTime", {})
+                pnl_hist_at = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
+                acv_hist_at = [float(p[1]) for p in at_data.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
+
+                pnl_at  = pnl_hist_at[-1] if pnl_hist_at else 0
+                peak_at = max(acv_hist_at) if acv_hist_at else 1
+                roe_at  = min((pnl_at / max(peak_at, 1)) * 100, 9999)
+
+                # MDD allTime
+                mdd_at = 0.0
+                if acv_hist_at:
+                    pk = acv_hist_at[0]
+                    for v in acv_hist_at:
+                        if v > pk:
+                            pk = v
+                        dd = (pk - v) / pk * 100 if pk > 0 else 0
+                        if dd > mdd_at:
+                            mdd_at = dd
 
                 # Filtre MDD < 40% sur 30j ET allTime
-                worst_mdd = max(max_dd, max_dd_at)
+                worst_mdd = max(mdd_30, mdd_at)
                 if worst_mdd > 40:
-                    logger.info(f"MDD trop élevé {address[:12]}... (30j:{max_dd:.0f}% / allTime:{max_dd_at:.0f}%)")
                     return None
-                max_dd = worst_mdd
 
-                # Consistance 30j (% points avec PnL croissant)
-                pos_moves = sum(1 for i in range(1, len(pnl_hist_30)) if pnl_hist_30[i] > pnl_hist_30[i-1])
-                consistency = (pos_moves / max(len(pnl_hist_30) - 1, 1)) * 100
-
-                # Winrate depuis window week (plus granulaire)
+                # Winrate hebdo
                 week_data = windows.get("perpWeek") or windows.get("week", {})
                 week_pnl  = [float(p[1]) for p in week_data.get("pnlHistory", []) if isinstance(p, list)]
                 week_pos  = sum(1 for p in week_pnl if p > 0)
@@ -709,26 +711,21 @@ async def fetch_top_traders_hl() -> list:
                 if winrate < 60:
                     return None
 
-                # ROE allTime pour info
-                at_data  = windows.get("perpAllTime") or windows.get("allTime", {})
-                pnl_hist_at = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
-                acv_hist_at = [float(p[1]) for p in at_data.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
-                pnl_at   = pnl_hist_at[-1] if pnl_hist_at else 0
-                peak_at  = max(acv_hist_at) if acv_hist_at else 1
-                roe_at   = min((pnl_at / max(peak_at, 1)) * 100, 9999)
+                # Consistance 30j
+                pos_moves   = sum(1 for i in range(1, len(pnl_hist_30)) if pnl_hist_30[i] > pnl_hist_30[i-1])
+                consistency = (pos_moves / max(len(pnl_hist_30) - 1, 1)) * 100
 
                 return {
-                    "address":      address,
-                    "pnl":          pnl_30d,
-                    "pnl_at":       pnl_at,
-                    "roi":          round(roi_30d, 1),
-                    "roe_at":       round(roe_at, 1),
-                    "mdd":          round(max_dd, 1),
-                    "consistency":  round(consistency, 1),
-                    "week_winrate": round(winrate, 1),
-                    "winrate":      round(winrate, 1),
-                    "n_trades":     0,
-                    "asset_pnl":    {},
+                    "address":     address,
+                    "pnl":         pnl_30d,
+                    "pnl_at":      pnl_at,
+                    "roi":         round(roi_30d, 1),
+                    "roe_at":      round(roe_at, 1),
+                    "mdd":         round(worst_mdd, 1),
+                    "consistency": round(consistency, 1),
+                    "winrate":     round(winrate, 1),
+                    "n_trades":    0,
+                    "asset_pnl":   {},
                 }
             except Exception as e:
                 logger.warning(f"Portfolio {address[:12]}... erreur: {e}")
