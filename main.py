@@ -1163,7 +1163,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "👋 *Bienvenue sur MarignyCryptoBot!*\n\n"
+        "👋 *Bienvenue sur SakaiBot! 🤖*\n\n"
         "📊 *Marche & Analyse*\n"
         "   /prix — Prix en temps reel\n"
         "   /setup — Analyse technique complete\n"
@@ -1321,7 +1321,7 @@ def main():
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
 
-    logger.info("🤖 MarignyCryptoBot demarre avec module TradeBot!")
+    logger.info("🤖 SakaiBot demarre avec module TradeBot!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
