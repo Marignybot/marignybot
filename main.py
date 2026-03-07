@@ -588,7 +588,7 @@ async def fetch_top_traders_hl() -> list:
         # Etape 2 : appeler portfolio en PARALLELE pour tous les candidats
         async def fetch_portfolio(session, address):
             try:
-                # Appels paralleles : portfolio + userFills
+                # Portfolio seul — rapide
                 async with session.post(
                     "https://api-ui.hyperliquid.xyz/info",
                     json={"type": "portfolio", "user": address},
@@ -596,14 +596,6 @@ async def fetch_top_traders_hl() -> list:
                 ) as resp:
                     portfolio = await resp.json()
 
-                async with session.post(
-                    "https://api-ui.hyperliquid.xyz/info",
-                    json={"type": "userFills", "user": address},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp2:
-                    fills = await resp2.json()
-
-                # Parser portfolio
                 windows = {}
                 for item in portfolio:
                     if isinstance(item, list) and len(item) == 2:
@@ -640,18 +632,6 @@ async def fetch_top_traders_hl() -> list:
                 week_positive = sum(1 for p in week_pnl if p > 0)
                 week_total = max(len(week_pnl), 1)
 
-                # Calculer PnL par asset depuis userFills
-                asset_pnl = {}
-                if isinstance(fills, list):
-                    for fill in fills:
-                        if not isinstance(fill, dict):
-                            continue
-                        coin = fill.get("coin", "")
-                        # closedPnl est le PnL realise sur ce trade
-                        pnl_fill = float(fill.get("closedPnl", 0) or 0)
-                        if coin:
-                            asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pnl_fill
-
                 return {
                     "address":      address,
                     "pnl":          pnl_final,
@@ -661,7 +641,7 @@ async def fetch_top_traders_hl() -> list:
                     "week_winrate": round(week_positive / week_total * 100, 1),
                     "n_trades":     0,
                     "winrate":      round(consistency, 1),
-                    "asset_pnl":    asset_pnl,
+                    "asset_pnl":    {},
                 }
             except Exception as e:
                 logger.warning(f"Portfolio {address[:10]}... erreur: {e}")
@@ -700,62 +680,84 @@ def rank_and_score_traders(traders: list) -> list:
     return sorted(scored, key=lambda x: x["score"], reverse=True)
 
 
-def build_tradebot_report(top5: list, all_traders: list = None) -> str:
-    """Rapport ETF avec top 2 par asset et adresses completes copiables."""
+def build_top5_report(top5: list) -> str:
+    """Rapport Top 5 global avec adresses completes copiables."""
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    ASSETS = ["BTC", "ETH", "SOL", "HYPE", "TAO"]
-
     lines = [
-        f"🏆 ETF SYNTHETIQUE — TradeBot",
+        "🏆 *ETF SYNTHETIQUE — TradeBot*",
         f"📅 {now}",
         "━━━━━━━━━━━━━━━━━━━━",
+        "*📊 TOP 5 GLOBAL*",
+        "",
     ]
-
-    # --- Section 1 : Top 5 global ---
-    lines.append("📊 TOP 5 GLOBAL")
     for i, t in enumerate(top5, 1):
-        verdict = "🟢" if t["score"] >= 70 else ("🟡" if t["score"] >= 55 else "🔴")
-        lines.append(
-            f"{verdict} #{i} Score {t['score']}/100 | MDD {t['mdd']:.0f}% | ROI {t.get('roi',0):.0f}%"
-        )
+        verdict = "🟢 FORT" if t["score"] >= 70 else ("🟡 MOYEN" if t["score"] >= 55 else "🔴 FAIBLE")
+        lines.append(f"*#{i}* — Score: *{t['score']}/100* {verdict}")
+        lines.append(f"MDD: {t['mdd']:.0f}% | ROI: {t.get('roi',0):.0f}% | Consist: {t['consistency']:.0f}%")
         lines.append(f"`{t['address']}`")
         lines.append("")
+    avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
+    lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"Score ETF moyen: *{avg}/100*")
+    return "\n".join(lines)
 
-    # --- Section 2 : Top 2 par asset ---
-    if all_traders:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("🎯 TOP 2 PAR ASSET")
+
+async def build_asset_report(traders: list) -> str:
+    """Top 2 par asset via userFills — appels paralleles rapides."""
+    ASSETS = ["BTC", "ETH", "SOL", "HYPE", "TAO"]
+
+    async def get_asset_pnl(session, trader):
+        try:
+            async with session.post(
+                "https://api-ui.hyperliquid.xyz/info",
+                json={"type": "userFillsByTime", "user": trader["address"],
+                      "startTime": int((datetime.now().timestamp() - 90*86400) * 1000)},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                fills = await resp.json()
+            asset_pnl = {}
+            if isinstance(fills, list):
+                for fill in fills:
+                    if not isinstance(fill, dict):
+                        continue
+                    coin = fill.get("coin", "")
+                    pnl_fill = float(fill.get("closedPnl", 0) or 0)
+                    if coin:
+                        asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pnl_fill
+            return {**trader, "asset_pnl": asset_pnl}
+        except Exception:
+            return {**trader, "asset_pnl": {}}
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [get_asset_pnl(session, t) for t in traders]
+        enriched = await asyncio.gather(*tasks)
+
+    lines = ["🎯 *TOP 2 PAR ASSET* (90j)", ""]
+    assigned = set()
+
+    for asset in ASSETS:
+        candidates = []
+        for t in enriched:
+            if t["address"] in assigned:
+                continue
+            apnl = t.get("asset_pnl", {}).get(asset, 0.0)
+            if apnl > 0:
+                candidates.append((apnl, t))
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top2 = candidates[:2]
+
+        lines.append(f"— *{asset}* —")
+        if not top2:
+            lines.append("  Aucun trader qualifié")
+        else:
+            for rank, (apnl, t) in enumerate(top2, 1):
+                assigned.add(t["address"])
+                lines.append(f"*#{rank}* PnL {asset}: ${apnl:+,.0f} | Score: {t['score']}/100")
+                lines.append(f"`{t['address']}`")
         lines.append("")
 
-        assigned = set()  # chaque trader ne peut apparaitre que dans 1 asset
-
-        for asset in ASSETS:
-            # Trier les traders non encore assignes par PnL sur cet asset
-            candidates = []
-            for t in all_traders:
-                if t["address"] in assigned:
-                    continue
-                apnl = t.get("asset_pnl", {}).get(asset, 0.0)
-                if apnl > 0:
-                    candidates.append((apnl, t))
-
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            top2 = candidates[:2]
-
-            lines.append(f"— {asset} —")
-            if not top2:
-                lines.append("  Aucun trader qualifié")
-            else:
-                for rank, (apnl, t) in enumerate(top2, 1):
-                    assigned.add(t["address"])
-                    lines.append(f"  #{rank} PnL {asset}: ${apnl:+,.0f} | Score global: {t['score']}/100")
-                    lines.append(f"  `{t['address']}`")
-            lines.append("")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
-    lines.append(f"Score ETF moyen: {avg}/100")
     return "\n".join(lines)
+
 
 
 def build_history_report() -> str:
@@ -817,7 +819,13 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tradebot_history.append(session_data)
     if len(tradebot_history) > 30:
         tradebot_history.pop(0)
-    await update.message.reply_text(build_tradebot_report(top5, all_traders=scored), parse_mode="Markdown")
+    # Message 1 : Top 5 global immediatement
+    await update.message.reply_text(build_top5_report(top5), parse_mode="Markdown")
+
+    # Message 2 : Top 2 par asset avec userFills (appels rapides sur top 20 seulement)
+    await update.message.reply_text("🔍 Analyse par asset en cours...")
+    asset_report = await build_asset_report(scored[:20])
+    await update.message.reply_text(asset_report, parse_mode="Markdown")
 
 
 async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
