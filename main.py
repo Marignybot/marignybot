@@ -1934,6 +1934,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔔 *Alertes*\n"
         "   /alertes — Activer les alertes auto\n"
         "   /desactiver\\_alertes — Stopper les alertes\n\n"
+        "🎯 *Target Wallet Manuel*\n"
+        "   /target 0x... — Copier un wallet ($50/position)\n"
+        "   /target\\_pause — Mettre en pause\n"
+        "   /target\\_stop — Arrêter\n"
+        "   /target\\_status — Statut du target\n\n"
         "ℹ️ /aide — Affiche ce message\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -2053,6 +2058,364 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ============================================================
+# MODULE TARGET WALLET MANUEL
+# ============================================================
+
+TARGET_SIZE = 50.0  # $50 par position copiée
+
+target_state = {
+    "active":   False,
+    "paused":   False,
+    "address":  None,
+    "ws_task":  None,
+    "positions": {},   # {asset: {side, size, entry}}
+    "trades_log": [],
+}
+
+
+async def target_sync_positions(address: str, app) -> None:
+    """Copie immédiatement toutes les positions ouvertes du wallet cible."""
+    logger.info(f"Target sync — {address[:12]}...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "clearinghouseState", "user": address},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                state = await resp.json()
+
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "allMids"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp2:
+                mids = await resp2.json()
+
+        positions = []
+        for pos in state.get("assetPositions", []):
+            p = pos.get("position", {})
+            sz = float(p.get("szi", 0) or 0)
+            if sz == 0:
+                continue
+            positions.append(p)
+
+        if not positions:
+            await send_copy_notification(app,
+                f"🎯 *Target Wallet actif*\n"
+                f"`{address[:20]}...`\n"
+                f"Aucune position ouverte actuellement — surveillance active."
+            )
+            return
+
+        results = []
+        for p in positions:
+            asset   = p.get("coin", "")
+            sz      = float(p.get("szi", 0) or 0)
+            is_buy  = sz > 0
+            lev     = int(p.get("leverage", {}).get("value", 1) or 1)
+            price   = float(mids.get(asset, 0))
+            if price <= 0:
+                results.append(f"⚠️ {asset}: prix introuvable")
+                continue
+
+            my_size = round(TARGET_SIZE / price, 6)
+            result  = await place_order(asset, is_buy, my_size, "Target Sync", lev)
+            status  = "✅" if "error" not in result else "❌"
+            side_str = "Long 📈" if is_buy else "Short 📉"
+            results.append(f"{status} {asset} {side_str} x{lev} ~${TARGET_SIZE:.0f}")
+
+            target_state["positions"][asset] = {
+                "side":  "long" if is_buy else "short",
+                "size":  my_size,
+                "entry": price,
+            }
+            target_state["trades_log"].append({
+                "time": datetime.now().strftime("%d/%m %H:%M"),
+                "asset": asset, "dir": f"Sync {side_str}",
+                "size": my_size, "price": price,
+                "result": "ok" if "error" not in result else "erreur",
+            })
+
+        await send_copy_notification(app,
+            f"🎯 *Target Wallet — Sync*\n"
+            f"`{address[:20]}...`\n\n"
+            + "\n".join(results)
+        )
+
+    except Exception as e:
+        logger.error(f"target_sync erreur: {e}")
+        await send_copy_notification(app, f"❌ Target sync erreur: `{str(e)[:100]}`")
+
+
+async def target_watch_ws(address: str, app) -> None:
+    """WebSocket — surveille toutes les positions du wallet cible en temps réel."""
+    import websockets
+    import json as json_mod
+
+    ws_url = "wss://api.hyperliquid.xyz/ws"
+    logger.info(f"Target WebSocket démarré → {address[:12]}...")
+
+    while target_state["active"]:
+        if target_state["paused"]:
+            await asyncio.sleep(5)
+            continue
+        try:
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+                await ws.send(json_mod.dumps({
+                    "method": "subscribe",
+                    "subscription": {"type": "userEvents", "user": address}
+                }))
+                logger.info(f"✅ Target WebSocket connecté → {address[:12]}")
+
+                async for raw_msg in ws:
+                    if not target_state["active"]:
+                        break
+                    if target_state["paused"]:
+                        continue
+                    try:
+                        msg  = json_mod.loads(raw_msg)
+                        data = msg.get("data", {})
+                        fills = data.get("fills", [])
+
+                        for fill in fills:
+                            asset    = fill.get("coin", "")
+                            side     = fill.get("side", "")
+                            size     = float(fill.get("sz", 0) or 0)
+                            price    = float(fill.get("px", 0) or 0)
+                            dir_fill = fill.get("dir", "")
+
+                            if size <= 0 or price <= 0:
+                                continue
+
+                            is_opening = "Open" in dir_fill
+                            is_closing = "Close" in dir_fill
+                            is_buy     = side == "B"
+
+                            if is_opening:
+                                my_size = round(TARGET_SIZE / price, 6)
+                                # Levier du trader
+                                try:
+                                    async with aiohttp.ClientSession() as s:
+                                        async with s.post(
+                                            HYPERLIQUID_API,
+                                            json={"type": "clearinghouseState", "user": address},
+                                            timeout=aiohttp.ClientTimeout(total=5)
+                                        ) as r:
+                                            ts = await r.json()
+                                    lev = 1
+                                    for pos in ts.get("assetPositions", []):
+                                        p = pos.get("position", {})
+                                        if p.get("coin") == asset:
+                                            lev = int(p.get("leverage", {}).get("value", 1) or 1)
+                                            break
+                                except Exception:
+                                    lev = 1
+
+                                result = await place_order(asset, is_buy, my_size, dir_fill, lev)
+                                target_state["positions"][asset] = {
+                                    "side": "long" if is_buy else "short",
+                                    "size": my_size, "entry": price,
+                                }
+
+                            elif is_closing:
+                                my_pos = target_state["positions"].get(asset)
+                                if not my_pos:
+                                    continue
+                                my_size = my_pos["size"]
+                                is_buy  = my_pos["side"] == "short"
+                                result  = await place_order(asset, is_buy, my_size, dir_fill, 1)
+                                target_state["positions"].pop(asset, None)
+                            else:
+                                continue
+
+                            status = "✅" if "error" not in result else "❌"
+                            emoji  = "📈" if is_buy else "📉"
+                            log = {
+                                "time": datetime.now().strftime("%d/%m %H:%M"),
+                                "asset": asset, "dir": dir_fill,
+                                "size": my_size, "price": price,
+                                "result": "ok" if "error" not in result else "erreur",
+                            }
+                            target_state["trades_log"].append(log)
+                            if len(target_state["trades_log"]) > 100:
+                                target_state["trades_log"] = target_state["trades_log"][-100:]
+
+                            notif = (
+                                f"{status} *Target Copy {emoji}*\n"
+                                f"Asset:  *{asset}*\n"
+                                f"Action: {dir_fill}\n"
+                                f"Taille: {my_size} (~${TARGET_SIZE:.0f})\n"
+                                f"Prix:   ${price:,.2f}\n"
+                                f"Wallet: `{address[:16]}...`"
+                            )
+                            if "error" in result:
+                                notif += f"\n⚠️ {result['error']}"
+                            await send_copy_notification(app, notif)
+
+                    except Exception as e:
+                        logger.warning(f"Target WS parse erreur: {e}")
+
+        except Exception as e:
+            if not target_state["active"]:
+                break
+            logger.warning(f"Target WS déconnecté: {e} — reconnexion 5s")
+            await asyncio.sleep(5)
+
+    logger.info("Target WebSocket arrêté")
+
+
+# ============================================================
+# COMMANDES TARGET
+# ============================================================
+
+async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /target 0x...  → démarre ou change le wallet cible
+    Copie toutes les positions ouvertes immédiatement ($50/position).
+    """
+    if not is_authorized(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Usage: `/target 0xADRESSE`\n"
+            "Exemple: `/target 0x7585ca5118a3ec6abe5169af82cdf26d3da2aa00`",
+            parse_mode="Markdown"
+        )
+        return
+
+    address = context.args[0].strip().lower()
+    if not address.startswith("0x") or len(address) != 42:
+        await update.message.reply_text("❌ Adresse invalide. Format: `0x...` (42 caractères)", parse_mode="Markdown")
+        return
+
+    # Arrêter l'ancien WebSocket si existant
+    if target_state["ws_task"] and not target_state["ws_task"].done():
+        target_state["active"] = False
+        target_state["ws_task"].cancel()
+        await asyncio.sleep(1)
+
+    old_address = target_state["address"]
+    target_state["address"]   = address
+    target_state["active"]    = True
+    target_state["paused"]    = False
+    target_state["positions"] = {}
+
+    if old_address and old_address != address:
+        await update.message.reply_text(
+            f"🔄 *Target changé*\n"
+            f"Ancien: `{old_address[:20]}...`\n"
+            f"Nouveau: `{address[:20]}...`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"🎯 *Target Wallet Manuel activé*\n`{address}`\n\n"
+            f"💰 ${TARGET_SIZE:.0f} par position | tous assets\n"
+            f"Synchronisation des positions ouvertes...",
+            parse_mode="Markdown"
+        )
+
+    # Sync positions ouvertes immédiatement
+    await target_sync_positions(address, context.application)
+
+    # Lancer le WebSocket de surveillance
+    target_state["ws_task"] = asyncio.create_task(
+        target_watch_ws(address, context.application)
+    )
+    logger.info(f"Target WebSocket lancé → {address[:12]}")
+
+
+async def cmd_target_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/target_pause — met en pause la surveillance (positions gardées)."""
+    if not is_authorized(update):
+        return
+
+    if not target_state["active"] or not target_state["address"]:
+        await update.message.reply_text("⏸ Aucun target actif.")
+        return
+
+    if target_state["paused"]:
+        await update.message.reply_text("⏸ Target déjà en pause.")
+        return
+
+    target_state["paused"] = True
+    await update.message.reply_text(
+        f"⏸ *Target en pause*\n"
+        f"`{target_state['address'][:20]}...`\n\n"
+        f"Surveillance suspendue — positions ouvertes conservées.\n"
+        f"Lance `/target {target_state['address']}` pour reprendre.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_target_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/target_stop — arrête le target (positions gardées)."""
+    if not is_authorized(update):
+        return
+
+    if not target_state["active"] or not target_state["address"]:
+        await update.message.reply_text("⏸ Aucun target actif.")
+        return
+
+    addr = target_state["address"]
+    target_state["active"]  = False
+    target_state["paused"]  = False
+    if target_state["ws_task"] and not target_state["ws_task"].done():
+        target_state["ws_task"].cancel()
+    target_state["ws_task"]    = None
+    target_state["address"]    = None
+    target_state["positions"]  = {}
+
+    await update.message.reply_text(
+        f"🛑 *Target arrêté*\n"
+        f"`{addr[:20]}...`\n\n"
+        f"Tes positions ouvertes sont conservées — gère-les manuellement.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/target_status — affiche le statut du target wallet."""
+    if not is_authorized(update):
+        return
+
+    if not target_state["address"]:
+        await update.message.reply_text(
+            "⏸ *Target inactif*\nUtilise `/target 0x...` pour démarrer.",
+            parse_mode="Markdown"
+        )
+        return
+
+    status_emoji = "⏸ EN PAUSE" if target_state["paused"] else ("🟢 ACTIF" if target_state["active"] else "🔴 INACTIF")
+    lines = [
+        f"🎯 *TARGET WALLET MANUEL*",
+        f"Status: {status_emoji}",
+        f"Wallet: `{target_state['address']}`",
+        f"Taille/position: ${TARGET_SIZE:.0f}",
+        "",
+        "📡 *Positions copiées:*",
+    ]
+
+    if target_state["positions"]:
+        for asset, pos in target_state["positions"].items():
+            emoji = "📈" if pos["side"] == "long" else "📉"
+            lines.append(f"{emoji} {asset}: {pos['side'].upper()} sz:{pos['size']} @ ${pos['entry']:,.2f}")
+    else:
+        lines.append("_Aucune position active_")
+
+    if target_state["trades_log"]:
+        lines.append("")
+        lines.append(f"📋 *Derniers trades ({min(3, len(target_state['trades_log']))}):*")
+        for t in target_state["trades_log"][-3:]:
+            s = "✅" if t["result"] == "ok" else "❌"
+            lines.append(f"{s} {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.0f}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -2094,6 +2457,12 @@ def main():
     app.add_handler(CommandHandler("copy_status",   cmd_copy_status))
     app.add_handler(CommandHandler("copy_stop",     cmd_copy_stop_asset))
     app.add_handler(CommandHandler("copy_close",    cmd_copy_close_all))
+
+    # Target Wallet Manuel
+    app.add_handler(CommandHandler("target",        cmd_target))
+    app.add_handler(CommandHandler("target_pause",  cmd_target_pause))
+    app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
+    app.add_handler(CommandHandler("target_status", cmd_target_status))
 
     logger.info("🤖 SakaiBot demarre avec module TradeBot!")
     app.run_polling(
