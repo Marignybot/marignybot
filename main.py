@@ -29,8 +29,8 @@ COPY_BOT_ADDRESS   = "0xd849f8E96d7BE1A1fc7CA5291Dc6603a47dF8dFD"
 HL_PRIVATE_KEY     = os.getenv("HL_PRIVATE_KEY", "")
 COPY_CAPITAL       = 1000.0   # capital total
 COPY_ASSETS        = ["BTC", "ETH", "HYPE"]   # assets surveillés phase 1
-COPY_ALLOC         = 200.0    # $200 par asset
-COPY_MAX_SIZE      = 100.0    # $100 max par trade (50% allocation)
+COPY_ALLOC         = 100.0    # $100 par asset (test)
+COPY_MAX_SIZE      = 50.0     # $50 max par trade (test)
 MARGIN_SAFETY      = 0.5      # marge de sécurité 50%
 
 # Levier max par asset
@@ -1697,6 +1697,18 @@ async def stop_copy_trading() -> None:
 # COMMANDES TELEGRAM — Copy Trading
 # ============================================================
 
+async def cmd_copy_start_asset(update: Update, context: ContextTypes.DEFAULT_TYPE, asset: str):
+    """Shortcut: démarre le copy trading sur un asset spécifique."""
+    context.args = [asset]
+    await cmd_copy_start(update, context)
+
+
+async def cmd_copy_stop_asset_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, asset: str):
+    """Shortcut: arrête le copy trading sur un asset spécifique."""
+    context.args = [asset]
+    await cmd_copy_stop_asset(update, context)
+
+
 async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Lance le copy trading sur un ou plusieurs assets.
@@ -1955,13 +1967,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📈 *Mes Positions*\n"
         "   /positions — Positions Hyperliquid\n\n"
         "🏆 *TradeBot — ETF Hyperliquid*\n"
-        "   /toptraders — Selectionner les 5 meilleurs traders\n"
-        "   /inspector — Analyser un wallet Hyperliquid\n"
-        "   /copy\\_start — Démarrer (ex: /copy\\_start BTC)\n"
-        "   /copy\\_status — Statut du copy trading\n"
-        "   /copy\\_stop — Arrêter (ex: /copy\\_stop BTC)\n"
+        "   /toptraders — Analyser les meilleurs traders\n"
+        "   /inspector — Analyser un wallet\n\n"
+        "🟢 *Start Copy Trading*\n"
+        "   /start\\_btc — Démarrer BTC\n"
+        "   /start\\_eth — Démarrer ETH\n"
+        "   /start\\_hype — Démarrer HYPE\n"
+        "   /copy\\_start — Démarrer tous\n\n"
+        "🔴 *Stop Copy Trading*\n"
+        "   /stop\\_btc — Arrêter BTC\n"
+        "   /stop\\_eth — Arrêter ETH\n"
+        "   /stop\\_hype — Arrêter HYPE\n"
+        "   /copy\\_stop — Arrêter tout\n\n"
+        "📊 *Statut & Gestion*\n"
+        "   /copy\\_status — Statut en temps réel\n"
         "   /copy\\_close — Fermer toutes les positions\n"
-        "   /tb\\_historique — Historique des selections\n"
+        "   /tb\\_historique — Historique des sélections\n"
         "   /tb\\_aide — Aide TradeBot\n\n"
         "🔔 *Alertes*\n"
         "   /alertes — Activer les alertes auto\n"
@@ -2107,6 +2128,13 @@ def main():
     app.add_handler(CommandHandler("tb_historique", cmd_tb_historique))
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
+    # Shortcuts par asset
+    app.add_handler(CommandHandler("start_btc",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"BTC")))
+    app.add_handler(CommandHandler("start_eth",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"ETH")))
+    app.add_handler(CommandHandler("start_hype",    lambda u,ctx: cmd_copy_start_asset(u,ctx,"HYPE")))
+    app.add_handler(CommandHandler("stop_btc",      lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"BTC")))
+    app.add_handler(CommandHandler("stop_eth",      lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"ETH")))
+    app.add_handler(CommandHandler("stop_hype",     lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"HYPE")))
     app.add_handler(CommandHandler("copy_start",    cmd_copy_start))
     app.add_handler(CommandHandler("copy_status",   cmd_copy_status))
     app.add_handler(CommandHandler("copy_stop",     cmd_copy_stop_asset))
