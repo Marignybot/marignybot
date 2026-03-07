@@ -539,77 +539,122 @@ def stars(value: float, max_val: float = 100) -> str:
 
 
 async def fetch_top_traders_hl() -> list:
-    """Recupere les top traders via stats-data.hyperliquid.xyz"""
+    """Recupere les top traders via leaderboard + portfolio pour scoring reel."""
     try:
+        # Etape 1 : recuperer le leaderboard pour avoir les adresses
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
-                logger.info(f"Leaderboard status: {resp.status}")
                 data = await resp.json()
 
-        # Structure reelle: {"leaderboardRows": [[adresse, {windowPerformances:[...]}], ...]}
         raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
-        logger.info(f"Traders bruts: {len(raw_rows)}")
-        if raw_rows:
-            logger.info(f"Exemple row[0]: {str(raw_rows[0])[:500]}")
+        logger.info(f"Leaderboard: {len(raw_rows)} traders")
 
-        traders = []
-        for row in raw_rows:  # Parcourir TOUS les traders
+        # Trier par PnL allTime et prendre top 50 candidats
+        candidates = []
+        for row in raw_rows:
             try:
-                # row = [adresse_str, {windowPerformances: [...]}]
-                if isinstance(row, list) and len(row) >= 2:
-                    address    = str(row[0])
-                    stats_dict = row[1] if isinstance(row[1], dict) else {}
-                elif isinstance(row, dict):
-                    address    = row.get("ethAddress") or row.get("user", "")
+                if isinstance(row, dict):
+                    address = row.get("ethAddress") or row.get("user", "")
                     stats_dict = row
+                elif isinstance(row, list) and len(row) >= 2:
+                    address = str(row[0])
+                    stats_dict = row[1] if isinstance(row[1], dict) else {}
                 else:
                     continue
 
-                if not address or len(address) < 5:
+                if not address or len(address) < 10:
                     continue
 
-                # Chercher la meilleure window dispo
-                window_performances = stats_dict.get("windowPerformances", [])
-                window_data = {}
-                for w in window_performances:
-                    if not isinstance(w, dict):
-                        continue
-                    wname = w.get("window", "")
-                    wp    = w.get("windowPerformance", {})
-                    if wname == "allTime":
-                        window_data = wp
+                # Extraire PnL allTime pour pre-filtrage
+                pnl_alltime = 0.0
+                for w in stats_dict.get("windowPerformances", []):
+                    if isinstance(w, list) and len(w) == 2 and w[0] == "allTime":
+                        pnl_alltime = float(w[1].get("pnl", 0) or 0)
                         break
-                    elif wname in ("month", "week") and not window_data:
-                        window_data = wp
 
-                if not window_data:
-                    window_data = stats_dict
-
-                pnl      = float(window_data.get("pnl", 0) or 0)
-                n_trades = int(float(window_data.get("numTrades", 0) or 0))
-                winrate  = float(window_data.get("winRate", 0) or 0) * 100
-                roi      = float(window_data.get("roi", 0) or 0) * 100
-
-                mdd_proxy         = abs(min(0.0, roi)) if roi < 0 else max(0.0, 5.0 - roi * 0.1)
-                consistency_proxy = 75.0 if winrate >= 55 else 50.0
-
-                traders.append({
-                    "address":     address,
-                    "pnl":         pnl,
-                    "n_trades":    n_trades,
-                    "winrate":     winrate,
-                    "roi":         roi,
-                    "mdd":         round(mdd_proxy, 1),
-                    "consistency": round(consistency_proxy, 1),
-                })
-            except Exception as row_err:
-                logger.warning(f"Row ignoree: {row_err}")
+                if pnl_alltime > 0:
+                    candidates.append((address, pnl_alltime))
+            except Exception:
                 continue
 
-        logger.info(f"Traders parsed avec succes: {len(traders)}")
+        # Garder les 50 meilleurs PnL pour appeler portfolio
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top_candidates = candidates[:50]
+        logger.info(f"Top 50 candidats selectionnes (meilleur PnL: ${top_candidates[0][1]:,.0f})")
+
+        # Etape 2 : appeler portfolio pour chaque candidat
+        traders = []
+        async with aiohttp.ClientSession() as session:
+            for address, _ in top_candidates:
+                try:
+                    async with session.post(
+                        "https://api-ui.hyperliquid.xyz/info",
+                        json={"type": "portfolio", "user": address},
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        portfolio = await resp.json()
+
+                    # portfolio = [["day", {...}], ["week", {...}], ["month", {...}], ["allTime", {...}], ...]
+                    windows = {}
+                    for item in portfolio:
+                        if isinstance(item, list) and len(item) == 2:
+                            windows[item[0]] = item[1]
+
+                    # Calculer les metriques depuis allTime
+                    at = windows.get("perpAllTime") or windows.get("allTime", {})
+                    pnl_history = [float(p[1]) for p in at.get("pnlHistory", []) if p[1] != "0.0"]
+                    acv_history = [float(p[1]) for p in at.get("accountValueHistory", []) if float(p[1]) > 0]
+
+                    if not pnl_history or not acv_history:
+                        continue
+
+                    pnl_final = pnl_history[-1]
+                    if pnl_final <= 0:
+                        continue
+
+                    # ROI
+                    initial_value = acv_history[0] if acv_history[0] > 0 else 1
+                    roi = (pnl_final / initial_value) * 100
+
+                    # Drawdown maximum reel
+                    peak = acv_history[0]
+                    max_dd = 0.0
+                    for v in acv_history:
+                        if v > peak:
+                            peak = v
+                        dd = (peak - v) / peak * 100 if peak > 0 else 0
+                        if dd > max_dd:
+                            max_dd = dd
+
+                    # Consistance : % de points ou le PnL est croissant
+                    positive_moves = sum(1 for i in range(1, len(pnl_history)) if pnl_history[i] > pnl_history[i-1])
+                    consistency = (positive_moves / max(len(pnl_history) - 1, 1)) * 100
+
+                    # Semaines profitables (depuis window week)
+                    week_data = windows.get("perpWeek") or windows.get("week", {})
+                    week_pnl = [float(p[1]) for p in week_data.get("pnlHistory", [])]
+                    week_positive = sum(1 for p in week_pnl if p > 0)
+                    week_total = max(len(week_pnl), 1)
+
+                    traders.append({
+                        "address":     address,
+                        "pnl":         pnl_final,
+                        "roi":         round(roi, 1),
+                        "mdd":         round(max_dd, 1),
+                        "consistency": round(consistency, 1),
+                        "week_winrate": round(week_positive / week_total * 100, 1),
+                        "n_trades":    0,
+                        "winrate":     round(consistency, 1),
+                    })
+
+                except Exception as e:
+                    logger.warning(f"Portfolio {address[:10]}... erreur: {e}")
+                    continue
+
+        logger.info(f"Traders avec portfolio complet: {len(traders)}")
         return traders
 
     except Exception as e:
@@ -618,15 +663,10 @@ async def fetch_top_traders_hl() -> list:
 
 
 def apply_exclusion_filters(traders: list) -> list:
-    """Applique les filtres d'exclusion — garde les top 50 PnL positifs."""
-    # Trier par PnL décroissant et garder les positifs
-    positifs = [t for t in traders if t["pnl"] > 0]
-    positifs.sort(key=lambda x: x["pnl"], reverse=True)
-    top50 = positifs[:50]
-    logger.info(f"Filtres: {len(positifs)} PnL positifs sur {len(traders)} | top50 retenus")
-    if top50:
-        logger.info(f"Meilleur PnL: ${top50[0]['pnl']:,.0f} | 5e: ${top50[min(4,len(top50)-1)]['pnl']:,.0f}")
-    return top50
+    """Filtres : MDD > 60% exclus, le reste passe."""
+    filtered = [t for t in traders if t["mdd"] <= 60 and t["pnl"] > 0]
+    logger.info(f"Apres filtres: {len(filtered)}/{len(traders)} traders retenus")
+    return filtered
 
 
 def rank_and_score_traders(traders: list) -> list:
@@ -636,8 +676,8 @@ def rank_and_score_traders(traders: list) -> list:
     max_pnl = max(t["pnl"] for t in traders)
     scored  = []
     for t in traders:
-        pnl_score = score_pnl_relative(t["pnl"], max_pnl)
-        composite = compute_composite_score(t["consistency"], t["mdd"], t["winrate"], pnl_score)
+        roi_score = min(100.0, t.get("roi", 0) / 5)  # ROI 500% -> score 100
+        composite = compute_composite_score(t["consistency"], t["mdd"], t.get("week_winrate", t["winrate"]), roi_score)
         scored.append({**t, "score": composite})
     return sorted(scored, key=lambda x: x["score"], reverse=True)
 
