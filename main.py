@@ -681,44 +681,23 @@ def rank_and_score_traders(traders: list) -> list:
 def build_tradebot_report(top5: list) -> str:
     """Construit le rapport de selection ETF synthetique."""
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
     lines = [
-        "🏆 *ETF SYNTHETIQUE — Selection TradeBot*",
-        f"📅 _{now}_",
-        "━━━━━━━━━━━━━━━━━━━━\n",
+        "🏆 ETF SYNTHETIQUE — Top 5 TradeBot",
+        f"📅 {now}",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
     for i, t in enumerate(top5, 1):
         addr    = t["address"][:6] + "..." + t["address"][-4:]
-        verdict = "🟢 HOLD" if t["score"] >= 70 else ("🟡 WATCH" if t["score"] >= 55 else "🔴 WEAK")
+        verdict = "🟢 FORT" if t["score"] >= 70 else ("🟡 MOYEN" if t["score"] >= 55 else "🔴 FAIBLE")
         lines.append(
-            f"*#{i} — `{addr}`*\n"
-            f"   Score:       *{t['score']}/100*\n"
-            f"   Consistance: {stars(t['consistency'])} ({t['consistency']:.0f}%)\n"
-            f"   Drawdown:    {stars(100 - t['mdd'])} ({t['mdd']:.1f}%)\n"
-            f"   Win Rate:    {t['winrate']:.1f}%\n"
-            f"   PnL 90j:     ${t['pnl']:+,.0f}\n"
-            f"   Statut:      {verdict}\n"
+            f"#{i} {addr} — Score: {t['score']}/100 {verdict}\n"
+            f"  Consistance: {t['consistency']:.0f}% | MDD: {t['mdd']:.1f}%\n"
+            f"  WinRate: {t.get('week_winrate', t['winrate']):.0f}% | ROI: {t.get('roi', 0):.0f}%\n"
+            f"  PnL allTime: ${t['pnl']:+,.0f}"
         )
-    justifications = {
-        1: "Meilleur ratio consistance/drawdown sur 90j.",
-        2: "Win rate solide avec drawdown maitrise.",
-        3: "PnL fort avec bonne regularite.",
-        4: "Consistance elevee — peu de semaines negatives.",
-        5: "Bon equilibre toutes metriques.",
-    }
-    lines += [
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"📊 *Score ETF moyen: {avg}/100*\n",
-        "💬 *Justifications:*\n",
-    ]
-    for i, t in enumerate(top5, 1):
-        addr = t["address"][:6] + "..." + t["address"][-4:]
-        lines.append(f"*#{i}* `{addr}` — {justifications.get(i, 'Profil solide sur 90j.')}")
-    lines += [
-        "\n━━━━━━━━━━━━━━━━━━━━",
-        "_TradeBot v1.0 — Phase Analyse_",
-        "_/tb\\_historique pour voir les selections passees_",
-    ]
+        lines.append("─────────────────────")
+    avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
+    lines.append(f"Score ETF moyen: {avg}/100")
     return "\n".join(lines)
 
 
@@ -781,7 +760,7 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tradebot_history.append(session_data)
     if len(tradebot_history) > 30:
         tradebot_history.pop(0)
-    await update.message.reply_text(build_tradebot_report(top5), parse_mode="Markdown")
+    await update.message.reply_text(build_tradebot_report(top5))
 
 
 async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
