@@ -800,14 +800,27 @@ async def build_asset_report(traders: list) -> str:
             ) as resp:
                 fills = await resp.json()
             asset_pnl = {}
+            # Mapping noms Hyperliquid → noms affichés
+            COIN_MAP = {
+                "BTC":    "BTC", "WBTC":  "BTC",
+                "ETH":    "ETH", "WETH":  "ETH",
+                "SOL":    "SOL", "kSOL":  "SOL",
+                "HYPE":   "HYPE","kHYPE": "HYPE",
+                "TAO":    "TAO", "kTAO":  "TAO",
+            }
+            all_coins = set()
             if isinstance(fills, list):
                 for fill in fills:
                     if not isinstance(fill, dict):
                         continue
-                    coin = fill.get("coin", "")
+                    coin_raw = fill.get("coin", "")
+                    all_coins.add(coin_raw)
+                    coin = COIN_MAP.get(coin_raw, coin_raw)
                     pnl_fill = float(fill.get("closedPnl", 0) or 0)
                     if coin:
                         asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pnl_fill
+            if all_coins:
+                logger.info(f"Coins trouvés pour {trader['address'][:10]}: {sorted(all_coins)[:15]}")
             return {**trader, "asset_pnl": asset_pnl}
         except Exception:
             return {**trader, "asset_pnl": {}}
@@ -816,19 +829,25 @@ async def build_asset_report(traders: list) -> str:
         tasks = [get_asset_pnl(session, t) for t in traders]
         enriched = await asyncio.gather(*tasks)
 
-    lines = ["🎯 *TOP 2 PAR ASSET* (90j)", ""]
+    lines = ["🎯 *TOP 2 PAR ASSET* (30j)", ""]
     assigned = set()
 
     for asset in ASSETS:
         candidates = []
         for t in enriched:
-            if t["address"] in assigned:
-                continue
             apnl = t.get("asset_pnl", {}).get(asset, 0.0)
             if apnl > 0:
                 candidates.append((apnl, t))
         candidates.sort(key=lambda x: x[0], reverse=True)
-        top2 = candidates[:2]
+        # Dédupliquer par adresse
+        seen = set()
+        top2 = []
+        for apnl, t in candidates:
+            if t["address"] not in seen:
+                seen.add(t["address"])
+                top2.append((apnl, t))
+            if len(top2) == 2:
+                break
 
         lines.append(f"— *{asset}* —")
         if not top2:
