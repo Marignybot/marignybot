@@ -582,8 +582,8 @@ async def fetch_top_traders_hl() -> list:
 
         # Garder les 50 meilleurs PnL pour appeler portfolio
         candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = candidates[:50]
-        logger.info(f"Top 50 candidats selectionnes (meilleur PnL: ${top_candidates[0][1]:,.0f})")
+        top_candidates = candidates[:200]
+        logger.info(f"Top 200 candidats selectionnes (meilleur PnL: ${top_candidates[0][1]:,.0f})")
 
         # Etape 2 : appeler portfolio en PARALLELE pour tous les candidats
         async def fetch_portfolio(session, address):
@@ -612,6 +612,11 @@ async def fetch_top_traders_hl() -> list:
                 if pnl_final <= 0:
                     return None
 
+                # Filtre capital minimum : account value actuelle > $10k
+                current_value = acv_history[-1] if acv_history else 0
+                if current_value < 10000:
+                    return None
+
                 # Filtre activite : dernier trade dans les 15 derniers jours
                 raw_at = at.get("pnlHistory", [])
                 if raw_at:
@@ -621,8 +626,10 @@ async def fetch_top_traders_hl() -> list:
                         logger.info(f"Inactif {address[:10]}... ({days_since:.0f}j sans trade)")
                         return None
 
-                initial_value = acv_history[0] if acv_history[0] > 0 else 1
-                roi = (pnl_final / initial_value) * 100
+                # ROI basé sur la valeur courante du compte pour eviter les aberrations
+                current_value = acv_history[-1] if acv_history else 1
+                base_value = max(current_value - pnl_final, 1)  # capital investi initial
+                roi = min((pnl_final / base_value) * 100, 9999)  # cap a 9999%
 
                 peak = acv_history[0]
                 max_dd = 0.0
@@ -719,8 +726,7 @@ async def build_asset_report(traders: list) -> str:
         try:
             async with session.post(
                 "https://api-ui.hyperliquid.xyz/info",
-                json={"type": "userFillsByTime", "user": trader["address"],
-                      "startTime": int((datetime.now().timestamp() - 90*86400) * 1000)},
+                json={"type": "userFills", "user": trader["address"]},
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as resp:
                 fills = await resp.json()
