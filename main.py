@@ -1173,6 +1173,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /positions — Positions Hyperliquid\n\n"
         "🏆 *TradeBot — ETF Hyperliquid*\n"
         "   /toptraders — Selectionner les 5 meilleurs traders\n"
+        "   /inspector — Analyser un wallet Hyperliquid\n"
         "   /tb\\_historique — Historique des selections\n"
         "   /tb\\_aide — Aide TradeBot\n\n"
         "🔔 *Alertes*\n"
