@@ -1838,6 +1838,31 @@ async def cmd_copy_stop_asset(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"⏸ Pas de WebSocket actif sur {asset}.")
 
 
+async def cmd_copy_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force la synchronisation immédiate des positions ouvertes des traders surveillés."""
+    if not is_authorized(update):
+        return
+
+    if not copy_state["active"] or not copy_state["watched"]:
+        await update.message.reply_text(
+            "⏸ Aucun trader surveillé.\nLance d'abord `/start_hype`, `/start_btc` ou `/copy_start`.",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔄 *Sync forcée en cours...*\nTraders surveillés: {len(copy_state['watched'])}",
+        parse_mode="Markdown"
+    )
+
+    await sync_existing_positions(copy_state["watched"], context.application)
+
+    await update.message.reply_text(
+        "✅ *Sync terminée*\nVérifie `/copy_status` pour voir les positions.",
+        parse_mode="Markdown"
+    )
+
+
 async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le statut du copy trading."""
     if not is_authorized(update):
@@ -1980,6 +2005,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /stop\\_hype — Arrêter HYPE\n"
         "   /copy\\_stop — Arrêter tout\n\n"
         "📊 *Statut & Gestion*\n"
+        "   /copy\\_sync — Forcer sync positions ouvertes\n"
         "   /copy\\_status — Statut en temps réel\n"
         "   /copy\\_close — Fermer toutes les positions\n"
         "   /tb\\_historique — Historique des sélections\n"
@@ -2136,6 +2162,7 @@ def main():
     app.add_handler(CommandHandler("stop_eth",      lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"ETH")))
     app.add_handler(CommandHandler("stop_hype",     lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"HYPE")))
     app.add_handler(CommandHandler("copy_start",    cmd_copy_start))
+    app.add_handler(CommandHandler("copy_sync",     cmd_copy_sync))
     app.add_handler(CommandHandler("copy_status",   cmd_copy_status))
     app.add_handler(CommandHandler("copy_stop",     cmd_copy_stop_asset))
     app.add_handler(CommandHandler("copy_close",    cmd_copy_close_all))
