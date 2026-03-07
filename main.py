@@ -4,6 +4,8 @@ MarignyCryptoBot - Bot Telegram pour suivi crypto & Hyperliquid
 """
 
 import asyncio
+import os
+import json
 import logging
 import re
 import time as time_module
@@ -19,6 +21,40 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TELEGRAM_TOKEN = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"
 HYPERLIQUID_ADDRESS = "0x6e89b986FBB4B985AcCC9B3CfEE4c7B5301D9a5C"
 AUTHORIZED_USER_ID = 1429797974
+
+# ============================================================
+# COPY TRADING — SakaiBot
+# ============================================================
+COPY_BOT_ADDRESS   = "0xd849f8E96d7BE1A1fc7CA5291Dc6603a47dF8dFD"
+HL_PRIVATE_KEY     = os.getenv("HL_PRIVATE_KEY", "")
+COPY_CAPITAL       = 1000.0   # capital total
+COPY_ASSETS        = ["BTC", "HYPE"]   # assets surveillés phase 1
+COPY_ALLOC         = 200.0    # $200 par asset
+COPY_MAX_SIZE      = 100.0    # $100 max par trade (50% allocation)
+MARGIN_SAFETY      = 0.5      # marge de sécurité 50%
+
+# Levier max par asset
+COPY_LEVERAGE = {
+    "BTC":  5,   # x5 → liquidation à -20%
+    "HYPE": 3,   # x3 → liquidation à -33%
+}
+
+# Suivi du capital déployé par asset (évite de dépasser l'allocation)
+copy_deployed = {
+    "BTC":  0.0,
+    "HYPE": 0.0,
+}
+
+# State global du copy trading
+copy_state = {
+    "active":        False,          # copy trading actif ou non
+    "watched":       {},             # {asset: adresse_trader}
+    "positions":     {},             # {asset: {side, size, entry}}
+    "ws_tasks":      {},             # {asset: asyncio.Task}
+    "last_update":   {},             # {asset: timestamp}
+    "total_pnl":     0.0,
+    "trades_log":    [],
+}
 
 HYPERLIQUID_API            = "https://api.hyperliquid.xyz/info"
 WATCHED_TOKENS             = ["BTC", "ETH", "HYPE"]
@@ -934,6 +970,30 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asset_report = await build_asset_report(ranked[:20])
     await update.message.reply_text(asset_report, parse_mode="Markdown")
 
+    # --- Lancer le copy trading automatiquement ---
+    # Construire le mapping asset → meilleur trader
+    watched = {}
+    assigned_copy = set()
+    for asset in COPY_ASSETS:
+        for t in ranked[:20]:
+            apnl = t.get("asset_pnl", {}).get(asset, 0.0)
+            if apnl > 0 and t["address"] not in assigned_copy:
+                watched[asset] = t["address"]
+                assigned_copy.add(t["address"])
+                break
+
+    if watched:
+        if copy_state["active"]:
+            await stop_copy_trading()
+        await start_copy_trading(watched, context.application)
+        watch_lines = ["", "━━━━━━━━━━━━━━━━━━━━", "🤖 *Copy Trading ACTIF*"]
+        for asset, addr in watched.items():
+            watch_lines.append(f"   {asset} → `{addr}`")
+        watch_lines.append(f"Ratio: {COPY_RATIO} | Marge safety: {MARGIN_SAFETY}")
+        await update.message.reply_text("\n".join(watch_lines), parse_mode="Markdown")
+    else:
+        await update.message.reply_text("⚠️ Aucun trader assigné — copy trading non démarré.")
+
 
 async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Analyse complète d'un wallet Hyperliquid."""
@@ -1118,6 +1178,632 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Erreur lors de l'analyse: `{str(e)[:100]}`", parse_mode="Markdown")
 
 
+# ============================================================
+# MODULE COPY TRADING — WebSocket Hyperliquid
+# ============================================================
+
+async def send_copy_notification(app, message: str):
+    """Envoie une notification Telegram pour le copy trading."""
+    try:
+        await app.bot.send_message(
+            chat_id=AUTHORIZED_USER_ID,
+            text=message,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Notification copy trading erreur: {e}")
+
+
+async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
+    """
+    Place un ordre sur Hyperliquid via l'API exchange.
+    Utilise l'API Wallet pour signer.
+    """
+    try:
+        if not HL_PRIVATE_KEY:
+            logger.error("HL_PRIVATE_KEY non définie")
+            return {"error": "Clé privée manquante"}
+
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+        import hashlib, struct
+
+        # Récupérer le prix actuel
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "allMids"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                mids = await resp.json()
+
+        price = float(mids.get(asset, 0))
+        if price <= 0:
+            return {"error": f"Prix {asset} introuvable"}
+
+        # Slippage 0.1% pour ordre market
+        limit_px = price * (1.005 if is_buy else 0.995)
+        limit_px = round(limit_px, 2)
+
+        # Construction de l'ordre Hyperliquid
+        timestamp = int(datetime.now().timestamp() * 1000)
+
+        order_payload = {
+            "action": {
+                "type": "order",
+                "orders": [{
+                    "a": await get_asset_index(asset),
+                    "b": is_buy,
+                    "p": str(limit_px),
+                    "s": str(round(size, 6)),
+                    "r": False,  # reduce_only
+                    "t": {"limit": {"tif": "Ioc"}}  # Immediate or Cancel = market
+                }],
+                "grouping": "na"
+            },
+            "nonce": timestamp,
+            "vaultAddress": None
+        }
+
+        # Signature EIP-712
+        account = Account.from_key(HL_PRIVATE_KEY)
+        signature = sign_order(account, order_payload["action"], timestamp)
+
+        order_payload["signature"] = signature
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/exchange",
+                json=order_payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                result = await resp.json()
+
+        logger.info(f"Ordre {asset} {'BUY' if is_buy else 'SELL'} {size} → {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Erreur place_order {asset}: {e}")
+        return {"error": str(e)}
+
+
+async def get_asset_index(asset: str) -> int:
+    """Récupère l'index de l'asset dans le meta Hyperliquid."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "meta"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                meta = await resp.json()
+        universe = meta.get("universe", [])
+        for i, asset_info in enumerate(universe):
+            if asset_info.get("name") == asset:
+                return i
+        return -1
+    except Exception as e:
+        logger.error(f"get_asset_index erreur: {e}")
+        return -1
+
+
+def sign_order(account, action: dict, nonce: int) -> dict:
+    """Signe un ordre avec EIP-712 pour Hyperliquid."""
+    import json as json_mod
+    from eth_account.structured_data.hashing import hash_domain, hash_message
+    
+    # Hash de l'action
+    action_str = json_mod.dumps(action, separators=(',', ':'), sort_keys=True)
+    action_hash = hashlib.sha256(action_str.encode()).hexdigest()
+    
+    # Message à signer
+    msg = f"\x19Hyperliquid SignedAction\n{action_hash}\n{nonce}\n"
+    msg_hash = encode_defunct(text=msg)
+    signed = account.sign_message(msg_hash)
+    
+    return {
+        "r": hex(signed.r),
+        "s": hex(signed.s),
+        "v": signed.v
+    }
+
+
+async def get_my_positions() -> dict:
+    """Récupère les positions actuelles du compte bot."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "clearinghouseState", "user": COPY_BOT_ADDRESS},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                state = await resp.json()
+
+        positions = {}
+        if isinstance(state, dict):
+            for pos in state.get("assetPositions", []):
+                p = pos.get("position", {})
+                sz = float(p.get("szi", 0) or 0)
+                if sz != 0:
+                    positions[p.get("coin", "")] = {
+                        "side":  "long" if sz > 0 else "short",
+                        "size":  abs(sz),
+                        "entry": float(p.get("entryPx", 0) or 0),
+                        "upnl":  float(p.get("unrealizedPnl", 0) or 0),
+                    }
+        return positions
+    except Exception as e:
+        logger.error(f"get_my_positions erreur: {e}")
+        return {}
+
+
+async def check_margin_ok() -> bool:
+    """Vérifie que la marge disponible est > 50%."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "clearinghouseState", "user": COPY_BOT_ADDRESS},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                state = await resp.json()
+
+        margin_summary = state.get("marginSummary", {})
+        account_value  = float(margin_summary.get("accountValue", 0) or 0)
+        margin_used    = float(margin_summary.get("totalMarginUsed", 0) or 0)
+
+        if account_value <= 0:
+            return False
+
+        margin_ratio = 1 - (margin_used / account_value)
+        logger.info(f"Marge disponible: {margin_ratio*100:.1f}%")
+        return margin_ratio >= MARGIN_SAFETY
+
+    except Exception as e:
+        logger.error(f"check_margin_ok erreur: {e}")
+        return False
+
+
+async def watch_trader_positions(asset: str, trader_address: str, app) -> None:
+    """
+    WebSocket — surveille les positions d'un trader en temps réel.
+    Dès qu'il ouvre/ferme/modifie une position sur l'asset, on copie.
+    """
+    import websockets
+    import json as json_mod
+
+    ws_url = "wss://api.hyperliquid.xyz/ws"
+    logger.info(f"WebSocket démarré — surveillance {asset} → {trader_address[:12]}...")
+
+    while copy_state["active"]:
+        try:
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+                # Souscription aux positions du trader
+                subscribe_msg = json_mod.dumps({
+                    "method": "subscribe",
+                    "subscription": {
+                        "type": "userEvents",
+                        "user": trader_address
+                    }
+                })
+                await ws.send(subscribe_msg)
+                logger.info(f"✅ WebSocket {asset} connecté")
+
+                async for raw_msg in ws:
+                    if not copy_state["active"]:
+                        break
+
+                    try:
+                        msg = json_mod.loads(raw_msg)
+                        await process_trader_event(asset, trader_address, msg, app)
+                    except Exception as e:
+                        logger.warning(f"WebSocket {asset} parse erreur: {e}")
+
+        except Exception as e:
+            if not copy_state["active"]:
+                break
+            logger.warning(f"WebSocket {asset} déconnecté: {e} — reconnexion dans 5s")
+            await asyncio.sleep(5)
+
+    logger.info(f"WebSocket {asset} arrêté")
+
+
+async def process_trader_event(asset: str, trader_address: str, msg: dict, app) -> None:
+    """
+    Traite un événement WebSocket du trader.
+    - Ouverture : taille = COPY_MAX_SIZE ($100) / prix | levier = copié du trader
+    - Fermeture : ferme notre position complète
+    """
+    data = msg.get("data", {})
+    if not data:
+        return
+
+    fills = data.get("fills", [])
+    for fill in fills:
+        coin = fill.get("coin", "")
+        if coin != asset:
+            continue
+
+        side     = fill.get("side", "")
+        size     = float(fill.get("sz", 0) or 0)
+        price    = float(fill.get("px", 0) or 0)
+        dir_fill = fill.get("dir", "")
+
+        logger.info(f"Trader {trader_address[:12]} → {dir_fill} {asset} sz:{size} px:{price}")
+
+        if size <= 0 or price <= 0:
+            continue
+
+        is_opening = "Open" in dir_fill
+        is_closing = "Close" in dir_fill
+        is_buy     = side == "B"
+        leverage   = 1
+
+        if is_opening:
+            # 1. Vérifier si allocation encore disponible
+            deployed = copy_deployed.get(asset, 0.0)
+            if deployed + COPY_MAX_SIZE > COPY_ALLOC:
+                await send_copy_notification(app,
+                    f"⚠️ *Allocation {asset} pleine*\n"
+                    f"Déployé: ${deployed:.0f} / ${COPY_ALLOC:.0f}\n"
+                    f"Renfort du trader ignoré."
+                )
+                continue
+
+            # 2. Vérifier la marge globale
+            margin_ok = await check_margin_ok()
+            if not margin_ok:
+                await send_copy_notification(app,
+                    f"⚠️ *Copy Trading — Marge insuffisante*\n"
+                    f"Asset: {asset} | Action: {dir_fill}\n"
+                    f"Marge < {int(MARGIN_SAFETY*100)}% — ordre annulé"
+                )
+                continue
+
+            # 3. Taille en unités : $100 / prix actuel
+            my_size = round(COPY_MAX_SIZE / price, 6)
+
+            # 4. Levier : copier le trader mais capé par COPY_LEVERAGE
+            max_lev = COPY_LEVERAGE.get(asset, 3)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://api.hyperliquid.xyz/info",
+                        json={"type": "clearinghouseState", "user": trader_address},
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp:
+                        trader_state = await resp.json()
+                for pos in trader_state.get("assetPositions", []):
+                    p = pos.get("position", {})
+                    if p.get("coin") == asset:
+                        trader_lev = int(p.get("leverage", {}).get("value", 1) or 1)
+                        leverage   = min(trader_lev, max_lev)
+                        break
+            except Exception:
+                leverage = max_lev
+
+            # 5. Enregistrer le capital déployé
+            copy_deployed[asset] = deployed + COPY_MAX_SIZE
+
+        elif is_closing:
+            # Fermer notre position complète
+            my_positions = await get_my_positions()
+            my_pos = my_positions.get(asset)
+            if not my_pos:
+                logger.info(f"Pas de position ouverte sur {asset} — fermeture ignorée")
+                continue
+            my_size  = my_pos["size"]
+            is_buy   = my_pos["side"] == "short"  # inverser pour fermer
+            leverage = 1
+            # Reset capital déployé
+            copy_deployed[asset] = 0.0
+            logger.info(f"Capital {asset} reset → $0")
+        else:
+            continue
+
+        # Passer l'ordre
+        result = await place_order(asset, is_buy, my_size, dir_fill, leverage)
+
+        # Log
+        trade_log = {
+            "time":     datetime.now().strftime("%d/%m %H:%M"),
+            "asset":    asset,
+            "dir":      dir_fill,
+            "size":     my_size,
+            "price":    price,
+            "leverage": leverage,
+            "trader":   trader_address[:12],
+            "result":   "ok" if "error" not in result else "erreur",
+        }
+        copy_state["trades_log"].append(trade_log)
+        if len(copy_state["trades_log"]) > 100:
+            copy_state["trades_log"] = copy_state["trades_log"][-100:]
+
+        # Notification
+        emoji  = "📈" if is_buy else "📉"
+        status = "✅" if "error" not in result else "❌"
+        notif  = (
+            f"{status} *Copy Trade {emoji}*\n"
+            f"Asset:   *{asset}*\n"
+            f"Action:  {dir_fill}\n"
+            f"Taille:  {my_size} unités (~${COPY_MAX_SIZE:.0f})\n"
+            f"Levier:  x{leverage}\n"
+            f"Prix:    ${price:,.2f}\n"
+            f"Trader:  `{trader_address[:16]}...`"
+        )
+        if "error" in result:
+            notif += f"\n⚠️ Erreur: {result['error']}"
+
+        await send_copy_notification(app, notif)
+
+
+async def sync_existing_positions(watched: dict, app) -> None:
+    """
+    Au démarrage : vérifie si les traders ont déjà des positions ouvertes
+    et les copie immédiatement sans attendre un événement WebSocket.
+    """
+    logger.info("Synchronisation des positions existantes...")
+
+    for asset, trader_addr in watched.items():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.hyperliquid.xyz/info",
+                    json={"type": "clearinghouseState", "user": trader_addr},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    state = await resp.json()
+
+            for pos in state.get("assetPositions", []):
+                p = pos.get("position", {})
+                if p.get("coin") != asset:
+                    continue
+                sz = float(p.get("szi", 0) or 0)
+                if sz == 0:
+                    continue
+
+                # Vérifier qu'on n'a pas déjà cette position
+                my_positions = await get_my_positions()
+                if asset in my_positions:
+                    logger.info(f"Position {asset} déjà présente sur notre compte")
+                    continue
+
+                # Vérifier allocation et marge
+                deployed = copy_deployed.get(asset, 0.0)
+                if deployed + COPY_MAX_SIZE > COPY_ALLOC:
+                    continue
+                if not await check_margin_ok():
+                    continue
+
+                # Prix actuel
+                async with aiohttp.ClientSession() as session2:
+                    async with session2.post(
+                        "https://api.hyperliquid.xyz/info",
+                        json={"type": "allMids"},
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp2:
+                        mids = await resp2.json()
+                current_price = float(mids.get(asset, 0))
+                if current_price <= 0:
+                    continue
+
+                is_buy     = sz > 0
+                trader_lev = int(p.get("leverage", {}).get("value", 1) or 1)
+                leverage   = min(trader_lev, COPY_LEVERAGE.get(asset, 3))
+                my_size    = round(COPY_MAX_SIZE / current_price, 6)
+
+                result = await place_order(asset, is_buy, my_size, "Sync Open", leverage)
+                copy_deployed[asset] = deployed + COPY_MAX_SIZE
+
+                side_str = "Long 📈" if is_buy else "Short 📉"
+                status   = "✅" if "error" not in result else "❌"
+                notif_lines = [
+                    f"{status} *Position existante synchronisée*",
+                    f"Asset:  *{asset}*",
+                    f"Action: {side_str}",
+                    f"Taille: {my_size} (~${COPY_MAX_SIZE:.0f})",
+                    f"Levier: x{leverage}",
+                    f"Prix:   ${current_price:,.2f}",
+                    f"Trader: `{trader_addr[:16]}...`",
+                    f"_(Ouverte avant démarrage du bot)_",
+                ]
+                await send_copy_notification(app, "\n".join(notif_lines))
+                logger.info(f"Sync {asset} {side_str} OK")
+
+        except Exception as e:
+            logger.warning(f"Sync {asset} erreur: {e}")
+
+    logger.info("Synchronisation terminée")
+
+
+async def start_copy_trading(watched: dict, app) -> None:
+    """
+    Lance les WebSockets pour chaque asset/trader.
+    Si déjà actif et trader change :
+      - Arrête l'ancien WebSocket
+      - Lance le nouveau
+      - Garde les positions ouvertes existantes
+    """
+    old_watched  = copy_state.get("watched", {})
+    my_positions = await get_my_positions()
+
+    copy_state["active"]  = True
+    copy_state["watched"] = watched
+    if "ws_tasks" not in copy_state:
+        copy_state["ws_tasks"] = {}
+
+    active_assets = []
+    notif_lines   = ["🤖 *SakaiBot — Copy Trading*", ""]
+
+    for asset, trader_addr in watched.items():
+        if not trader_addr:
+            notif_lines.append(f"⬜ {asset}: aucun trader qualifié")
+            continue
+
+        old_trader     = old_watched.get(asset)
+        trader_changed = old_trader and old_trader != trader_addr
+
+        # Arrêter l'ancien WebSocket si trader changé
+        if trader_changed and asset in copy_state["ws_tasks"]:
+            copy_state["ws_tasks"][asset].cancel()
+            logger.info(f"WebSocket {asset} ancien trader arrêté")
+
+        # Lancer le nouveau WebSocket
+        task = asyncio.create_task(
+            watch_trader_positions(asset, trader_addr, app)
+        )
+        copy_state["ws_tasks"][asset] = task
+        active_assets.append(asset)
+        logger.info(f"WebSocket lancé: {asset} → {trader_addr[:12]}...")
+
+        # Gérer le capital déployé
+        if asset in my_positions:
+            copy_deployed[asset] = COPY_MAX_SIZE
+            if trader_changed:
+                notif_lines.append(
+                    f"🔁 {asset}: nouveau trader assigné\n"
+                    f"   `{trader_addr[:16]}...`\n"
+                    f"   Position existante conservée ✅"
+                )
+            else:
+                notif_lines.append(
+                    f"✅ {asset}: `{trader_addr[:16]}...`\n"
+                    f"   Position conservée"
+                )
+        else:
+            copy_deployed[asset] = 0.0
+            notif_lines.append(
+                f"👀 {asset}: `{trader_addr[:16]}...`\n"
+                f"   En surveillance"
+            )
+
+    if not active_assets:
+        copy_state["active"] = False
+        await send_copy_notification(app, "❌ *Copy Trading annulé*\nAucun trader qualifié.")
+        return
+
+    notif_lines.append("")
+    notif_lines.append(f"📡 Assets: {', '.join(active_assets)}")
+    notif_lines.append(
+        f"💰 BTC: ${COPY_MAX_SIZE:.0f} max x{COPY_LEVERAGE['BTC']} | "
+        f"HYPE: ${COPY_MAX_SIZE:.0f} max x{COPY_LEVERAGE['HYPE']}"
+    )
+    await send_copy_notification(app, "\n".join(notif_lines))
+    logger.info(f"✅ Copy trading actif — assets: {active_assets}")
+
+    # Sync uniquement les assets sans position ouverte
+    new_watched = {a: t for a, t in watched.items() if a not in my_positions and t}
+    if new_watched:
+        await sync_existing_positions(new_watched, app)
+
+
+async def stop_copy_trading() -> None:
+    """Arrête tous les WebSockets de copy trading."""
+    copy_state["active"] = False
+    for asset, task in copy_state["ws_tasks"].items():
+        task.cancel()
+        logger.info(f"WebSocket {asset} annulé")
+    copy_state["ws_tasks"] = {}
+    logger.info("Copy trading arrêté")
+
+
+# ============================================================
+# COMMANDES TELEGRAM — Copy Trading
+# ============================================================
+
+async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le statut du copy trading."""
+    if not is_authorized(update):
+        return
+
+    if not copy_state["active"]:
+        await update.message.reply_text(
+            "⏸ *Copy Trading inactif*\n"
+            "Lance `/toptraders` pour démarrer.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Récupérer les positions actuelles
+    positions = await get_my_positions()
+
+    lines = [
+        "🤖 *COPY TRADING — Statut*",
+        f"Status: {'🟢 ACTIF' if copy_state['active'] else '🔴 INACTIF'}",
+        f"Traders suivis: {len(copy_state['watched'])}",
+        "",
+        "📡 *Assets surveillés:*",
+    ]
+
+    for asset in COPY_ASSETS:
+        trader = copy_state["watched"].get(asset, None)
+        if trader:
+            pos = positions.get(asset)
+            if pos:
+                emoji = "📈" if pos["side"] == "long" else "📉"
+                lines.append(
+                    f"{emoji} {asset}: {pos['side'].upper()} "
+                    f"sz:{pos['size']} | PnL: ${pos['upnl']:+,.0f}"
+                )
+            else:
+                lines.append(f"👀 {asset}: en surveillance (pas de position)")
+        else:
+            lines.append(f"⬜ {asset}: aucun trader assigné")
+
+    if copy_state["trades_log"]:
+        lines.append("")
+        lines.append(f"📋 *Derniers trades ({min(3, len(copy_state['trades_log']))}) :*")
+        for t in copy_state["trades_log"][-3:]:
+            status = "✅" if t["result"] == "ok" else "❌"
+            lines.append(f"{status} {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.0f}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_copy_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Arrête le copy trading."""
+    if not is_authorized(update):
+        return
+
+    if not copy_state["active"]:
+        await update.message.reply_text("⏸ Copy trading déjà inactif.")
+        return
+
+    await stop_copy_trading()
+    await update.message.reply_text(
+        "🛑 *Copy Trading arrêté*\n"
+        "Tes positions ouvertes restent actives — gère-les manuellement.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ferme toutes les positions du bot."""
+    if not is_authorized(update):
+        return
+
+    await update.message.reply_text("🔄 Fermeture de toutes les positions en cours...")
+
+    positions = await get_my_positions()
+    if not positions:
+        await update.message.reply_text("✅ Aucune position ouverte.")
+        return
+
+    results = []
+    for asset, pos in positions.items():
+        is_buy = pos["side"] == "short"  # pour fermer un short on achète
+        result = await place_order(asset, is_buy, pos["size"], "Close All")
+        status = "✅" if "error" not in result else "❌"
+        results.append(f"{status} {asset} fermé")
+
+    await update.message.reply_text(
+        "🏁 *Fermeture terminée*\n" + "\n".join(results),
+        parse_mode="Markdown"
+    )
+
+
+
 async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche l'historique des selections precedentes."""
     if not is_authorized(update):
@@ -1174,6 +1860,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏆 *TradeBot — ETF Hyperliquid*\n"
         "   /toptraders — Selectionner les 5 meilleurs traders\n"
         "   /inspector — Analyser un wallet Hyperliquid\n"
+        "   /copy\\_status — Statut du copy trading\n"
+        "   /copy\\_stop — Arrêter le copy trading\n"
+        "   /copy\\_close — Fermer toutes les positions\n"
         "   /tb\\_historique — Historique des selections\n"
         "   /tb\\_aide — Aide TradeBot\n\n"
         "🔔 *Alertes*\n"
@@ -1320,6 +2009,9 @@ def main():
     app.add_handler(CommandHandler("tb_historique", cmd_tb_historique))
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
+    app.add_handler(CommandHandler("copy_status",   cmd_copy_status))
+    app.add_handler(CommandHandler("copy_stop",     cmd_copy_stop))
+    app.add_handler(CommandHandler("copy_close",    cmd_copy_close_all))
 
     logger.info("🤖 SakaiBot demarre avec module TradeBot!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
