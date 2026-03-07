@@ -556,7 +556,7 @@ async def fetch_top_traders_hl() -> list:
             logger.info(f"Exemple row[0]: {str(raw_rows[0])[:500]}")
 
         traders = []
-        for row in raw_rows[:100]:
+        for row in raw_rows:  # Parcourir TOUS les traders
             try:
                 # row = [adresse_str, {windowPerformances: [...]}]
                 if isinstance(row, list) and len(row) >= 2:
@@ -618,18 +618,15 @@ async def fetch_top_traders_hl() -> list:
 
 
 def apply_exclusion_filters(traders: list) -> list:
-    """Applique les filtres d'exclusion."""
-    filtered = []
-    for t in traders:
-        # Exclure seulement si MDD catastrophique ou PnL negatif
-        if t["mdd"] > TRADEBOT_MAX_DRAWDOWN:
-            continue
-        if t["pnl"] <= 0:
-            continue
-        # n_trades optionnel — API ne le fournit pas toujours
-        filtered.append(t)
-    logger.info(f"Apres filtres: {len(filtered)}/{len(traders)} traders")
-    return filtered
+    """Applique les filtres d'exclusion — garde les top 50 PnL positifs."""
+    # Trier par PnL décroissant et garder les positifs
+    positifs = [t for t in traders if t["pnl"] > 0]
+    positifs.sort(key=lambda x: x["pnl"], reverse=True)
+    top50 = positifs[:50]
+    logger.info(f"Filtres: {len(positifs)} PnL positifs sur {len(traders)} | top50 retenus")
+    if top50:
+        logger.info(f"Meilleur PnL: ${top50[0]['pnl']:,.0f} | 5e: ${top50[min(4,len(top50)-1)]['pnl']:,.0f}")
+    return top50
 
 
 def rank_and_score_traders(traders: list) -> list:
