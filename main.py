@@ -585,75 +585,71 @@ async def fetch_top_traders_hl() -> list:
         top_candidates = candidates[:50]
         logger.info(f"Top 50 candidats selectionnes (meilleur PnL: ${top_candidates[0][1]:,.0f})")
 
-        # Etape 2 : appeler portfolio pour chaque candidat
-        traders = []
+        # Etape 2 : appeler portfolio en PARALLELE pour tous les candidats
+        async def fetch_portfolio(session, address):
+            try:
+                async with session.post(
+                    "https://api-ui.hyperliquid.xyz/info",
+                    json={"type": "portfolio", "user": address},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    portfolio = await resp.json()
+
+                windows = {}
+                for item in portfolio:
+                    if isinstance(item, list) and len(item) == 2:
+                        windows[item[0]] = item[1]
+
+                at = windows.get("perpAllTime") or windows.get("allTime", {})
+                pnl_history = [float(p[1]) for p in at.get("pnlHistory", []) if float(p[1]) != 0.0]
+                acv_history = [float(p[1]) for p in at.get("accountValueHistory", []) if float(p[1]) > 0]
+
+                if not pnl_history or not acv_history:
+                    return None
+
+                pnl_final = pnl_history[-1]
+                if pnl_final <= 0:
+                    return None
+
+                initial_value = acv_history[0] if acv_history[0] > 0 else 1
+                roi = (pnl_final / initial_value) * 100
+
+                peak = acv_history[0]
+                max_dd = 0.0
+                for v in acv_history:
+                    if v > peak:
+                        peak = v
+                    dd = (peak - v) / peak * 100 if peak > 0 else 0
+                    if dd > max_dd:
+                        max_dd = dd
+
+                positive_moves = sum(1 for i in range(1, len(pnl_history)) if pnl_history[i] > pnl_history[i-1])
+                consistency = (positive_moves / max(len(pnl_history) - 1, 1)) * 100
+
+                week_data = windows.get("perpWeek") or windows.get("week", {})
+                week_pnl = [float(p[1]) for p in week_data.get("pnlHistory", [])]
+                week_positive = sum(1 for p in week_pnl if p > 0)
+                week_total = max(len(week_pnl), 1)
+
+                return {
+                    "address":      address,
+                    "pnl":          pnl_final,
+                    "roi":          round(roi, 1),
+                    "mdd":          round(max_dd, 1),
+                    "consistency":  round(consistency, 1),
+                    "week_winrate": round(week_positive / week_total * 100, 1),
+                    "n_trades":     0,
+                    "winrate":      round(consistency, 1),
+                }
+            except Exception as e:
+                logger.warning(f"Portfolio {address[:10]}... erreur: {e}")
+                return None
+
         async with aiohttp.ClientSession() as session:
-            for address, _ in top_candidates:
-                try:
-                    async with session.post(
-                        "https://api-ui.hyperliquid.xyz/info",
-                        json={"type": "portfolio", "user": address},
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        portfolio = await resp.json()
+            tasks = [fetch_portfolio(session, addr) for addr, _ in top_candidates]
+            results = await asyncio.gather(*tasks)
 
-                    # portfolio = [["day", {...}], ["week", {...}], ["month", {...}], ["allTime", {...}], ...]
-                    windows = {}
-                    for item in portfolio:
-                        if isinstance(item, list) and len(item) == 2:
-                            windows[item[0]] = item[1]
-
-                    # Calculer les metriques depuis allTime
-                    at = windows.get("perpAllTime") or windows.get("allTime", {})
-                    pnl_history = [float(p[1]) for p in at.get("pnlHistory", []) if p[1] != "0.0"]
-                    acv_history = [float(p[1]) for p in at.get("accountValueHistory", []) if float(p[1]) > 0]
-
-                    if not pnl_history or not acv_history:
-                        continue
-
-                    pnl_final = pnl_history[-1]
-                    if pnl_final <= 0:
-                        continue
-
-                    # ROI
-                    initial_value = acv_history[0] if acv_history[0] > 0 else 1
-                    roi = (pnl_final / initial_value) * 100
-
-                    # Drawdown maximum reel
-                    peak = acv_history[0]
-                    max_dd = 0.0
-                    for v in acv_history:
-                        if v > peak:
-                            peak = v
-                        dd = (peak - v) / peak * 100 if peak > 0 else 0
-                        if dd > max_dd:
-                            max_dd = dd
-
-                    # Consistance : % de points ou le PnL est croissant
-                    positive_moves = sum(1 for i in range(1, len(pnl_history)) if pnl_history[i] > pnl_history[i-1])
-                    consistency = (positive_moves / max(len(pnl_history) - 1, 1)) * 100
-
-                    # Semaines profitables (depuis window week)
-                    week_data = windows.get("perpWeek") or windows.get("week", {})
-                    week_pnl = [float(p[1]) for p in week_data.get("pnlHistory", [])]
-                    week_positive = sum(1 for p in week_pnl if p > 0)
-                    week_total = max(len(week_pnl), 1)
-
-                    traders.append({
-                        "address":     address,
-                        "pnl":         pnl_final,
-                        "roi":         round(roi, 1),
-                        "mdd":         round(max_dd, 1),
-                        "consistency": round(consistency, 1),
-                        "week_winrate": round(week_positive / week_total * 100, 1),
-                        "n_trades":    0,
-                        "winrate":     round(consistency, 1),
-                    })
-
-                except Exception as e:
-                    logger.warning(f"Portfolio {address[:10]}... erreur: {e}")
-                    continue
-
+        traders = [r for r in results if r is not None]
         logger.info(f"Traders avec portfolio complet: {len(traders)}")
         return traders
 
