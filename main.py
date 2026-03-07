@@ -549,63 +549,65 @@ async def fetch_top_traders_hl() -> list:
                 logger.info(f"Leaderboard status: {resp.status}")
                 data = await resp.json()
 
-        logger.info(f"Leaderboard type: {type(data)}")
-        if isinstance(data, dict):
-            logger.info(f"Leaderboard keys: {list(data.keys())}")
-        elif isinstance(data, list):
-            logger.info(f"Leaderboard rows: {len(data)}")
-            if data:
-                logger.info(f"First row keys: {list(data[0].keys())}")
+        # Structure reelle: {"leaderboardRows": [[adresse, {windowPerformances:[...]}], ...]}
+        raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
+        logger.info(f"Traders bruts: {len(raw_rows)}")
 
         traders = []
-        # Structure reelle: {"leaderboardRows": [[address, {windowPerformances: [...]}], ...]}
-        raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
-
         for row in raw_rows[:100]:
-            # Chaque row est une liste [address, stats_dict]
-            if isinstance(row, list) and len(row) >= 2:
-                address    = row[0]
-                stats_dict = row[1]
-            elif isinstance(row, dict):
-                address    = row.get("ethAddress") or row.get("user", "")
-                stats_dict = row
-            else:
+            try:
+                # row = [adresse_str, {windowPerformances: [...]}]
+                if isinstance(row, list) and len(row) >= 2:
+                    address    = str(row[0])
+                    stats_dict = row[1] if isinstance(row[1], dict) else {}
+                elif isinstance(row, dict):
+                    address    = row.get("ethAddress") or row.get("user", "")
+                    stats_dict = row
+                else:
+                    continue
+
+                if not address or len(address) < 5:
+                    continue
+
+                # Chercher la meilleure window dispo
+                window_performances = stats_dict.get("windowPerformances", [])
+                window_data = {}
+                for w in window_performances:
+                    if not isinstance(w, dict):
+                        continue
+                    wname = w.get("window", "")
+                    wp    = w.get("windowPerformance", {})
+                    if wname == "allTime":
+                        window_data = wp
+                        break
+                    elif wname in ("month", "week") and not window_data:
+                        window_data = wp
+
+                if not window_data:
+                    window_data = stats_dict
+
+                pnl      = float(window_data.get("pnl", 0) or 0)
+                n_trades = int(float(window_data.get("numTrades", 0) or 0))
+                winrate  = float(window_data.get("winRate", 0) or 0) * 100
+                roi      = float(window_data.get("roi", 0) or 0) * 100
+
+                mdd_proxy         = abs(min(0.0, roi)) if roi < 0 else max(0.0, 5.0 - roi * 0.1)
+                consistency_proxy = 75.0 if winrate >= 55 else 50.0
+
+                traders.append({
+                    "address":     address,
+                    "pnl":         pnl,
+                    "n_trades":    n_trades,
+                    "winrate":     winrate,
+                    "roi":         roi,
+                    "mdd":         round(mdd_proxy, 1),
+                    "consistency": round(consistency_proxy, 1),
+                })
+            except Exception as row_err:
+                logger.warning(f"Row ignoree: {row_err}")
                 continue
 
-            if not address:
-                continue
-
-            # Chercher la meilleure window dispo
-            window_data = {}
-            window_performances = stats_dict.get("windowPerformances", []) if isinstance(stats_dict, dict) else []
-            for w in window_performances:
-                wname = w.get("window", "")
-                if wname == "allTime":
-                    window_data = w.get("windowPerformance", {})
-                    break
-                elif wname in ("month", "week"):
-                    window_data = w.get("windowPerformance", {})
-
-            if not window_data and isinstance(stats_dict, dict):
-                window_data = stats_dict
-
-            pnl      = float(window_data.get("pnl", 0) or 0)
-            n_trades = int(window_data.get("numTrades", 0) or 0)
-            winrate  = float(window_data.get("winRate", 0) or 0) * 100
-            roi      = float(window_data.get("roi", 0) or 0) * 100
-
-            mdd_proxy         = abs(min(0.0, roi)) if roi < 0 else max(0.0, 5.0 - roi * 0.1)
-            consistency_proxy = 75.0 if winrate >= 55 else 50.0
-
-            traders.append({
-                "address":     address,
-                "pnl":         pnl,
-                "n_trades":    n_trades,
-                "winrate":     winrate,
-                "roi":         roi,
-                "mdd":         round(mdd_proxy, 1),
-                "consistency": round(consistency_proxy, 1),
-            })
+        logger.info(f"Traders parsed avec succes: {len(traders)}")
         return traders
 
     except Exception as e:
