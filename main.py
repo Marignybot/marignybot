@@ -539,12 +539,11 @@ def stars(value: float, max_val: float = 100) -> str:
 
 
 async def fetch_top_traders_hl() -> list:
-    """Recupere les top traders via l'API Hyperliquid (leaderboard)."""
+    """Recupere les top traders via stats-data.hyperliquid.xyz"""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(
-                HYPERLIQUID_API,
-                json={"type": "leaderboard"},
+            async with session.get(
+                "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard",
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 data = await resp.json()
@@ -552,16 +551,18 @@ async def fetch_top_traders_hl() -> list:
         traders = []
         rows = data if isinstance(data, list) else data.get("leaderboardRows", [])
 
-        for row in rows[:50]:
+        for row in rows[:100]:
             address = row.get("ethAddress") or row.get("user", "")
             if not address:
                 continue
 
             window_data = {}
             for w in row.get("windowPerformances", []):
-                if w.get("window") in ("allTime", "month"):
+                wname = w.get("window", "")
+                if wname in ("allTime", "month", "week"):
                     window_data = w.get("windowPerformance", {})
-                    break
+                    if wname == "allTime":
+                        break
             if not window_data:
                 window_data = row.get("windowPerformance", row)
 
@@ -570,7 +571,6 @@ async def fetch_top_traders_hl() -> list:
             winrate  = float(window_data.get("winRate", 0) or 0) * 100
             roi      = float(window_data.get("roi", 0) or 0) * 100
 
-            # Proxy MDD et consistance (API HL ne fournit pas ces metriques directement)
             mdd_proxy         = abs(min(0.0, roi)) if roi < 0 else max(0.0, 5.0 - roi * 0.1)
             consistency_proxy = 75.0 if winrate >= 55 else 50.0
 
