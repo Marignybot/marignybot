@@ -575,15 +575,23 @@ async def fetch_top_traders_hl() -> list:
                         pnl_alltime = float(w[1].get("pnl", 0) or 0)
                         break
 
-                if pnl_alltime > 0:
-                    candidates.append((address, pnl_alltime))
+                # Extraire ROI allTime
+                roi_alltime = 0.0
+                for w in stats_dict.get("windowPerformances", []):
+                    if isinstance(w, list) and len(w) == 2 and w[0] == "allTime":
+                        roi_alltime = float(w[1].get("roi", 0) or 0) * 100
+                        break
+
+                # Filtre : PnL > $50k ET ROI > 50% pour ecarter les micro-comptes
+                if pnl_alltime > 50000 and roi_alltime > 50:
+                    candidates.append((address, roi_alltime, pnl_alltime))
             except Exception:
                 continue
 
-        # Garder les 50 meilleurs PnL pour appeler portfolio
+        # Trier par ROI pour avoir les meilleurs performers relatifs
         candidates.sort(key=lambda x: x[1], reverse=True)
         top_candidates = candidates[:200]
-        logger.info(f"Top 200 candidats selectionnes (meilleur PnL: ${top_candidates[0][1]:,.0f})")
+        logger.info(f"Top 200 candidats (meilleur ROI: {top_candidates[0][1]:.0f}%) selectionnes (meilleur PnL: ${top_candidates[0][1]:,.0f})")
 
         # Etape 2 : appeler portfolio en PARALLELE pour tous les candidats
         async def fetch_portfolio(session, address):
@@ -626,10 +634,9 @@ async def fetch_top_traders_hl() -> list:
                         logger.info(f"Inactif {address[:10]}... ({days_since:.0f}j sans trade)")
                         return None
 
-                # ROI basé sur la valeur courante du compte pour eviter les aberrations
-                current_value = acv_history[-1] if acv_history else 1
-                base_value = max(current_value - pnl_final, 1)  # capital investi initial
-                roi = min((pnl_final / base_value) * 100, 9999)  # cap a 9999%
+                # ROI : PnL / valeur max atteinte (evite les aberrations sur petits comptes)
+                peak_value = max(acv_history) if acv_history else 1
+                roi = min((pnl_final / max(peak_value, 1)) * 100, 2000)  # cap a 2000%
 
                 peak = acv_history[0]
                 max_dd = 0.0
