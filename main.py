@@ -65,7 +65,7 @@ copy_state = {
 }
 
 HYPERLIQUID_API            = "https://api.hyperliquid.xyz/info"
-WATCHED_TOKENS             = ["BTC", "ETH", "HYPE"]
+WATCHED_TOKENS             = ["BTC", "ETH", "SOL", "HYPE", "TAO"]
 ALERT_THRESHOLD_PERCENT    = 5.0
 LIQUIDATION_ALERT_PERCENT  = 15.0
 MORNING_HOUR_UTC           = 8
