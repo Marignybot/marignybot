@@ -558,22 +558,36 @@ async def fetch_top_traders_hl() -> list:
                 logger.info(f"First row keys: {list(data[0].keys())}")
 
         traders = []
-        rows = data if isinstance(data, list) else data.get("leaderboardRows", [])
+        # Structure reelle: {"leaderboardRows": [[address, {windowPerformances: [...]}], ...]}
+        raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
 
-        for row in rows[:100]:
-            address = row.get("ethAddress") or row.get("user", "")
+        for row in raw_rows[:100]:
+            # Chaque row est une liste [address, stats_dict]
+            if isinstance(row, list) and len(row) >= 2:
+                address    = row[0]
+                stats_dict = row[1]
+            elif isinstance(row, dict):
+                address    = row.get("ethAddress") or row.get("user", "")
+                stats_dict = row
+            else:
+                continue
+
             if not address:
                 continue
 
+            # Chercher la meilleure window dispo
             window_data = {}
-            for w in row.get("windowPerformances", []):
+            window_performances = stats_dict.get("windowPerformances", []) if isinstance(stats_dict, dict) else []
+            for w in window_performances:
                 wname = w.get("window", "")
-                if wname in ("allTime", "month", "week"):
+                if wname == "allTime":
                     window_data = w.get("windowPerformance", {})
-                    if wname == "allTime":
-                        break
-            if not window_data:
-                window_data = row.get("windowPerformance", row)
+                    break
+                elif wname in ("month", "week"):
+                    window_data = w.get("windowPerformance", {})
+
+            if not window_data and isinstance(stats_dict, dict):
+                window_data = stats_dict
 
             pnl      = float(window_data.get("pnl", 0) or 0)
             n_trades = int(window_data.get("numTrades", 0) or 0)
