@@ -29,7 +29,7 @@ AUTHORIZED_USER_ID = 1429797974
 COPY_BOT_ADDRESS   = "0xd849f8E96d7BE1A1fc7CA5291Dc6603a47dF8dFD"
 HL_PRIVATE_KEY     = os.getenv("HL_PRIVATE_KEY", "")
 COPY_CAPITAL       = 1000.0   # capital total
-COPY_ASSETS        = ["BTC", "ETH", "HYPE"]   # assets surveillés phase 1
+COPY_ASSETS        = ["BTC", "ETH", "HYPE", "SOL", "TAO"]
 COPY_ALLOC         = 100.0    # $100 par asset (test)
 COPY_MAX_SIZE      = 50.0     # $50 max par trade (test)
 MARGIN_SAFETY      = 0.5      # marge de sécurité 50%
@@ -39,6 +39,8 @@ COPY_LEVERAGE = {
     "BTC":  5,
     "ETH":  4,
     "HYPE": 3,
+    "SOL":  5,
+    "TAO":  3,
 }
 
 # Suivi du capital déployé par asset
@@ -46,6 +48,8 @@ copy_deployed = {
     "BTC":  0.0,
     "ETH":  0.0,
     "HYPE": 0.0,
+    "SOL":  0.0,
+    "TAO":  0.0,
 }
 
 # State global du copy trading
@@ -1419,45 +1423,18 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
         leverage   = 1
 
         if is_opening:
-            deployed = copy_deployed.get(asset, 0.0)
-            if deployed + COPY_MAX_SIZE > COPY_ALLOC:
+            if not await check_margin_ok():
                 await send_copy_notification(app,
-                    f"⚠️ *Allocation {asset} pleine*\n"
-                    f"Déployé: ${deployed:.0f} / ${COPY_ALLOC:.0f}\n"
-                    f"Renfort du trader ignoré."
-                )
-                continue
-
-            margin_ok = await check_margin_ok()
-            if not margin_ok:
-                await send_copy_notification(app,
-                    f"⚠️ *Copy Trading — Marge insuffisante*\n"
+                    f"⚠️ *Marge insuffisante*\n"
                     f"Asset: {asset} | Action: {dir_fill}\n"
                     f"Marge < {int(MARGIN_SAFETY*100)}% — ordre annulé"
                 )
                 continue
 
-            my_size = round(COPY_MAX_SIZE / price, 6)
-
-            max_lev = COPY_LEVERAGE.get(asset, 3)
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        "https://api.hyperliquid.xyz/info",
-                        json={"type": "clearinghouseState", "user": trader_address},
-                        timeout=aiohttp.ClientTimeout(total=5)
-                    ) as resp:
-                        trader_state = await resp.json()
-                for pos in trader_state.get("assetPositions", []):
-                    p = pos.get("position", {})
-                    if p.get("coin") == asset:
-                        trader_lev = int(p.get("leverage", {}).get("value", 1) or 1)
-                        leverage   = min(trader_lev, max_lev)
-                        break
-            except Exception:
-                leverage = max_lev
-
-            copy_deployed[asset] = deployed + COPY_MAX_SIZE
+            # Taille proportionnelle : ratio position_trader / capital_trader
+            pos_value = size * price
+            my_size, leverage, my_usd = await get_proportional_size(asset, trader_address, pos_value, price)
+            copy_deployed[asset] = copy_deployed.get(asset, 0.0) + my_usd
 
         elif is_closing:
             my_positions = await get_my_positions()
@@ -1506,14 +1483,89 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
         await send_copy_notification(app, notif)
 
 
+async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: float, current_price: float) -> tuple:
+    """
+    Calcule la taille proportionnelle à copier.
+    Ratio = position_trader / capital_trader
+    Ma taille = ratio * mon_capital_bot
+    Retourne (size, leverage, usd_value)
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "clearinghouseState", "user": trader_addr},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                trader_state = await resp.json()
+
+        # Capital total du trader
+        margin = trader_state.get("crossMarginSummary") or trader_state.get("marginSummary") or {}
+        trader_capital = float(margin.get("accountValue", 0) or 0)
+        if trader_capital <= 0:
+            trader_capital = float(trader_state.get("crossAccountValue", 0) or 1)
+
+        # Levier du trader sur cet asset
+        leverage = 1
+        for pos in trader_state.get("assetPositions", []):
+            p = pos.get("position", {})
+            if p.get("coin") == asset:
+                leverage = int(p.get("leverage", {}).get("value", 1) or 1)
+                break
+
+        # Capital de mon wallet bot
+        bot_positions, bot_balance = await get_wallet_data(COPY_BOT_ADDRESS)
+        my_capital = bot_balance.get("accountValue", 0)
+        if my_capital <= 0:
+            my_capital = 1000.0  # fallback
+
+        # Ratio proportionnel
+        ratio        = trader_pos_value / max(trader_capital, 1)
+        my_usd_value = ratio * my_capital
+        my_usd_value = max(my_usd_value, 11.0)  # minimum $11
+
+        SIZE_RULES = {
+            "BTC":  {"min": 0.001, "decimals": 3},
+            "ETH":  {"min": 0.01,  "decimals": 2},
+            "SOL":  {"min": 0.1,   "decimals": 1},
+            "HYPE": {"min": 1.0,   "decimals": 0},
+            "TAO":  {"min": 0.01,  "decimals": 2},
+        }
+        rules   = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
+        my_size = max(round(my_usd_value / current_price, rules["decimals"]), rules["min"])
+
+        logger.info(
+            f"Proportionnel {asset}: trader_cap=${trader_capital:.0f} "
+            f"pos=${trader_pos_value:.0f} ratio={ratio*100:.1f}% "
+            f"mon_cap=${my_capital:.0f} → ${my_usd_value:.0f} sz={my_size}"
+        )
+        return my_size, leverage, my_usd_value
+
+    except Exception as e:
+        logger.warning(f"get_proportional_size erreur: {e}")
+        SIZE_RULES = {"BTC": {"min": 0.001, "decimals": 3}, "ETH": {"min": 0.01, "decimals": 2},
+                      "SOL": {"min": 0.1, "decimals": 1}, "HYPE": {"min": 1.0, "decimals": 0}}
+        rules = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
+        fallback_size = max(round(50.0 / current_price, rules["decimals"]), rules["min"])
+        return fallback_size, 1, 50.0
+
+
 async def sync_existing_positions(watched: dict, app) -> None:
     logger.info("Synchronisation des positions existantes...")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            HYPERLIQUID_API,
+            json={"type": "allMids"},
+            timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
+            mids = await resp.json()
 
     for asset, trader_addr in watched.items():
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    "https://api.hyperliquid.xyz/info",
+                    HYPERLIQUID_API,
                     json={"type": "clearinghouseState", "user": trader_addr},
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
@@ -1529,48 +1581,36 @@ async def sync_existing_positions(watched: dict, app) -> None:
 
                 my_positions = await get_my_positions()
                 if asset in my_positions:
-                    logger.info(f"Position {asset} déjà présente sur notre compte")
+                    logger.info(f"Position {asset} déjà présente sur notre compte — skip")
                     continue
 
-                deployed = copy_deployed.get(asset, 0.0)
-                if deployed + COPY_MAX_SIZE > COPY_ALLOC:
-                    continue
                 if not await check_margin_ok():
+                    await send_copy_notification(app, f"⚠️ Marge insuffisante — sync {asset} annulé")
                     continue
 
-                async with aiohttp.ClientSession() as session2:
-                    async with session2.post(
-                        "https://api.hyperliquid.xyz/info",
-                        json={"type": "allMids"},
-                        timeout=aiohttp.ClientTimeout(total=5)
-                    ) as resp2:
-                        mids = await resp2.json()
                 current_price = float(mids.get(asset, 0))
                 if current_price <= 0:
                     continue
 
-                is_buy     = sz > 0
-                trader_lev = int(p.get("leverage", {}).get("value", 1) or 1)
-                leverage   = min(trader_lev, COPY_LEVERAGE.get(asset, 3))
-                my_size    = round(COPY_MAX_SIZE / current_price, 6)
+                # Valeur de la position du trader
+                entry_px    = float(p.get("entryPx", current_price) or current_price)
+                pos_value   = abs(sz) * current_price
+                is_buy      = sz > 0
 
+                my_size, leverage, my_usd = await get_proportional_size(asset, trader_addr, pos_value, current_price)
                 result = await place_order(asset, is_buy, my_size, "Sync Open", leverage)
-                copy_deployed[asset] = deployed + COPY_MAX_SIZE
 
                 side_str = "Long 📈" if is_buy else "Short 📉"
                 status   = "✅" if "error" not in result else "❌"
-                notif_lines = [
-                    f"{status} *Position existante synchronisée*",
-                    f"Asset:  *{asset}*",
-                    f"Action: {side_str}",
-                    f"Taille: {my_size} (~${COPY_MAX_SIZE:.0f})",
-                    f"Levier: x{leverage}",
+                await send_copy_notification(app, "\n".join([
+                    f"{status} *Sync position existante*",
+                    f"Asset:  *{asset}* {side_str} x{leverage}",
+                    f"Taille: {my_size} (~${my_usd:.0f})",
                     f"Prix:   ${current_price:,.2f}",
                     f"Trader: `{trader_addr[:16]}...`",
-                    f"_(Ouverte avant démarrage du bot)_",
-                ]
-                await send_copy_notification(app, "\n".join(notif_lines))
-                logger.info(f"Sync {asset} {side_str} OK")
+                    f"_(Position ouverte avant démarrage)_",
+                ]))
+                logger.info(f"Sync {asset} {side_str} sz={my_size} OK")
 
         except Exception as e:
             logger.warning(f"Sync {asset} erreur: {e}")
@@ -1637,7 +1677,7 @@ async def start_copy_trading(watched: dict, app) -> None:
     notif_lines.append("")
     notif_lines.append(f"📡 Assets: {', '.join(active_assets)}")
     notif_lines.append(
-        f"💰 BTC x{COPY_LEVERAGE['BTC']} | ETH x{COPY_LEVERAGE['ETH']} | HYPE x{COPY_LEVERAGE['HYPE']} — ${COPY_MAX_SIZE:.0f} max/trade"
+        f"💰 BTC x{COPY_LEVERAGE['BTC']} | ETH x{COPY_LEVERAGE['ETH']} | HYPE x{COPY_LEVERAGE['HYPE']} | SOL x{COPY_LEVERAGE['SOL']} | TAO x{COPY_LEVERAGE['TAO']}"
     )
     await send_copy_notification(app, "\n".join(notif_lines))
     logger.info(f"✅ Copy trading actif — assets: {active_assets}")
@@ -1941,11 +1981,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /start\\_btc — Démarrer BTC\n"
         "   /start\\_eth — Démarrer ETH\n"
         "   /start\\_hype — Démarrer HYPE\n"
+        "   /start\\_sol — Démarrer SOL\n"
+        "   /start\\_tao — Démarrer TAO\n"
         "   /copy\\_start — Démarrer tous\n\n"
         "🔴 *Stop Copy Trading*\n"
         "   /stop\\_btc — Arrêter BTC\n"
         "   /stop\\_eth — Arrêter ETH\n"
         "   /stop\\_hype — Arrêter HYPE\n"
+        "   /stop\\_sol — Arrêter SOL\n"
+        "   /stop\\_tao — Arrêter TAO\n"
         "   /copy\\_stop — Arrêter tout\n\n"
         "📊 *Statut & Gestion*\n"
         "   /copy\\_sync — Forcer sync positions ouvertes\n"
@@ -2180,11 +2224,12 @@ async def target_sync_positions(address: str, app) -> None:
                 results.append(f"⚠️ {asset}: prix introuvable")
                 continue
 
-            my_size = round(TARGET_SIZE / price, 6)
+            pos_value = abs(sz) * price
+            my_size, lev, my_usd = await get_proportional_size(asset, address, pos_value, price)
             result  = await place_order(asset, is_buy, my_size, "Target Sync", lev)
             status  = "✅" if "error" not in result else "❌"
             side_str = "Long 📈" if is_buy else "Short 📉"
-            results.append(f"{status} {asset} {side_str} x{lev} ~${TARGET_SIZE:.0f}")
+            results.append(f"{status} {asset} {side_str} x{lev} ~${my_usd:.0f}")
 
             target_state["positions"][asset] = {
                 "side":  "long" if is_buy else "short",
@@ -2254,29 +2299,13 @@ async def target_watch_ws(address: str, app) -> None:
                             is_buy     = side == "B"
 
                             if is_opening:
-                                my_size = round(TARGET_SIZE / price, 6)
-                                # Levier du trader
-                                try:
-                                    async with aiohttp.ClientSession() as s:
-                                        async with s.post(
-                                            HYPERLIQUID_API,
-                                            json={"type": "clearinghouseState", "user": address},
-                                            timeout=aiohttp.ClientTimeout(total=5)
-                                        ) as r:
-                                            ts = await r.json()
-                                    lev = 1
-                                    for pos in ts.get("assetPositions", []):
-                                        p = pos.get("position", {})
-                                        if p.get("coin") == asset:
-                                            lev = int(p.get("leverage", {}).get("value", 1) or 1)
-                                            break
-                                except Exception:
-                                    lev = 1
-
+                                pos_value = size * price
+                                my_size, lev, my_usd = await get_proportional_size(asset, address, pos_value, price)
                                 result = await place_order(asset, is_buy, my_size, dir_fill, lev)
                                 target_state["positions"][asset] = {
                                     "side": "long" if is_buy else "short",
                                     "size": my_size, "entry": price,
+                                    "usd": my_usd,
                                 }
 
                             elif is_closing:
@@ -2306,7 +2335,7 @@ async def target_watch_ws(address: str, app) -> None:
                                 f"{status} *Target Copy {emoji}*\n"
                                 f"Asset:  *{asset}*\n"
                                 f"Action: {dir_fill}\n"
-                                f"Taille: {my_size} (~${TARGET_SIZE:.0f})\n"
+                                f"Taille: {my_size} (~${my_usd:.0f})\n"
                                 f"Prix:   ${price:,.2f}\n"
                                 f"Wallet: `{address[:16]}...`"
                             )
@@ -2373,7 +2402,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             f"🎯 *Target Wallet Manuel activé*\n`{address}`\n\n"
-            f"💰 ${TARGET_SIZE:.0f} par position | tous assets\n"
+            f"💰 Taille proportionnelle à ton capital | tous assets\n"
             f"Synchronisation des positions ouvertes...",
             parse_mode="Markdown"
         )
@@ -2454,7 +2483,7 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 *TARGET WALLET MANUEL*",
         f"Status: {status_emoji}",
         f"Wallet: `{target_state['address']}`",
-        f"Taille/position: ${TARGET_SIZE:.0f}",
+        "Taille: proportionnelle au capital",
         "",
         "📡 *Positions copiées:*",
     ]
@@ -2510,6 +2539,8 @@ def main():
     app.add_handler(CommandHandler("start_btc",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"BTC")))
     app.add_handler(CommandHandler("start_eth",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"ETH")))
     app.add_handler(CommandHandler("start_hype",    lambda u,ctx: cmd_copy_start_asset(u,ctx,"HYPE")))
+    app.add_handler(CommandHandler("start_sol",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"SOL")))
+    app.add_handler(CommandHandler("start_tao",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"TAO")))
     app.add_handler(CommandHandler("stop_btc",      lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"BTC")))
     app.add_handler(CommandHandler("stop_eth",      lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"ETH")))
     app.add_handler(CommandHandler("stop_hype",     lambda u,ctx: cmd_copy_stop_asset_direct(u,ctx,"HYPE")))
