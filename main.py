@@ -583,7 +583,7 @@ async def fetch_top_traders_hl() -> list:
                         break
 
                 # Filtre : PnL > $50k ET ROI > 50% pour ecarter les micro-comptes
-                if pnl_alltime > 50000 and roi_alltime > 50:
+                if pnl_alltime > 100000 and 100 < roi_alltime < 50000:
                     candidates.append((address, roi_alltime, pnl_alltime))
             except Exception:
                 continue
@@ -671,7 +671,7 @@ async def fetch_top_traders_hl() -> list:
                 return None
 
         async with aiohttp.ClientSession() as session:
-            tasks = [fetch_portfolio(session, addr) for addr, _ in top_candidates]
+            tasks = [fetch_portfolio(session, addr) for addr, _, _ in top_candidates]
             results = await asyncio.gather(*tasks)
 
         traders = [r for r in results if r is not None]
