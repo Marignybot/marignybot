@@ -1031,6 +1031,9 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Parser windows portfolio
         windows = {}
+        if not portfolio or not isinstance(portfolio, list):
+            await update.message.reply_text("❌ Données portfolio indisponibles pour ce wallet.", parse_mode="Markdown")
+            return
         for item in portfolio:
             if isinstance(item, list) and len(item) == 2:
                 windows[item[0]] = item[1]
@@ -1760,17 +1763,24 @@ async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ranked = copy_state["last_ranked"]
 
     # Construire le mapping asset → meilleur trader
+    # Priorité : meilleur PnL sur l'asset (spécialiste), peu importe le score global
     watched      = {}
     assigned_set = set()
     for asset in assets:
-        for t in ranked:
-            apnl = t.get("asset_pnl", {}).get(asset, 0.0)
-            if apnl > 0 and t["address"] not in assigned_set:
+        # Trier tous les traders par PnL sur cet asset (décroissant)
+        specialists = sorted(
+            [t for t in ranked if t.get("asset_pnl", {}).get(asset, 0.0) > 0],
+            key=lambda t: t.get("asset_pnl", {}).get(asset, 0.0),
+            reverse=True
+        )
+        # Prendre le meilleur spécialiste non encore assigné
+        for t in specialists:
+            if t["address"] not in assigned_set:
                 watched[asset] = t["address"]
                 assigned_set.add(t["address"])
                 break
         if asset not in watched:
-            # Fallback : meilleur score global si pas de spécialiste asset
+            # Fallback : meilleur score global si aucun spécialiste trouvé
             for t in ranked:
                 if t["address"] not in assigned_set:
                     watched[asset] = t["address"]
