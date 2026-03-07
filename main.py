@@ -1194,61 +1194,33 @@ async def get_asset_index(asset: str) -> int:
         return -1
 
 
-def sign_l1_action(account, action: dict, vault_address, nonce: int) -> dict:
-    """
-    Signature EIP-712 correcte pour Hyperliquid L1.
-    Ref: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/signing
-    """
-    import msgpack
-    from eth_account.messages import encode_defunct
-    from eth_utils import keccak
-
-    # Encoder l'action avec msgpack (format requis par HL)
-    action_bytes = msgpack.packb(action, use_bin_type=True)
-    action_hash  = keccak(action_bytes)
-
-    # Encoder vault_address (None → 0x0000...0000)
-    if vault_address:
-        vault_bytes = bytes.fromhex(vault_address[2:].lower().zfill(40))
-    else:
-        vault_bytes = b'\x00' * 20
-
-    # Nonce en big-endian 8 bytes
-    nonce_bytes = nonce.to_bytes(8, 'big')
-
-    # Flag: 0 si pas de vault, 1 si vault
-    flag_byte = b'\x01' if vault_address else b'\x00'
-
-    # Hash final
-    payload = action_hash + nonce_bytes + flag_byte + vault_bytes
-    final_hash = keccak(payload)
-
-    # Signer avec eth_account
-    msg = encode_defunct(final_hash)
-    signed = account.sign_message(msg)
-
-    return {
-        "r": hex(signed.r),
-        "s": hex(signed.s),
-        "v": signed.v,
-    }
-
-
 async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
+    """
+    Place un ordre via le SDK officiel hyperliquid-python-sdk.
+    La clé API HL_PRIVATE_KEY doit être générée depuis app.hyperliquid.xyz → Settings → API.
+    """
     try:
         if not HL_PRIVATE_KEY:
             logger.error("HL_PRIVATE_KEY non définie")
             return {"error": "Clé privée manquante"}
 
-        from eth_account import Account
+        import eth_account
+        from hyperliquid.exchange import Exchange
+        from hyperliquid.utils import constants
 
-        account = Account.from_key(HL_PRIVATE_KEY)
-        logger.info(f"place_order — wallet dérivé: {account.address}")
+        # Clé API avec ou sans 0x
+        key = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+        wallet   = eth_account.Account.from_key(key)
+        exchange = Exchange(
+            wallet,
+            constants.MAINNET_API_URL,
+            account_address=COPY_BOT_ADDRESS
+        )
 
-        # Prix actuel
+        # Prix actuel pour ordre IOC avec slippage
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.hyperliquid.xyz/info",
+                HYPERLIQUID_API,
                 json={"type": "allMids"},
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
@@ -1258,45 +1230,20 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         if price <= 0:
             return {"error": f"Prix {asset} introuvable"}
 
-        # Slippage 0.5%
         limit_px = round(price * (1.005 if is_buy else 0.995), 6)
 
-        asset_idx = await get_asset_index(asset)
-        if asset_idx < 0:
-            return {"error": f"Asset {asset} introuvable"}
-
-        timestamp = int(datetime.now().timestamp() * 1000)
-
-        action = {
-            "type": "order",
-            "orders": [{
-                "a": asset_idx,
-                "b": is_buy,
-                "p": str(limit_px),
-                "s": str(round(size, 6)),
-                "r": False,
-                "t": {"limit": {"tif": "Ioc"}}
-            }],
-            "grouping": "na"
-        }
-
-        signature = sign_l1_action(account, action, None, timestamp)
-
-        payload = {
-            "action":       action,
-            "nonce":        timestamp,
-            "signature":    signature,
-            "vaultAddress": None
-        }
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.hyperliquid.xyz/exchange",
-                json=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                result = await resp.json()
+        # SDK gère la signature EIP-712 correctement
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: exchange.order(
+                asset,
+                is_buy,
+                round(size, 6),
+                limit_px,
+                {"limit": {"tif": "Ioc"}}
+            )
+        )
 
         logger.info(f"Ordre {asset} {'BUY' if is_buy else 'SELL'} {size} → {result}")
         return result
