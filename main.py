@@ -36,12 +36,12 @@ MARGIN_SAFETY      = 0.5      # marge de sécurité 50%
 
 # Levier max par asset
 COPY_LEVERAGE = {
-    "BTC":  5,   # x5 → liquidation à -20%
-    "ETH":  4,   # x4 → liquidation à -25%
-    "HYPE": 3,   # x3 → liquidation à -33%
+    "BTC":  5,
+    "ETH":  4,
+    "HYPE": 3,
 }
 
-# Suivi du capital déployé par asset (évite de dépasser l'allocation)
+# Suivi du capital déployé par asset
 copy_deployed = {
     "BTC":  0.0,
     "ETH":  0.0,
@@ -50,14 +50,14 @@ copy_deployed = {
 
 # State global du copy trading
 copy_state = {
-    "active":        False,          # copy trading actif ou non
-    "watched":       {},             # {asset: adresse_trader}
-    "positions":     {},             # {asset: {side, size, entry}}
-    "ws_tasks":      {},             # {asset: asyncio.Task}
-    "last_update":   {},             # {asset: timestamp}
+    "active":        False,
+    "watched":       {},
+    "positions":     {},
+    "ws_tasks":      {},
+    "last_update":   {},
     "total_pnl":     0.0,
     "trades_log":    [],
-    "last_ranked":   [],             # derniers traders classés par /toptraders
+    "last_ranked":   [],
 }
 
 HYPERLIQUID_API            = "https://api.hyperliquid.xyz/info"
@@ -273,6 +273,7 @@ def format_fear_greed(fg: dict) -> str:
         f"   ➡️ {comment}\n\n"
         f"_Mis a jour: {datetime.now().strftime('%H:%M:%S')}_"
     )
+
 
 # ============================================================
 # ALERTES S/R & LIQUIDATION
@@ -583,14 +584,6 @@ def stars(value: float, max_val: float = 100) -> str:
 
 
 async def fetch_top_traders_hl() -> list:
-    """
-    Selection basee sur metriques 30j :
-    - ROI 30j > 20%
-    - MDD < 40%
-    - Winrate (consistance) > 40%
-    - Actif dans les 15 derniers jours (window day a un PnL non nul)
-    - Capital actuel > $10k
-    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -602,7 +595,6 @@ async def fetch_top_traders_hl() -> list:
         raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
         logger.info(f"Leaderboard: {len(raw_rows)} traders")
 
-        # Pre-filtrage sur les métriques du leaderboard (window 30j)
         candidates = []
         for row in raw_rows:
             try:
@@ -618,7 +610,6 @@ async def fetch_top_traders_hl() -> list:
                 if not address or len(address) < 10:
                     continue
 
-                # Extraire métriques par window
                 metrics = {}
                 for w in stats_dict.get("windowPerformances", []):
                     if isinstance(w, list) and len(w) == 2:
@@ -631,10 +622,6 @@ async def fetch_top_traders_hl() -> list:
                 pnl_30d  = float(m30.get("pnl", 0) or 0)
                 pnl_at   = float(mat.get("pnl", 0) or 0)
 
-                # Filtres pre-selection :
-                # - ROI 30j entre 20% et 10000% (evite aberrations)
-                # - PnL 30j > $5k (trader actif et rentable)
-                # - PnL allTime > $10k (trader serieux)
                 if not (20 <= roi_30d <= 10000):
                     continue
                 if pnl_30d < 5000:
@@ -647,12 +634,10 @@ async def fetch_top_traders_hl() -> list:
             except Exception:
                 continue
 
-        # Trier par ROI 30j décroissant
         candidates.sort(key=lambda x: x[1], reverse=True)
         top_candidates = candidates[:150]
-        logger.info(f"{len(candidates)} candidats qualifiés | top 150 retenus (meilleur ROI 30j: {top_candidates[0][1]:.0f}%)")
+        logger.info(f"{len(candidates)} candidats qualifiés | top 150 retenus")
 
-        # Appels portfolio en parallèle
         async def fetch_portfolio(session, address):
             try:
                 async with session.post(
@@ -662,13 +647,11 @@ async def fetch_top_traders_hl() -> list:
                 ) as resp:
                     portfolio = await resp.json()
 
-                # Parser les windows
                 windows = {}
                 for item in portfolio:
                     if isinstance(item, list) and len(item) == 2:
                         windows[item[0]] = item[1]
 
-                # --- Filtre activité 15j ---
                 now_ms     = datetime.now().timestamp() * 1000
                 cutoff_ms  = now_ms - (15 * 86400 * 1000)
                 recent_activity = False
@@ -690,7 +673,6 @@ async def fetch_top_traders_hl() -> list:
                 if not recent_activity:
                     return None
 
-                # --- Métriques 30j ---
                 m30          = windows.get("perpMonth") or windows.get("month", {})
                 pnl_hist_30  = [float(p[1]) for p in m30.get("pnlHistory", []) if isinstance(p, list)]
                 acv_hist_30  = [float(p[1]) for p in m30.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
@@ -706,11 +688,9 @@ async def fetch_top_traders_hl() -> list:
                 if current_value < 10000:
                     return None
 
-                # ROI 30j
                 base_30 = max(current_value - pnl_30d, 1)
                 roi_30d = min((pnl_30d / base_30) * 100, 2000)
 
-                # MDD 30j
                 peak   = acv_hist_30[0]
                 mdd_30 = 0.0
                 for v in acv_hist_30:
@@ -720,7 +700,6 @@ async def fetch_top_traders_hl() -> list:
                     if dd > mdd_30:
                         mdd_30 = dd
 
-                # --- Métriques allTime ---
                 at_data     = windows.get("perpAllTime") or windows.get("allTime", {})
                 pnl_hist_at = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
                 acv_hist_at = [float(p[1]) for p in at_data.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
@@ -729,7 +708,6 @@ async def fetch_top_traders_hl() -> list:
                 peak_at = max(acv_hist_at) if acv_hist_at else 1
                 roe_at  = min((pnl_at / max(peak_at, 1)) * 100, 9999)
 
-                # MDD allTime
                 mdd_at = 0.0
                 if acv_hist_at:
                     pk = acv_hist_at[0]
@@ -740,22 +718,18 @@ async def fetch_top_traders_hl() -> list:
                         if dd > mdd_at:
                             mdd_at = dd
 
-                # Filtre MDD < 40% sur 30j ET allTime
                 worst_mdd = max(mdd_30, mdd_at)
                 if worst_mdd > 40:
                     return None
 
-                # Winrate hebdo
                 week_data = windows.get("perpWeek") or windows.get("week", {})
                 week_pnl  = [float(p[1]) for p in week_data.get("pnlHistory", []) if isinstance(p, list)]
                 week_pos  = sum(1 for p in week_pnl if p > 0)
                 winrate   = (week_pos / max(len(week_pnl), 1)) * 100
 
-                # Filtre winrate >= 60%
                 if winrate < 60:
                     return None
 
-                # Consistance 30j
                 pos_moves   = sum(1 for i in range(1, len(pnl_hist_30)) if pnl_hist_30[i] > pnl_hist_30[i-1])
                 consistency = (pos_moves / max(len(pnl_hist_30) - 1, 1)) * 100
 
@@ -789,27 +763,24 @@ async def fetch_top_traders_hl() -> list:
 
 
 def apply_exclusion_filters(traders: list) -> list:
-    """Filtres : MDD > 60% exclus, le reste passe."""
     filtered = [t for t in traders if t["mdd"] <= 60 and t["pnl"] > 0]
     logger.info(f"Apres filtres: {len(filtered)}/{len(traders)} traders retenus")
     return filtered
 
 
 def rank_and_score_traders(traders: list) -> list:
-    """Score et classe tous les traders filtres."""
     if not traders:
         return []
     max_pnl = max(t["pnl"] for t in traders)
     scored  = []
     for t in traders:
-        roi_score = min(100.0, t.get("roi", 0) / 5)  # ROI 500% -> score 100
+        roi_score = min(100.0, t.get("roi", 0) / 5)
         composite = compute_composite_score(t["consistency"], t["mdd"], t.get("week_winrate", t["winrate"]), roi_score)
         scored.append({**t, "score": composite})
     return sorted(scored, key=lambda x: x["score"], reverse=True)
 
 
 def build_top5_report(top5: list) -> str:
-    """Rapport Top 5 global avec adresses completes copiables."""
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     lines = [
         "🏆 *ETF SYNTHETIQUE — TradeBot*",
@@ -831,8 +802,12 @@ def build_top5_report(top5: list) -> str:
     return "\n".join(lines)
 
 
-async def build_asset_report(traders: list) -> str:
-    """Top 2 par asset via userFills — appels paralleles rapides."""
+async def build_asset_report(traders: list) -> tuple:
+    """
+    Top 2 par asset via userFills.
+    Retourne (rapport_texte, traders_enrichis_avec_asset_pnl).
+    *** FIX : retourne maintenant un tuple pour que last_ranked soit enrichi ***
+    """
     ASSETS = ["BTC", "ETH", "SOL", "HYPE", "TAO"]
 
     async def get_asset_pnl(session, trader):
@@ -844,7 +819,6 @@ async def build_asset_report(traders: list) -> str:
             ) as resp:
                 fills = await resp.json()
             asset_pnl = {}
-            # Mapping noms Hyperliquid → noms affichés
             COIN_MAP = {
                 "BTC":    "BTC", "WBTC":  "BTC",
                 "ETH":    "ETH", "WETH":  "ETH",
@@ -873,6 +847,9 @@ async def build_asset_report(traders: list) -> str:
         tasks = [get_asset_pnl(session, t) for t in traders]
         enriched = await asyncio.gather(*tasks)
 
+    # Convertir en liste (asyncio.gather retourne un tuple)
+    enriched = list(enriched)
+
     lines = ["🎯 *TOP 2 PAR ASSET* (30j)", ""]
     assigned = set()
 
@@ -883,7 +860,6 @@ async def build_asset_report(traders: list) -> str:
             if apnl > 0:
                 candidates.append((apnl, t))
         candidates.sort(key=lambda x: x[0], reverse=True)
-        # Dédupliquer par adresse
         seen = set()
         top2 = []
         for apnl, t in candidates:
@@ -903,12 +879,11 @@ async def build_asset_report(traders: list) -> str:
                 lines.append(f"`{t['address']}`")
         lines.append("")
 
-    return "\n".join(lines)
-
+    # *** RETOURNE LE TUPLE (texte, enriched) ***
+    return "\n".join(lines), enriched
 
 
 def build_history_report() -> str:
-    """Construit le rapport d'historique des selections."""
     if not tradebot_history:
         return (
             "📚 *Historique TradeBot*\n\n"
@@ -930,7 +905,6 @@ def build_history_report() -> str:
 # COMMANDES TRADEBOT
 # ============================================================
 async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande principale: analyse et selection des 5 meilleurs traders."""
     if not is_authorized(update):
         return
     await update.message.reply_text(
@@ -966,16 +940,19 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tradebot_history.append(session_data)
     if len(tradebot_history) > 30:
         tradebot_history.pop(0)
-    # Message 1 : Top 5 global immediatement
+
     await update.message.reply_text(build_top5_report(top5), parse_mode="Markdown")
 
-    # Message 2 : Top 2 par asset avec userFills (appels rapides sur top 20 seulement)
     await update.message.reply_text("🔍 Analyse par asset en cours...")
-    asset_report = await build_asset_report(ranked[:20])
+
+    # *** FIX PRINCIPAL : récupérer les traders ENRICHIS avec asset_pnl ***
+    asset_report, enriched_ranked = await build_asset_report(ranked[:20])
     await update.message.reply_text(asset_report, parse_mode="Markdown")
 
-    # Stocker les résultats pour /copy_start
-    copy_state["last_ranked"] = ranked[:20]
+    # *** Stocker les traders ENRICHIS — asset_pnl est maintenant rempli ***
+    copy_state["last_ranked"] = enriched_ranked
+    logger.info(f"last_ranked mis à jour avec {len(enriched_ranked)} traders enrichis")
+
     await update.message.reply_text(
         "💡 *Tip:* Lance `/copy\_start BTC`, `/copy\_start HYPE` ou `/copy\_start` pour démarrer le copy trading.",
         parse_mode="Markdown"
@@ -983,7 +960,6 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyse complète d'un wallet Hyperliquid."""
     if not is_authorized(update):
         return
 
@@ -1005,7 +981,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Portfolio
             async with session.post(
                 "https://api-ui.hyperliquid.xyz/info",
                 json={"type": "portfolio", "user": address},
@@ -1013,7 +988,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ) as resp:
                 portfolio = await resp.json()
 
-            # Fills pour PnL par asset
             async with session.post(
                 "https://api-ui.hyperliquid.xyz/info",
                 json={"type": "userFills", "user": address},
@@ -1021,7 +995,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ) as resp2:
                 fills = await resp2.json()
 
-            # Positions ouvertes
             async with session.post(
                 "https://api-ui.hyperliquid.xyz/info",
                 json={"type": "clearinghouseState", "user": address},
@@ -1029,7 +1002,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ) as resp3:
                 state = await resp3.json()
 
-        # Parser windows portfolio
         windows = {}
         if not portfolio or not isinstance(portfolio, list):
             await update.message.reply_text("❌ Données portfolio indisponibles pour ce wallet.", parse_mode="Markdown")
@@ -1044,7 +1016,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acv_hist = [float(p[1]) for p in w.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
             pnl = pnl_hist[-1] if pnl_hist else 0
             capital = acv_hist[-1] if acv_hist else 0
-            # MDD
             mdd = 0.0
             if acv_hist:
                 pk = acv_hist[0]
@@ -1052,10 +1023,8 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if v > pk: pk = v
                     dd = (pk - v) / pk * 100 if pk > 0 else 0
                     if dd > mdd: mdd = dd
-            # ROI
             base = max(capital - pnl, 1)
             roi = min((pnl / base) * 100, 9999) if pnl > 0 else (pnl / base) * 100
-            # Consistance
             pos = sum(1 for i in range(1, len(pnl_hist)) if pnl_hist[i] > pnl_hist[i-1])
             consist = (pos / max(len(pnl_hist) - 1, 1)) * 100
             return {"pnl": pnl, "capital": capital, "mdd": mdd, "roi": roi, "consist": consist}
@@ -1065,19 +1034,16 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m30 = get_window_stats("perpMonth", "month")
         at  = get_window_stats("perpAllTime","allTime")
 
-        # Winrate depuis week
         week_data = windows.get("perpWeek") or windows.get("week", {})
         week_pnl  = [float(p[1]) for p in week_data.get("pnlHistory", []) if isinstance(p, list)]
         winrate   = (sum(1 for p in week_pnl if p > 0) / max(len(week_pnl), 1)) * 100
 
-        # Dernier trade (timestamp)
         now_ms   = datetime.now().timestamp() * 1000
         last_fill_ts = None
         if isinstance(fills, list) and fills:
             last_fill_ts = max((f.get("time", 0) for f in fills if isinstance(f, dict)), default=None)
         days_inactive = ((now_ms - last_fill_ts) / 86400000) if last_fill_ts else None
 
-        # PnL par asset (top 5)
         asset_pnl = {}
         COIN_MAP = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "HYPE": "HYPE", "TAO": "TAO"}
         if isinstance(fills, list):
@@ -1089,7 +1055,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pv
         top_assets = sorted(asset_pnl.items(), key=lambda x: x[1], reverse=True)[:5]
 
-        # Positions ouvertes
         positions = []
         if isinstance(state, dict):
             for pos in state.get("assetPositions", []):
@@ -1105,7 +1070,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "lev":  p.get("leverage", {}).get("value", "?"),
                     })
 
-        # Score composite
         roi_score = min(100.0, m30["roi"] / 5)
         score = round(
             score_consistency(m30["consist"]) * 0.35 +
@@ -1115,7 +1079,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         verdict = "🟢 FORT" if score >= 65 else ("🟡 MOYEN" if score >= 45 else "🔴 FAIBLE")
 
-        # Construire le rapport
         lines = [
             f"🔎 *INSPECTOR — Wallet Analysis*",
             f"`{address}`",
@@ -1160,8 +1123,7 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"_Données Hyperliquid en temps réel_")
 
-        report = "\n".join(lines)
-        await update.message.reply_text(report, parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"Inspector erreur: {e}")
@@ -1173,7 +1135,6 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def send_copy_notification(app, message: str):
-    """Envoie une notification Telegram pour le copy trading."""
     try:
         await app.bot.send_message(
             chat_id=AUTHORIZED_USER_ID,
@@ -1185,10 +1146,6 @@ async def send_copy_notification(app, message: str):
 
 
 async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
-    """
-    Place un ordre sur Hyperliquid via l'API exchange.
-    Utilise l'API Wallet pour signer.
-    """
     try:
         if not HL_PRIVATE_KEY:
             logger.error("HL_PRIVATE_KEY non définie")
@@ -1198,7 +1155,6 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         from eth_account.messages import encode_defunct
         import hashlib, struct
 
-        # Récupérer le prix actuel
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://api.hyperliquid.xyz/info",
@@ -1211,11 +1167,9 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         if price <= 0:
             return {"error": f"Prix {asset} introuvable"}
 
-        # Slippage 0.1% pour ordre market
         limit_px = price * (1.005 if is_buy else 0.995)
         limit_px = round(limit_px, 2)
 
-        # Construction de l'ordre Hyperliquid
         timestamp = int(datetime.now().timestamp() * 1000)
 
         order_payload = {
@@ -1226,8 +1180,8 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
                     "b": is_buy,
                     "p": str(limit_px),
                     "s": str(round(size, 6)),
-                    "r": False,  # reduce_only
-                    "t": {"limit": {"tif": "Ioc"}}  # Immediate or Cancel = market
+                    "r": False,
+                    "t": {"limit": {"tif": "Ioc"}}
                 }],
                 "grouping": "na"
             },
@@ -1235,10 +1189,8 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
             "vaultAddress": None
         }
 
-        # Signature EIP-712
         account = Account.from_key(HL_PRIVATE_KEY)
         signature = sign_order(account, order_payload["action"], timestamp)
-
         order_payload["signature"] = signature
 
         async with aiohttp.ClientSession() as session:
@@ -1259,7 +1211,6 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
 
 
 async def get_asset_index(asset: str) -> int:
-    """Récupère l'index de l'asset dans le meta Hyperliquid."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1279,19 +1230,17 @@ async def get_asset_index(asset: str) -> int:
 
 
 def sign_order(account, action: dict, nonce: int) -> dict:
-    """Signe un ordre avec EIP-712 pour Hyperliquid."""
     import json as json_mod
-    from eth_account.structured_data.hashing import hash_domain, hash_message
-    
-    # Hash de l'action
+    import hashlib
+    from eth_account.messages import encode_defunct
+
     action_str = json_mod.dumps(action, separators=(',', ':'), sort_keys=True)
     action_hash = hashlib.sha256(action_str.encode()).hexdigest()
-    
-    # Message à signer
+
     msg = f"\x19Hyperliquid SignedAction\n{action_hash}\n{nonce}\n"
     msg_hash = encode_defunct(text=msg)
     signed = account.sign_message(msg_hash)
-    
+
     return {
         "r": hex(signed.r),
         "s": hex(signed.s),
@@ -1300,7 +1249,6 @@ def sign_order(account, action: dict, nonce: int) -> dict:
 
 
 async def get_my_positions() -> dict:
-    """Récupère les positions actuelles du compte bot."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1329,7 +1277,6 @@ async def get_my_positions() -> dict:
 
 
 async def check_margin_ok() -> bool:
-    """Vérifie que la marge disponible est > 50%."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1356,10 +1303,6 @@ async def check_margin_ok() -> bool:
 
 
 async def watch_trader_positions(asset: str, trader_address: str, app) -> None:
-    """
-    WebSocket — surveille les positions d'un trader en temps réel.
-    Dès qu'il ouvre/ferme/modifie une position sur l'asset, on copie.
-    """
     import websockets
     import json as json_mod
 
@@ -1369,7 +1312,6 @@ async def watch_trader_positions(asset: str, trader_address: str, app) -> None:
     while copy_state["active"]:
         try:
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-                # Souscription aux positions du trader
                 subscribe_msg = json_mod.dumps({
                     "method": "subscribe",
                     "subscription": {
@@ -1383,7 +1325,6 @@ async def watch_trader_positions(asset: str, trader_address: str, app) -> None:
                 async for raw_msg in ws:
                     if not copy_state["active"]:
                         break
-
                     try:
                         msg = json_mod.loads(raw_msg)
                         await process_trader_event(asset, trader_address, msg, app)
@@ -1400,11 +1341,6 @@ async def watch_trader_positions(asset: str, trader_address: str, app) -> None:
 
 
 async def process_trader_event(asset: str, trader_address: str, msg: dict, app) -> None:
-    """
-    Traite un événement WebSocket du trader.
-    - Ouverture : taille = COPY_MAX_SIZE ($100) / prix | levier = copié du trader
-    - Fermeture : ferme notre position complète
-    """
     data = msg.get("data", {})
     if not data:
         return
@@ -1431,7 +1367,6 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
         leverage   = 1
 
         if is_opening:
-            # 1. Vérifier si allocation encore disponible
             deployed = copy_deployed.get(asset, 0.0)
             if deployed + COPY_MAX_SIZE > COPY_ALLOC:
                 await send_copy_notification(app,
@@ -1441,7 +1376,6 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
                 )
                 continue
 
-            # 2. Vérifier la marge globale
             margin_ok = await check_margin_ok()
             if not margin_ok:
                 await send_copy_notification(app,
@@ -1451,10 +1385,8 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
                 )
                 continue
 
-            # 3. Taille en unités : $100 / prix actuel
             my_size = round(COPY_MAX_SIZE / price, 6)
 
-            # 4. Levier : copier le trader mais capé par COPY_LEVERAGE
             max_lev = COPY_LEVERAGE.get(asset, 3)
             try:
                 async with aiohttp.ClientSession() as session:
@@ -1473,29 +1405,24 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
             except Exception:
                 leverage = max_lev
 
-            # 5. Enregistrer le capital déployé
             copy_deployed[asset] = deployed + COPY_MAX_SIZE
 
         elif is_closing:
-            # Fermer notre position complète
             my_positions = await get_my_positions()
             my_pos = my_positions.get(asset)
             if not my_pos:
                 logger.info(f"Pas de position ouverte sur {asset} — fermeture ignorée")
                 continue
             my_size  = my_pos["size"]
-            is_buy   = my_pos["side"] == "short"  # inverser pour fermer
+            is_buy   = my_pos["side"] == "short"
             leverage = 1
-            # Reset capital déployé
             copy_deployed[asset] = 0.0
             logger.info(f"Capital {asset} reset → $0")
         else:
             continue
 
-        # Passer l'ordre
         result = await place_order(asset, is_buy, my_size, dir_fill, leverage)
 
-        # Log
         trade_log = {
             "time":     datetime.now().strftime("%d/%m %H:%M"),
             "asset":    asset,
@@ -1510,7 +1437,6 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
         if len(copy_state["trades_log"]) > 100:
             copy_state["trades_log"] = copy_state["trades_log"][-100:]
 
-        # Notification
         emoji  = "📈" if is_buy else "📉"
         status = "✅" if "error" not in result else "❌"
         notif  = (
@@ -1529,10 +1455,6 @@ async def process_trader_event(asset: str, trader_address: str, msg: dict, app) 
 
 
 async def sync_existing_positions(watched: dict, app) -> None:
-    """
-    Au démarrage : vérifie si les traders ont déjà des positions ouvertes
-    et les copie immédiatement sans attendre un événement WebSocket.
-    """
     logger.info("Synchronisation des positions existantes...")
 
     for asset, trader_addr in watched.items():
@@ -1553,20 +1475,17 @@ async def sync_existing_positions(watched: dict, app) -> None:
                 if sz == 0:
                     continue
 
-                # Vérifier qu'on n'a pas déjà cette position
                 my_positions = await get_my_positions()
                 if asset in my_positions:
                     logger.info(f"Position {asset} déjà présente sur notre compte")
                     continue
 
-                # Vérifier allocation et marge
                 deployed = copy_deployed.get(asset, 0.0)
                 if deployed + COPY_MAX_SIZE > COPY_ALLOC:
                     continue
                 if not await check_margin_ok():
                     continue
 
-                # Prix actuel
                 async with aiohttp.ClientSession() as session2:
                     async with session2.post(
                         "https://api.hyperliquid.xyz/info",
@@ -1608,13 +1527,6 @@ async def sync_existing_positions(watched: dict, app) -> None:
 
 
 async def start_copy_trading(watched: dict, app) -> None:
-    """
-    Lance les WebSockets pour chaque asset/trader.
-    Si déjà actif et trader change :
-      - Arrête l'ancien WebSocket
-      - Lance le nouveau
-      - Garde les positions ouvertes existantes
-    """
     old_watched  = copy_state.get("watched", {})
     my_positions = await get_my_positions()
 
@@ -1634,12 +1546,10 @@ async def start_copy_trading(watched: dict, app) -> None:
         old_trader     = old_watched.get(asset)
         trader_changed = old_trader and old_trader != trader_addr
 
-        # Arrêter l'ancien WebSocket si trader changé
         if trader_changed and asset in copy_state["ws_tasks"]:
             copy_state["ws_tasks"][asset].cancel()
             logger.info(f"WebSocket {asset} ancien trader arrêté")
 
-        # Lancer le nouveau WebSocket
         task = asyncio.create_task(
             watch_trader_positions(asset, trader_addr, app)
         )
@@ -1647,7 +1557,6 @@ async def start_copy_trading(watched: dict, app) -> None:
         active_assets.append(asset)
         logger.info(f"WebSocket lancé: {asset} → {trader_addr[:12]}...")
 
-        # Gérer le capital déployé
         if asset in my_positions:
             copy_deployed[asset] = COPY_MAX_SIZE
             if trader_changed:
@@ -1681,14 +1590,12 @@ async def start_copy_trading(watched: dict, app) -> None:
     await send_copy_notification(app, "\n".join(notif_lines))
     logger.info(f"✅ Copy trading actif — assets: {active_assets}")
 
-    # Sync uniquement les assets sans position ouverte
     new_watched = {a: t for a, t in watched.items() if a not in my_positions and t}
     if new_watched:
         await sync_existing_positions(new_watched, app)
 
 
 async def stop_copy_trading() -> None:
-    """Arrête tous les WebSockets de copy trading."""
     copy_state["active"] = False
     for asset, task in copy_state["ws_tasks"].items():
         task.cancel()
@@ -1702,26 +1609,16 @@ async def stop_copy_trading() -> None:
 # ============================================================
 
 async def cmd_copy_start_asset(update: Update, context: ContextTypes.DEFAULT_TYPE, asset: str):
-    """Shortcut: démarre le copy trading sur un asset spécifique."""
     context.args = [asset]
     await cmd_copy_start(update, context)
 
 
 async def cmd_copy_stop_asset_direct(update: Update, context: ContextTypes.DEFAULT_TYPE, asset: str):
-    """Shortcut: arrête le copy trading sur un asset spécifique."""
     context.args = [asset]
     await cmd_copy_stop_asset(update, context)
 
 
 async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Lance le copy trading sur un ou plusieurs assets.
-    Usage:
-      /copy_start       → tous les assets configurés
-      /copy_start BTC   → BTC uniquement
-      /copy_start HYPE  → HYPE uniquement
-    Si /toptraders n'a pas été lancé, le fait automatiquement.
-    """
     if not is_authorized(update):
         return
 
@@ -1741,7 +1638,6 @@ async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         assets = COPY_ASSETS
 
-    # Si pas de données /toptraders → lancer l'analyse d'abord
     if not copy_state.get("last_ranked"):
         await update.message.reply_text(
             "🔍 Aucune analyse récente — lancement de `/toptraders` automatiquement...",
@@ -1756,42 +1652,42 @@ async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Aucun trader ne passe les filtres.", parse_mode="Markdown")
             return
         ranked = rank_and_score_traders(filtered)
-        copy_state["last_ranked"] = ranked[:20]
-        # Envoyer le rapport top 5
+        # *** FIX : enrichir asset_pnl même dans le fallback ***
+        await update.message.reply_text("🔍 Enrichissement par asset en cours...", parse_mode="Markdown")
+        _, enriched_ranked = await build_asset_report(ranked[:20])
+        copy_state["last_ranked"] = enriched_ranked
         await update.message.reply_text(build_top5_report(ranked[:5]), parse_mode="Markdown")
 
     ranked = copy_state["last_ranked"]
 
-    # Construire le mapping asset → meilleur trader
-    # Priorité : meilleur PnL sur l'asset (spécialiste), peu importe le score global
+    # Logique spécialiste — fonctionne maintenant car asset_pnl est rempli
     watched      = {}
     assigned_set = set()
     for asset in assets:
-        # Trier tous les traders par PnL sur cet asset (décroissant)
         specialists = sorted(
             [t for t in ranked if t.get("asset_pnl", {}).get(asset, 0.0) > 0],
             key=lambda t: t.get("asset_pnl", {}).get(asset, 0.0),
             reverse=True
         )
-        # Prendre le meilleur spécialiste non encore assigné
         for t in specialists:
             if t["address"] not in assigned_set:
                 watched[asset] = t["address"]
                 assigned_set.add(t["address"])
+                logger.info(f"Spécialiste {asset}: {t['address'][:12]} (PnL {asset}: ${t['asset_pnl'].get(asset,0):,.0f})")
                 break
         if asset not in watched:
-            # Fallback : meilleur score global si aucun spécialiste trouvé
+            # Fallback global
             for t in ranked:
                 if t["address"] not in assigned_set:
                     watched[asset] = t["address"]
                     assigned_set.add(t["address"])
+                    logger.info(f"Fallback {asset}: {t['address'][:12]} (score global)")
                     break
 
     if not watched:
         await update.message.reply_text("⚠️ Aucun trader disponible pour ces assets.", parse_mode="Markdown")
         return
 
-    # Arrêter uniquement les WebSockets des assets concernés
     for asset in assets:
         if asset in copy_state.get("ws_tasks", {}):
             copy_state["ws_tasks"][asset].cancel()
@@ -1801,19 +1697,12 @@ async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_copy_stop_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Arrête le copy trading sur un asset ou tout.
-    Usage:
-      /copy_stop        → stoppe tout
-      /copy_stop BTC    → stoppe BTC uniquement
-    """
     if not is_authorized(update):
         return
 
     args = context.args
 
     if not args:
-        # Stopper tout
         if not copy_state["active"]:
             await update.message.reply_text("⏸ Copy trading déjà inactif.")
             return
@@ -1825,7 +1714,6 @@ async def cmd_copy_stop_asset(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # Stopper un asset spécifique
     asset = args[0].upper()
     if asset not in COPY_ASSETS:
         await update.message.reply_text(f"❌ Asset `{asset}` non reconnu.", parse_mode="Markdown")
@@ -1837,7 +1725,6 @@ async def cmd_copy_stop_asset(update: Update, context: ContextTypes.DEFAULT_TYPE
         del copy_state["ws_tasks"][asset]
         if asset in copy_state["watched"]:
             del copy_state["watched"][asset]
-        # Si plus aucun asset actif → désactiver complètement
         if not copy_state["ws_tasks"]:
             copy_state["active"] = False
         await update.message.reply_text(
@@ -1850,7 +1737,6 @@ async def cmd_copy_stop_asset(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_copy_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Force la synchronisation immédiate des positions ouvertes des traders surveillés."""
     if not is_authorized(update):
         return
 
@@ -1875,7 +1761,6 @@ async def cmd_copy_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le statut du copy trading."""
     if not is_authorized(update):
         return
 
@@ -1887,7 +1772,6 @@ async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Récupérer les positions actuelles
     positions = await get_my_positions()
 
     lines = [
@@ -1924,7 +1808,6 @@ async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ferme toutes les positions du bot."""
     if not is_authorized(update):
         return
 
@@ -1937,7 +1820,7 @@ async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     results = []
     for asset, pos in positions.items():
-        is_buy = pos["side"] == "short"  # pour fermer un short on achète
+        is_buy = pos["side"] == "short"
         result = await place_order(asset, is_buy, pos["size"], "Close All")
         status = "✅" if "error" not in result else "❌"
         results.append(f"{status} {asset} fermé")
@@ -1948,16 +1831,13 @@ async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-
 async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche l'historique des selections precedentes."""
     if not is_authorized(update):
         return
     await update.message.reply_text(build_history_report(), parse_mode="Markdown")
 
 
 async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Aide specifique au module TradeBot."""
     if not is_authorized(update):
         return
     msg = (
@@ -1982,7 +1862,7 @@ async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /inspector — Analyser un wallet manuellement\n"
         "   /tb\\_historique — Selections passees\n"
         "   /tb\\_aide — Cette aide\n\n"
-        "_v2.0 — Analyse | v3.0 prevue: copy trading auto_"
+        "_v3.0 — Copy trading auto actif_"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -2158,7 +2038,6 @@ def main():
 
     app.add_error_handler(error_handler)
 
-    # Commandes existantes
     app.add_handler(CommandHandler("start",              cmd_start))
     app.add_handler(CommandHandler("aide",               cmd_aide))
     app.add_handler(CommandHandler("prix",               cmd_prix))
@@ -2169,12 +2048,11 @@ def main():
     app.add_handler(CommandHandler("alertes",            cmd_activer_alertes))
     app.add_handler(CommandHandler("desactiver_alertes", cmd_desactiver_alertes))
 
-    # Nouvelles commandes TradeBot
     app.add_handler(CommandHandler("toptraders",    cmd_toptraders))
     app.add_handler(CommandHandler("tb_historique", cmd_tb_historique))
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
-    # Shortcuts par asset
+
     app.add_handler(CommandHandler("start_btc",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"BTC")))
     app.add_handler(CommandHandler("start_eth",     lambda u,ctx: cmd_copy_start_asset(u,ctx,"ETH")))
     app.add_handler(CommandHandler("start_hype",    lambda u,ctx: cmd_copy_start_asset(u,ctx,"HYPE")))
