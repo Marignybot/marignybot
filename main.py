@@ -1522,17 +1522,17 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
         # Ratio proportionnel — diviseur x5 (trader 10% → moi 2%)
         ratio        = trader_pos_value / max(trader_capital, 1)
         my_usd_value = (ratio / 5) * my_capital
-        my_usd_value = max(my_usd_value, 11.0)  # minimum $11
 
         SIZE_RULES = {
-            "BTC":  {"min": 0.001, "decimals": 3},
-            "ETH":  {"min": 0.01,  "decimals": 2},
-            "SOL":  {"min": 0.1,   "decimals": 1},
-            "HYPE": {"min": 1.0,   "decimals": 0},
-            "TAO":  {"min": 0.01,  "decimals": 2},
+            "BTC":  {"min": 0.001, "decimals": 3, "min_usd": 11.0},
+            "ETH":  {"min": 0.01,  "decimals": 2, "min_usd": 11.0},
+            "SOL":  {"min": 0.1,   "decimals": 1, "min_usd": 11.0},
+            "HYPE": {"min": 1.0,   "decimals": 0, "min_usd": 35.0},
+            "TAO":  {"min": 0.01,  "decimals": 2, "min_usd": 15.0},
         }
-        rules   = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
-        my_size = max(round(my_usd_value / current_price, rules["decimals"]), rules["min"])
+        rules        = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3, "min_usd": 11.0})
+        my_usd_value = max(my_usd_value, rules["min_usd"])  # minimum dynamique par asset
+        my_size      = max(round(my_usd_value / current_price, rules["decimals"]), rules["min"])
 
         logger.info(
             f"Proportionnel {asset}: trader_cap=${trader_capital:.0f} "
@@ -1543,10 +1543,13 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
 
     except Exception as e:
         logger.warning(f"get_proportional_size erreur: {e}")
-        SIZE_RULES = {"BTC": {"min": 0.001, "decimals": 3}, "ETH": {"min": 0.01, "decimals": 2},
-                      "SOL": {"min": 0.1, "decimals": 1}, "HYPE": {"min": 1.0, "decimals": 0}}
+        SIZE_RULES = {
+            "BTC":  {"min": 0.001, "decimals": 3}, "ETH": {"min": 0.01, "decimals": 2},
+            "SOL":  {"min": 0.1,   "decimals": 1}, "HYPE": {"min": 1.0, "decimals": 0},
+            "TAO":  {"min": 0.01,  "decimals": 2},
+        }
         rules = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
-        fallback_size = max(round(50.0 / current_price, rules["decimals"]), rules["min"])
+        fallback_size = max(round(50.0 / max(current_price, 0.01), rules["decimals"]), rules["min"])
         return fallback_size, 1, 50.0
 
 
