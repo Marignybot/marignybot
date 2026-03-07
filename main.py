@@ -454,6 +454,35 @@ def format_prices(prices: dict) -> str:
     return "\n".join(lines)
 
 
+def format_wallet_block(label: str, address: str, positions: list, balance: dict) -> str:
+    lines = [f"*{label}*", f"`{address[:20]}...`"]
+    if balance:
+        av  = balance.get("accountValue", 0)
+        mu  = balance.get("totalMarginUsed", 0)
+        pnl = balance.get("totalUnrealizedPnl", 0)
+        lines.append(f"💼 Valeur: ${av:,.2f} | Marge: ${mu:,.2f}")
+        lines.append(f"{'🟢' if pnl >= 0 else '🔴'} PnL non réalisé: ${pnl:+,.2f}")
+    open_pos = [p for p in positions if float(p.get("position", {}).get("szi", 0)) != 0]
+    if not open_pos:
+        lines.append("_Aucune position ouverte_")
+    else:
+        for p in open_pos:
+            pos    = p.get("position", {})
+            coin   = pos.get("coin", "?")
+            size   = float(pos.get("szi", 0))
+            entry  = float(pos.get("entryPx", 0))
+            upnl   = float(pos.get("unrealizedPnl", 0))
+            liq_px = float(pos.get("liquidationPx") or 0)
+            lev    = pos.get("leverage", {}).get("value", "?")
+            lines.append(
+                f"  {'📈 LONG' if size > 0 else '📉 SHORT'} *{coin}* x{lev}\n"
+                f"  Taille: {abs(size)} | Entrée: ${entry:,.4f}\n"
+                f"  {'✅' if upnl >= 0 else '❌'} PnL: ${upnl:+,.2f}"
+                + (f" | ⚠️ Liq: ${liq_px:,.2f}" if liq_px > 0 else "")
+            )
+    return "\n".join(lines)
+
+
 def format_positions(positions: list, balance: dict) -> str:
     lines = ["📈 *Positions Hyperliquid*\n"]
     if balance:
@@ -1945,12 +1974,51 @@ async def cmd_prix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_prices(prices), parse_mode="Markdown")
 
 
+async def get_wallet_data(address: str) -> tuple:
+    """Retourne (positions, balance) pour n'importe quelle adresse."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "clearinghouseState", "user": address},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+        positions = data.get("assetPositions", [])
+        margin    = data.get("crossMarginSummary") or data.get("marginSummary") or {}
+        av        = float(margin.get("accountValue", 0))
+        mu        = float(margin.get("totalMarginUsed", 0))
+        pnl       = float(margin.get("totalUnrealizedPnl", 0))
+        if av == 0:
+            av = float(data.get("crossAccountValue", 0) or data.get("withdrawable", 0) or 0)
+        if pnl == 0:
+            pnl = sum(float(p.get("position", {}).get("unrealizedPnl", 0)) for p in positions)
+        balance = {"accountValue": av, "totalMarginUsed": mu, "totalUnrealizedPnl": pnl}
+        return positions, balance
+    except Exception as e:
+        logger.error(f"get_wallet_data {address[:12]}: {e}")
+        return [], {}
+
+
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     await update.message.reply_text("⏳ Connexion a Hyperliquid...", parse_mode="Markdown")
-    positions, balance = await asyncio.gather(get_hyperliquid_positions(), get_hyperliquid_balance())
-    await update.message.reply_text(format_positions(positions, balance), parse_mode="Markdown")
+
+    (pos_master, bal_master), (pos_bot, bal_bot) = await asyncio.gather(
+        get_wallet_data(HYPERLIQUID_ADDRESS),
+        get_wallet_data(COPY_BOT_ADDRESS),
+    )
+
+    now = datetime.now().strftime("%H:%M:%S")
+    msg = (
+        f"📈 *Positions Hyperliquid* — _{now}_\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 {format_wallet_block('Mon Wallet Master', HYPERLIQUID_ADDRESS, pos_master, bal_master)}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 {format_wallet_block('Mon Wallet Bot', COPY_BOT_ADDRESS, pos_bot, bal_bot)}\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
