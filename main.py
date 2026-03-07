@@ -13,6 +13,7 @@ from datetime import datetime, time
 import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict
 
 # ============================================================
 # CONFIGURATION — variables chargees depuis .env
@@ -2138,6 +2139,15 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    async def error_handler(update, context):
+        if isinstance(context.error, Conflict):
+            logger.warning("⚠️ Conflit détecté (autre instance) — attente 10s...")
+            await asyncio.sleep(10)
+        else:
+            logger.error(f"Erreur: {context.error}")
+
+    app.add_error_handler(error_handler)
+
     # Commandes existantes
     app.add_handler(CommandHandler("start",              cmd_start))
     app.add_handler(CommandHandler("aide",               cmd_aide))
@@ -2168,7 +2178,11 @@ def main():
     app.add_handler(CommandHandler("copy_close",    cmd_copy_close_all))
 
     logger.info("🤖 SakaiBot demarre avec module TradeBot!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 
 if __name__ == "__main__":
