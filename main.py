@@ -28,7 +28,7 @@ AUTHORIZED_USER_ID = 1429797974
 COPY_BOT_ADDRESS   = "0xd849f8E96d7BE1A1fc7CA5291Dc6603a47dF8dFD"
 HL_PRIVATE_KEY     = os.getenv("HL_PRIVATE_KEY", "")
 COPY_CAPITAL       = 1000.0   # capital total
-COPY_ASSETS        = ["BTC", "HYPE"]   # assets surveillés phase 1
+COPY_ASSETS        = ["BTC", "ETH", "HYPE"]   # assets surveillés phase 1
 COPY_ALLOC         = 200.0    # $200 par asset
 COPY_MAX_SIZE      = 100.0    # $100 max par trade (50% allocation)
 MARGIN_SAFETY      = 0.5      # marge de sécurité 50%
@@ -36,12 +36,14 @@ MARGIN_SAFETY      = 0.5      # marge de sécurité 50%
 # Levier max par asset
 COPY_LEVERAGE = {
     "BTC":  5,   # x5 → liquidation à -20%
+    "ETH":  4,   # x4 → liquidation à -25%
     "HYPE": 3,   # x3 → liquidation à -33%
 }
 
 # Suivi du capital déployé par asset (évite de dépasser l'allocation)
 copy_deployed = {
     "BTC":  0.0,
+    "ETH":  0.0,
     "HYPE": 0.0,
 }
 
@@ -54,6 +56,7 @@ copy_state = {
     "last_update":   {},             # {asset: timestamp}
     "total_pnl":     0.0,
     "trades_log":    [],
+    "last_ranked":   [],             # derniers traders classés par /toptraders
 }
 
 HYPERLIQUID_API            = "https://api.hyperliquid.xyz/info"
@@ -970,29 +973,12 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asset_report = await build_asset_report(ranked[:20])
     await update.message.reply_text(asset_report, parse_mode="Markdown")
 
-    # --- Lancer le copy trading automatiquement ---
-    # Construire le mapping asset → meilleur trader
-    watched = {}
-    assigned_copy = set()
-    for asset in COPY_ASSETS:
-        for t in ranked[:20]:
-            apnl = t.get("asset_pnl", {}).get(asset, 0.0)
-            if apnl > 0 and t["address"] not in assigned_copy:
-                watched[asset] = t["address"]
-                assigned_copy.add(t["address"])
-                break
-
-    if watched:
-        if copy_state["active"]:
-            await stop_copy_trading()
-        await start_copy_trading(watched, context.application)
-        watch_lines = ["", "━━━━━━━━━━━━━━━━━━━━", "🤖 *Copy Trading ACTIF*"]
-        for asset, addr in watched.items():
-            watch_lines.append(f"   {asset} → `{addr}`")
-        watch_lines.append(f"Ratio: {COPY_RATIO} | Marge safety: {MARGIN_SAFETY}")
-        await update.message.reply_text("\n".join(watch_lines), parse_mode="Markdown")
-    else:
-        await update.message.reply_text("⚠️ Aucun trader assigné — copy trading non démarré.")
+    # Stocker les résultats pour /copy_start
+    copy_state["last_ranked"] = ranked[:20]
+    await update.message.reply_text(
+        "💡 *Tip:* Lance `/copy\_start BTC`, `/copy\_start HYPE` ou `/copy\_start` pour démarrer le copy trading.",
+        parse_mode="Markdown"
+    )
 
 
 async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1686,8 +1672,7 @@ async def start_copy_trading(watched: dict, app) -> None:
     notif_lines.append("")
     notif_lines.append(f"📡 Assets: {', '.join(active_assets)}")
     notif_lines.append(
-        f"💰 BTC: ${COPY_MAX_SIZE:.0f} max x{COPY_LEVERAGE['BTC']} | "
-        f"HYPE: ${COPY_MAX_SIZE:.0f} max x{COPY_LEVERAGE['HYPE']}"
+        f"💰 BTC x{COPY_LEVERAGE['BTC']} | ETH x{COPY_LEVERAGE['ETH']} | HYPE x{COPY_LEVERAGE['HYPE']} — ${COPY_MAX_SIZE:.0f} max/trade"
     )
     await send_copy_notification(app, "\n".join(notif_lines))
     logger.info(f"✅ Copy trading actif — assets: {active_assets}")
@@ -1711,6 +1696,135 @@ async def stop_copy_trading() -> None:
 # ============================================================
 # COMMANDES TELEGRAM — Copy Trading
 # ============================================================
+
+async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Lance le copy trading sur un ou plusieurs assets.
+    Usage:
+      /copy_start       → tous les assets configurés
+      /copy_start BTC   → BTC uniquement
+      /copy_start HYPE  → HYPE uniquement
+    Si /toptraders n'a pas été lancé, le fait automatiquement.
+    """
+    if not is_authorized(update):
+        return
+
+    args    = context.args
+    assets  = []
+
+    if args:
+        asset_req = args[0].upper()
+        if asset_req not in COPY_ASSETS:
+            await update.message.reply_text(
+                f"❌ Asset `{asset_req}` non supporté.\n"
+                f"Assets disponibles: {', '.join(COPY_ASSETS)}",
+                parse_mode="Markdown"
+            )
+            return
+        assets = [asset_req]
+    else:
+        assets = COPY_ASSETS
+
+    # Si pas de données /toptraders → lancer l'analyse d'abord
+    if not copy_state.get("last_ranked"):
+        await update.message.reply_text(
+            "🔍 Aucune analyse récente — lancement de `/toptraders` automatiquement...",
+            parse_mode="Markdown"
+        )
+        raw_traders = await fetch_top_traders_hl()
+        if not raw_traders:
+            await update.message.reply_text("❌ Impossible de récupérer les traders. Réessaie.", parse_mode="Markdown")
+            return
+        filtered = apply_exclusion_filters(raw_traders)
+        if not filtered:
+            await update.message.reply_text("⚠️ Aucun trader ne passe les filtres.", parse_mode="Markdown")
+            return
+        ranked = rank_and_score_traders(filtered)
+        copy_state["last_ranked"] = ranked[:20]
+        # Envoyer le rapport top 5
+        await update.message.reply_text(build_top5_report(ranked[:5]), parse_mode="Markdown")
+
+    ranked = copy_state["last_ranked"]
+
+    # Construire le mapping asset → meilleur trader
+    watched      = {}
+    assigned_set = set()
+    for asset in assets:
+        for t in ranked:
+            apnl = t.get("asset_pnl", {}).get(asset, 0.0)
+            if apnl > 0 and t["address"] not in assigned_set:
+                watched[asset] = t["address"]
+                assigned_set.add(t["address"])
+                break
+        if asset not in watched:
+            # Fallback : meilleur score global si pas de spécialiste asset
+            for t in ranked:
+                if t["address"] not in assigned_set:
+                    watched[asset] = t["address"]
+                    assigned_set.add(t["address"])
+                    break
+
+    if not watched:
+        await update.message.reply_text("⚠️ Aucun trader disponible pour ces assets.", parse_mode="Markdown")
+        return
+
+    # Arrêter uniquement les WebSockets des assets concernés
+    for asset in assets:
+        if asset in copy_state.get("ws_tasks", {}):
+            copy_state["ws_tasks"][asset].cancel()
+            logger.info(f"WebSocket {asset} arrêté avant relance")
+
+    await start_copy_trading(watched, context.application)
+
+
+async def cmd_copy_stop_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Arrête le copy trading sur un asset ou tout.
+    Usage:
+      /copy_stop        → stoppe tout
+      /copy_stop BTC    → stoppe BTC uniquement
+    """
+    if not is_authorized(update):
+        return
+
+    args = context.args
+
+    if not args:
+        # Stopper tout
+        if not copy_state["active"]:
+            await update.message.reply_text("⏸ Copy trading déjà inactif.")
+            return
+        await stop_copy_trading()
+        await update.message.reply_text(
+            "🛑 *Copy Trading arrêté*\n"
+            "Tes positions ouvertes restent actives — gère-les manuellement.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Stopper un asset spécifique
+    asset = args[0].upper()
+    if asset not in COPY_ASSETS:
+        await update.message.reply_text(f"❌ Asset `{asset}` non reconnu.", parse_mode="Markdown")
+        return
+
+    task = copy_state.get("ws_tasks", {}).get(asset)
+    if task:
+        task.cancel()
+        del copy_state["ws_tasks"][asset]
+        if asset in copy_state["watched"]:
+            del copy_state["watched"][asset]
+        # Si plus aucun asset actif → désactiver complètement
+        if not copy_state["ws_tasks"]:
+            copy_state["active"] = False
+        await update.message.reply_text(
+            f"🛑 *Copy Trading {asset} arrêté*\n"
+            f"Position ouverte conservée — gère-la manuellement.",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(f"⏸ Pas de WebSocket actif sur {asset}.")
+
 
 async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le statut du copy trading."""
@@ -1759,23 +1873,6 @@ async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{status} {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.0f}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_copy_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Arrête le copy trading."""
-    if not is_authorized(update):
-        return
-
-    if not copy_state["active"]:
-        await update.message.reply_text("⏸ Copy trading déjà inactif.")
-        return
-
-    await stop_copy_trading()
-    await update.message.reply_text(
-        "🛑 *Copy Trading arrêté*\n"
-        "Tes positions ouvertes restent actives — gère-les manuellement.",
-        parse_mode="Markdown"
-    )
 
 
 async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1860,8 +1957,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏆 *TradeBot — ETF Hyperliquid*\n"
         "   /toptraders — Selectionner les 5 meilleurs traders\n"
         "   /inspector — Analyser un wallet Hyperliquid\n"
+        "   /copy\\_start — Démarrer (ex: /copy\\_start BTC)\n"
         "   /copy\\_status — Statut du copy trading\n"
-        "   /copy\\_stop — Arrêter le copy trading\n"
+        "   /copy\\_stop — Arrêter (ex: /copy\\_stop BTC)\n"
         "   /copy\\_close — Fermer toutes les positions\n"
         "   /tb\\_historique — Historique des selections\n"
         "   /tb\\_aide — Aide TradeBot\n\n"
@@ -2009,8 +2107,9 @@ def main():
     app.add_handler(CommandHandler("tb_historique", cmd_tb_historique))
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
+    app.add_handler(CommandHandler("copy_start",    cmd_copy_start))
     app.add_handler(CommandHandler("copy_status",   cmd_copy_status))
-    app.add_handler(CommandHandler("copy_stop",     cmd_copy_stop))
+    app.add_handler(CommandHandler("copy_stop",     cmd_copy_stop_asset))
     app.add_handler(CommandHandler("copy_close",    cmd_copy_close_all))
 
     logger.info("🤖 SakaiBot demarre avec module TradeBot!")
