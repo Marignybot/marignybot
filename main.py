@@ -935,6 +935,189 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(asset_report, parse_mode="Markdown")
 
 
+async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyse complète d'un wallet Hyperliquid."""
+    if not is_authorized(update):
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚠️ Usage: `/inspector <adresse>`\n"
+            "Exemple: `/inspector 0x9cd0a696c7cbb9d44de99268194cb08e5684e5fe`",
+            parse_mode="Markdown"
+        )
+        return
+
+    address = args[0].strip().lower()
+    if not address.startswith("0x") or len(address) != 42:
+        await update.message.reply_text("❌ Adresse invalide. Format: `0x...` (42 caractères)", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text(f"🔍 Inspection de `{address[:10]}...` en cours...", parse_mode="Markdown")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Portfolio
+            async with session.post(
+                "https://api-ui.hyperliquid.xyz/info",
+                json={"type": "portfolio", "user": address},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                portfolio = await resp.json()
+
+            # Fills pour PnL par asset
+            async with session.post(
+                "https://api-ui.hyperliquid.xyz/info",
+                json={"type": "userFills", "user": address},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp2:
+                fills = await resp2.json()
+
+            # Positions ouvertes
+            async with session.post(
+                "https://api-ui.hyperliquid.xyz/info",
+                json={"type": "clearinghouseState", "user": address},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp3:
+                state = await resp3.json()
+
+        # Parser windows portfolio
+        windows = {}
+        for item in portfolio:
+            if isinstance(item, list) and len(item) == 2:
+                windows[item[0]] = item[1]
+
+        def get_window_stats(win_key, fallback_key):
+            w = windows.get(win_key) or windows.get(fallback_key, {})
+            pnl_hist = [float(p[1]) for p in w.get("pnlHistory", []) if isinstance(p, list)]
+            acv_hist = [float(p[1]) for p in w.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
+            pnl = pnl_hist[-1] if pnl_hist else 0
+            capital = acv_hist[-1] if acv_hist else 0
+            # MDD
+            mdd = 0.0
+            if acv_hist:
+                pk = acv_hist[0]
+                for v in acv_hist:
+                    if v > pk: pk = v
+                    dd = (pk - v) / pk * 100 if pk > 0 else 0
+                    if dd > mdd: mdd = dd
+            # ROI
+            base = max(capital - pnl, 1)
+            roi = min((pnl / base) * 100, 9999) if pnl > 0 else (pnl / base) * 100
+            # Consistance
+            pos = sum(1 for i in range(1, len(pnl_hist)) if pnl_hist[i] > pnl_hist[i-1])
+            consist = (pos / max(len(pnl_hist) - 1, 1)) * 100
+            return {"pnl": pnl, "capital": capital, "mdd": mdd, "roi": roi, "consist": consist}
+
+        d1  = get_window_stats("perpDay",   "day")
+        w7  = get_window_stats("perpWeek",  "week")
+        m30 = get_window_stats("perpMonth", "month")
+        at  = get_window_stats("perpAllTime","allTime")
+
+        # Winrate depuis week
+        week_data = windows.get("perpWeek") or windows.get("week", {})
+        week_pnl  = [float(p[1]) for p in week_data.get("pnlHistory", []) if isinstance(p, list)]
+        winrate   = (sum(1 for p in week_pnl if p > 0) / max(len(week_pnl), 1)) * 100
+
+        # Dernier trade (timestamp)
+        now_ms   = datetime.now().timestamp() * 1000
+        last_fill_ts = None
+        if isinstance(fills, list) and fills:
+            last_fill_ts = max((f.get("time", 0) for f in fills if isinstance(f, dict)), default=None)
+        days_inactive = ((now_ms - last_fill_ts) / 86400000) if last_fill_ts else None
+
+        # PnL par asset (top 5)
+        asset_pnl = {}
+        COIN_MAP = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "HYPE": "HYPE", "TAO": "TAO"}
+        if isinstance(fills, list):
+            for fill in fills:
+                if not isinstance(fill, dict): continue
+                coin = fill.get("coin", "")
+                coin = COIN_MAP.get(coin, coin)
+                pv = float(fill.get("closedPnl", 0) or 0)
+                asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pv
+        top_assets = sorted(asset_pnl.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # Positions ouvertes
+        positions = []
+        if isinstance(state, dict):
+            for pos in state.get("assetPositions", []):
+                p = pos.get("position", {})
+                sz = float(p.get("szi", 0) or 0)
+                if sz != 0:
+                    positions.append({
+                        "coin": p.get("coin", "?"),
+                        "side": "Long 📈" if sz > 0 else "Short 📉",
+                        "size": abs(sz),
+                        "entry": float(p.get("entryPx", 0) or 0),
+                        "pnl":  float(p.get("unrealizedPnl", 0) or 0),
+                        "lev":  p.get("leverage", {}).get("value", "?"),
+                    })
+
+        # Score composite
+        roi_score = min(100.0, m30["roi"] / 5)
+        score = round(
+            score_consistency(m30["consist"]) * 0.35 +
+            score_drawdown(m30["mdd"])        * 0.30 +
+            score_winrate(winrate)            * 0.20 +
+            roi_score                         * 0.15, 1
+        )
+        verdict = "🟢 FORT" if score >= 65 else ("🟡 MOYEN" if score >= 45 else "🔴 FAIBLE")
+
+        # Construire le rapport
+        lines = [
+            f"🔎 *INSPECTOR — Wallet Analysis*",
+            f"`{address}`",
+            f"━━━━━━━━━━━━━━━━━━━━",
+            f"",
+            f"📊 *PERFORMANCE*",
+            f"{'Période':<12} {'PnL':>12} {'ROI':>8} {'MDD':>6}",
+            f"{'24h':<12} ${d1['pnl']:>+10,.0f} {d1['roi']:>7.1f}% {d1['mdd']:>5.1f}%",
+            f"{'7j':<12} ${w7['pnl']:>+10,.0f} {w7['roi']:>7.1f}% {w7['mdd']:>5.1f}%",
+            f"{'30j':<12} ${m30['pnl']:>+10,.0f} {m30['roi']:>7.1f}% {m30['mdd']:>5.1f}%",
+            f"{'AllTime':<12} ${at['pnl']:>+10,.0f} {at['roi']:>7.1f}% {at['mdd']:>5.1f}%",
+            f"",
+            f"🎯 *QUALITÉ (base 30j)*",
+            f"Score ETF:   *{score}/100* {verdict}",
+            f"Win Rate:    {winrate:.0f}%",
+            f"Consistance: {m30['consist']:.0f}%",
+            f"Capital:     ${m30['capital']:,.0f}",
+        ]
+
+        if days_inactive is not None:
+            lines.append(f"Dernier trade: il y a *{days_inactive:.0f}j*")
+
+        if top_assets:
+            lines.append(f"")
+            lines.append(f"💰 *PnL PAR ASSET (allTime)*")
+            for coin, pnl in top_assets:
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                lines.append(f"{emoji} {coin:<8} ${pnl:>+12,.0f}")
+
+        if positions:
+            lines.append(f"")
+            lines.append(f"⚡ *POSITIONS OUVERTES ({len(positions)})*")
+            for pos in positions[:5]:
+                lines.append(
+                    f"{pos['side']} {pos['coin']} x{pos['lev']} | "
+                    f"PnL: ${pos['pnl']:+,.0f}"
+                )
+        else:
+            lines.append(f"")
+            lines.append(f"⚡ *Aucune position ouverte*")
+
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"_Données Hyperliquid en temps réel_")
+
+        report = "\n".join(lines)
+        await update.message.reply_text(report, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"Inspector erreur: {e}")
+        await update.message.reply_text(f"❌ Erreur lors de l'analyse: `{str(e)[:100]}`", parse_mode="Markdown")
+
+
 async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche l'historique des selections precedentes."""
     if not is_authorized(update):
@@ -965,6 +1148,7 @@ async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   + Top 2 par asset (BTC, ETH, SOL, HYPE, TAO)\n\n"
         "📋 *Commandes:*\n"
         "   /toptraders — Lancer une analyse\n"
+        "   /inspector — Analyser un wallet manuellement\n"
         "   /tb\\_historique — Selections passees\n"
         "   /tb\\_aide — Cette aide\n\n"
         "_v2.0 — Analyse | v3.0 prevue: copy trading auto_"
@@ -1134,6 +1318,7 @@ def main():
     app.add_handler(CommandHandler("toptraders",    cmd_toptraders))
     app.add_handler(CommandHandler("tb_historique", cmd_tb_historique))
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
+    app.add_handler(CommandHandler("inspector",     cmd_inspector))
 
     logger.info("🤖 MarignyCryptoBot demarre avec module TradeBot!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
