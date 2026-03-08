@@ -2141,12 +2141,11 @@ target_trades_log: list = []
 
 # ── Helpers ordres ──────────────────────────────────────────
 
-async def place_limit_order(asset: str, is_buy: bool, size: float,
-                            ref_price: float, offset_pct: float = -0.1) -> dict:
+async def place_market_order(asset: str, is_buy: bool, size: float,
+                             ref_price: float) -> dict:
     """
-    Ordre LIMIT GTC à ref_price ± offset_pct%.
-    BUY  → ref × (1 - 0.001)  — légèrement sous marché
-    SELL → ref × (1 + 0.001)  — légèrement sur marché
+    Ordre MARKET — IOC avec slippage 2% pour garantir le fill.
+    Utilisé pour ouvertures, renforts, allègements et fermetures.
     """
     try:
         if not HL_PRIVATE_KEY:
@@ -2158,11 +2157,8 @@ async def place_limit_order(asset: str, is_buy: bool, size: float,
         wallet   = eth_account.Account.from_key(key)
         exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
 
-        if is_buy:
-            raw_px = ref_price * (1 + offset_pct / 100)
-        else:
-            raw_px = ref_price * (1 - offset_pct / 100)
-
+        slippage = 1.02 if is_buy else 0.98
+        raw_px   = ref_price * slippage
         magnitude = len(str(int(raw_px)))
         decimals  = max(0, 5 - magnitude)
         limit_px  = float(round(raw_px, decimals))
@@ -2173,61 +2169,28 @@ async def place_limit_order(asset: str, is_buy: bool, size: float,
         if sz * ref_price < 10:
             sz = max(round(11.0 / ref_price, rules["decimals"]), rules["min"])
 
-        logger.info(f"Limit {asset} {'BUY' if is_buy else 'SELL'} sz={sz} ref={ref_price:.2f} limit={limit_px:.2f}")
-
-        loop   = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Gtc"}})
-        )
-        logger.info(f"Limit {asset} résultat: {result}")
-        return result
-
-    except Exception as e:
-        logger.error(f"place_limit_order {asset}: {e}")
-        return {"error": str(e)}
-
-
-async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
-    """Clôture MARKET — IOC avec slippage 2% pour garantir le fill."""
-    try:
-        if not HL_PRIVATE_KEY:
-            return {"error": "HL_PRIVATE_KEY manquante"}
-        if not _HL_SDK_AVAILABLE:
-            return {"error": "hyperliquid-python-sdk non installé"}
-
-        key      = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
-        wallet   = eth_account.Account.from_key(key)
-        exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
-
-        mids  = await get_all_mids_cached()
-        price = float(mids.get(asset, 0))
-        if price <= 0:
-            return {"error": f"Prix {asset} introuvable"}
-
-        slippage = 1.02 if is_buy else 0.98
-        raw_px   = price * slippage
-        magnitude = len(str(int(raw_px)))
-        decimals  = max(0, 5 - magnitude)
-        limit_px  = float(round(raw_px, decimals))
-
-        rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
-        sz    = round(size, rules["decimals"])
-        sz    = max(sz, rules["min"])
-
-        logger.info(f"Market close {asset} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*price:.0f}")
+        logger.info(f"Market {asset} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*ref_price:.0f}")
 
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
         )
-        logger.info(f"Market close {asset} résultat: {result}")
+        logger.info(f"Market {asset} résultat: {result}")
         return result
 
     except Exception as e:
-        logger.error(f"place_market_close {asset}: {e}")
+        logger.error(f"place_market_order {asset}: {e}")
         return {"error": str(e)}
+
+
+async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
+    """Alias vers place_market_order pour les fermetures."""
+    mids  = await get_all_mids_cached()
+    price = float(mids.get(asset, 0))
+    if price <= 0:
+        return {"error": f"Prix {asset} introuvable"}
+    return await place_market_order(asset, is_buy, size, price)
 
 
 async def compute_target_ratio(trader_address: str) -> float | None:
@@ -2290,7 +2253,7 @@ async def target_watch_ws(address: str, app) -> None:
                         f"📡 *Target connecté*\n"
                         f"`{address}`\n"
                         f"Ratio: {ratio:.4f} | Réplication ACTIVE\n"
-                        f"Ouverture/Renfort → LIMIT -0.1% | Fermeture → MARKET"
+                        f"Ouverture/Renfort → MARKET IOC | Fermeture → MARKET"
                     )
                     first_connect = False
                 else:
@@ -2324,7 +2287,7 @@ async def target_watch_ws(address: str, app) -> None:
 async def process_target_event(address: str, msg: dict, app) -> None:
     """
     Traite un fill du trader cible.
-    Ouverture/Renfort → LIMIT -0.1%
+    Ouverture/Renfort → MARKET IOC
     Fermeture partielle ou totale → MARKET, proportionnelle au ratio de fermeture
     Conflit asset → ignoré, premier arrivé premier servi
     """
@@ -2381,9 +2344,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                 continue
 
             my_size = compute_my_size(asset, size, price, ratio)
-            result  = await place_limit_order(asset, is_buy, my_size, price, offset_pct=-0.1)
-
-            limit_px = price * (1 - 0.001) if is_buy else price * (1 + 0.001)
+            result  = await place_market_order(asset, is_buy, my_size, price)
 
             # Mémoriser ou cumuler (renfort)
             is_reinforce = asset in target_positions and target_positions[asset]["trader_addr"] == address
@@ -2404,11 +2365,11 @@ async def process_target_event(address: str, msg: dict, app) -> None:
             emoji  = "📈" if is_buy else "📉"
             label  = trader_info.get("label", address[:16])
             await send_copy_notification(app,
-                f"{status} *{'🔁 Renfort' if is_reinforce else 'Ouverture'} {emoji} LIMIT*\n"
+                f"{status} *{'🔁 Renfort' if is_reinforce else 'Ouverture'} {emoji} MARKET*\n"
                 f"Asset:   *{asset}*\n"
                 f"Action:  {dir_fill}\n"
                 f"Taille:  {my_size} (~${my_size*price:.0f})\n"
-                f"Ref:     ${price:,.4f} → limit ${limit_px:,.4f}\n"
+                f"Prix:    ~${price:,.4f}\n"
                 f"Trader:  `{label}`"
                 + (f"\n⚠️ {result['error']}" if "error" in result else "")
             )
@@ -2483,7 +2444,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
 
 async def target_sync_positions(address: str, app) -> None:
     """
-    /target_sync — Ouvre les positions DÉJÀ ouvertes du trader en LIMIT -0.1%.
+    /target_sync — Ouvre les positions DÉJÀ ouvertes du trader au MARKET.
     Optionnel — à appeler manuellement après /target si tu veux entrer sur
     les positions en cours.
     """
@@ -2532,7 +2493,7 @@ async def target_sync_positions(address: str, app) -> None:
                 continue
 
             my_size = compute_my_size(asset, abs(sz), price, ratio)
-            result  = await place_limit_order(asset, is_buy, my_size, price, offset_pct=-0.1)
+            result  = await place_market_order(asset, is_buy, my_size, price)
             status  = "✅" if "error" not in result else "❌"
             side_str = "Long 📈" if is_buy else "Short 📉"
             results.append(f"{status} {asset} {side_str} {my_size} (~${my_size*price:.0f})")
@@ -2632,7 +2593,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 Capital trader: ${trader_cap:,.0f}\n"
         f"📐 Ratio:          {ratio:.4f}\n\n"
         f"*Comportement:*\n"
-        f"• Ouverture/Renfort → LIMIT à -0.1%\n"
+        f"• Ouverture/Renfort → MARKET IOC\n"
         f"• Fermeture → MARKET immédiat (proportionnel)\n\n"
         f"💡 `/target_sync {address}` pour copier les positions déjà ouvertes.\n"
         f"🛑 `/target_stop {address}` pour arrêter.",
@@ -2643,7 +2604,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_target_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /target_sync 0xADRESSE
-    Ouvre les positions déjà ouvertes du trader en LIMIT -0.1%.
+    Ouvre les positions déjà ouvertes du trader au MARKET.
     """
     if not is_authorized(update):
         return
@@ -2847,7 +2808,7 @@ def main():
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.4 démarré — Multi-target, limit -0.1%, clôture market!")
+    logger.info("🤖 SakaiBot v4.4 démarré — Multi-target, tout market — ouverture, renfort, fermeture!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
