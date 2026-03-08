@@ -2701,59 +2701,73 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    active_targets = {a: t for a, t in target_registry.items() if t["active"]}
+    try:
+        active_targets = {a: t for a, t in target_registry.items() if t.get("active")}
 
-    if not active_targets:
-        await update.message.reply_text(
-            "⏸ *Aucun target actif*\n"
-            "Lance `/target 0xADRESSE` pour démarrer.",
-            parse_mode="Markdown"
-        )
-        return
+        if not active_targets:
+            await update.message.reply_text(
+                "⏸ *Aucun target actif*\n"
+                "Lance `/target 0xADRESSE` pour démarrer.",
+                parse_mode="Markdown"
+            )
+            return
 
-    lines = [
-        f"🎯 *TARGET STATUS — {len(active_targets)}/{MAX_TARGETS} actifs*",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+        lines = [
+            f"🎯 *TARGET STATUS — {len(active_targets)}/{MAX_TARGETS} actifs*",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
 
-    for addr, info in active_targets.items():
-        mode = "⏸ PAUSE" if info.get("paused") else "🟢 ACTIF"
-        lines.append(
-            f"*{info['label']}* {mode}\n"
-            f"`{addr}`\n"
-            f"Ratio: {info['ratio']:.4f}"
-        )
-        # Positions de ce trader
-        my_pos = [(a, p) for a, p in target_positions.items() if p["trader_addr"] == addr]
-        if my_pos:
-            for asset, pos in my_pos:
-                emoji = "📈" if pos["side"] == "long" else "📉"
-                lines.append(f"  {emoji} {asset} {pos['side'].upper()} sz:{pos['size']} @ ${pos['entry']:,.2f}")
-        else:
-            lines.append("  _Aucune position active_")
-        lines.append("")
+        for addr, info in active_targets.items():
+            mode       = "⏸ PAUSE" if info.get("paused") else "🟢 ACTIF"
+            label      = info.get("label", addr[:16])
+            ratio      = info.get("ratio", 0)
+            short_addr = addr[:20] + "..."
+            lines.append(
+                f"*{label}* {mode}\n"
+                f"`{short_addr}`\n"
+                f"Ratio: {ratio:.4f}"
+            )
+            my_pos = [(a, p) for a, p in target_positions.items() if p.get("trader_addr") == addr]
+            if my_pos:
+                for asset, pos in my_pos:
+                    emoji = "📈" if pos.get("side") == "long" else "📉"
+                    lines.append(f"  {emoji} {asset} {pos.get('side','?').upper()} sz:{pos.get('size',0)} @ ${pos.get('entry',0):,.2f}")
+            else:
+                lines.append("  _Aucune position ouverte_")
+            lines.append("")
 
-    # Positions consolidées (vue globale)
-    if target_positions:
+        if target_positions:
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"📊 *Positions bot ({len(target_positions)}):*")
+            for asset, pos in target_positions.items():
+                trader_addr = pos.get("trader_addr", "")
+                owner = target_registry.get(trader_addr, {}).get("label", trader_addr[:10])
+                emoji = "📈" if pos.get("side") == "long" else "📉"
+                lines.append(f"  {emoji} *{asset}* {pos.get('side','?').upper()} sz:{pos.get('size',0)} — via {owner}")
+
+        if target_trades_log:
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            recent = target_trades_log[-5:]
+            lines.append(f"📋 *Derniers signaux ({len(recent)}):*")
+            for t in recent:
+                lines.append(f"  {t.get('time','?')[:11]} | {t.get('asset','?')} {t.get('dir','?')} @ ${t.get('price',0):,.2f} — {t.get('trader','?')[:12]}")
+
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"📊 *Positions bot ({len(target_positions)}):*")
-        for asset, pos in target_positions.items():
-            owner = target_registry.get(pos["trader_addr"], {}).get("label", pos["trader_addr"][:10])
-            emoji = "📈" if pos["side"] == "long" else "📉"
-            lines.append(f"  {emoji} *{asset}* {pos['side'].upper()} sz:{pos['size']} — via {owner}")
+        lines.append("_/target\\_stop | /target\\_sync | /target\\_close_")
 
-    # Derniers trades
-    if target_trades_log:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        recent = target_trades_log[-5:]
-        lines.append(f"📋 *Derniers signaux ({len(recent)}):*")
-        for t in recent:
-            lines.append(f"  {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.2f} — {t['trader']}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_/target_stop 0x... | /target_sync 0x... | /target_close_")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"cmd_target_status erreur: {e}")
+        try:
+            fallback = "TARGET STATUS\n"
+            for addr, info in target_registry.items():
+                if info.get("active"):
+                    state = "PAUSE" if info.get("paused") else "ACTIF"
+                    fallback += f"- {info.get('label', addr[:16])} | ratio {info.get('ratio', 0):.4f} | {state}\n"
+            await update.message.reply_text(fallback or "Aucun target actif.")
+        except Exception:
+            await update.message.reply_text("Erreur affichage status — voir logs Railway.")
 
 
 
