@@ -567,7 +567,7 @@ tradebot_history = []
 # ============================================================
 
 TRADEBOT_MIN_TRADES      = 5
-TRADEBOT_MAX_DRAWDOWN    = 40.0
+TRADEBOT_MAX_DRAWDOWN    = 60.0
 TRADEBOT_EXCELLENT_RATIO = 5.0   # PnL_7j / MDD ≥ 5 → éligible même avec < 5 trades
 
 # Adresses bannies — jamais sélectionnées ni copiées
@@ -772,12 +772,16 @@ async def fetch_top_traders_hl() -> list:
                 acv_h30    = [float(p[1]) for p in m30.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
 
                 pnl_30j    = pnl_h30[-1] if pnl_h30 else 0.0
-                if pnl_30j <= 0:
-                    return None
 
+                # Accepte un PnL 30j légèrement négatif (correction temporaire)
+                # mais exclut si la perte dépasse 15% du capital
                 cap_30     = acv_h30[-1] if acv_h30 else 0.0
                 if cap_30 < 10000:
                     return None
+                if pnl_30j < 0:
+                    perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
+                    if perte_pct > 15.0:
+                        return None
 
                 base_30    = max(cap_30 - pnl_30j, 1)
                 roi_30j    = min((pnl_30j / base_30) * 100, 2000)
@@ -807,9 +811,7 @@ async def fetch_top_traders_hl() -> list:
                     logger.debug(f"Exclu {address[:12]}: {n_trades_7j} trades, ratio {pnl_mdd_ratio:.1f}")
                     return None
 
-                # ── Win rate minimum 50% sur 7j ────────────────────────
-                if winrate_7j < 50:
-                    return None
+                # Win rate : plus de filtre dur — composante du score uniquement
 
                 return {
                     "address":     address,
@@ -842,8 +844,11 @@ async def fetch_top_traders_hl() -> list:
 
 
 def apply_exclusion_filters(traders: list) -> list:
-    """Filtre de sécurité post-fetch : MDD et PnL_7j positif."""
-    filtered = [t for t in traders if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_7j", 0) > 0]
+    """Filtre de sécurité post-fetch : MDD ≤ 60% et PnL allTime positif."""
+    filtered = [
+        t for t in traders
+        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_at", 0) > 0
+    ]
     logger.info(f"Après filtres: {len(filtered)}/{len(traders)} traders retenus")
     return filtered
 
