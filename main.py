@@ -688,17 +688,67 @@ tradebot_history = []
 
 
 def compute_new_score(pnl_7j: float, mdd: float, winrate_7j: float,
-                      n_trades_7j: int, pnl_30j: float, roi_30j: float) -> float:
+                      n_trades_7j: int, pnl_30j: float, roi_30j: float,
+                      capital: float = 0.0) -> float:
     """
-    Score = (PnL_7j / MDD) × (WinRate_7j / 100) × log1p(n_trades_7j)
-    Bonus ×1.2 si confirmation 30j positive.
+    Score copytrading v2 — orienté copiabilité, pas performance brute.
+
+    Composantes :
+      roi_7j        — rendement % sur 7j (normalisé par capital, pas valeur absolue)
+      consistency   — régularité : idéal pnl_30j ≈ 4× pnl_7j
+      scalper       — pénalité si > 30 trades/jour (bots/scalpers incopiables)
+      wr_factor     — WinRate : pénalité forte < 50%, bonus > 65%
+      mdd_factor    — MDD : pénalité progressive jusqu'à 85%
+      vol_factor    — volume trades normalisé (log, plafonné à 30/j)
+
+    Différences vs v1 :
+      - PnL absolu remplacé par ROI % → comparaison équitable entre capitaux
+      - Pénalité scalper explicite (> 30 trades/jour)
+      - WinRate < 50% → score quasiment nul (incopiable)
+      - Consistance 7j/30j récompense la régularité
     """
-    pnl_mdd_ratio = pnl_7j / max(mdd, 1.0)
-    if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
+    if n_trades_7j < TRADEBOT_MIN_TRADES:
         return 0.0
-    raw = pnl_mdd_ratio * (winrate_7j / 100.0) * math.log1p(n_trades_7j)
-    if pnl_30j > 0 and roi_30j >= 20.0:
-        raw *= 1.2
+
+    # ROI 7j en % (si capital inconnu, fallback sur PnL brut normalisé)
+    if capital > 0:
+        roi_7j = (pnl_7j / capital) * 100
+    else:
+        roi_7j = pnl_7j / max(mdd, 1.0) * 0.01  # fallback dégradé
+
+    if roi_7j <= 0:
+        return 0.0
+
+    # Consistance : régularité sur 30j vs 7j
+    if pnl_7j > 0 and pnl_30j > 0:
+        ratio       = pnl_30j / pnl_7j
+        consistency = min(ratio / 4.0, 1.0)   # idéal: pnl_30j = 4× pnl_7j
+    elif pnl_30j > 0:
+        consistency = 0.5
+    else:
+        consistency = 0.1
+
+    # Pénalité scalper : > 30 trades/jour = incopiable
+    trades_per_day  = n_trades_7j / 7.0
+    scalper_penalty = min(1.0, 30.0 / max(trades_per_day, 0.1))
+
+    # WinRate — pénalité forte < 50%, bonus > 65%
+    wr = winrate_7j / 100.0
+    if wr < 0.50:
+        wr_factor = wr ** 2           # 27% → 0.073, 45% → 0.20
+    elif wr >= 0.65:
+        wr_factor = min(wr * 1.15, 1.0)
+    else:
+        wr_factor = wr
+
+    # MDD — pénalité modérée (30%→0.79, 50%→0.55, 70%→0.28, 85%→0.05)
+    mdd_factor = max(0.05, 1.0 - (mdd / 85.0) ** 1.5)
+
+    # Volume trades normalisé (log, plafonné à 210 = 30/j × 7j)
+    capped     = min(n_trades_7j, 210)
+    vol_factor = math.log1p(capped) / math.log1p(210)
+
+    raw = roi_7j * consistency * scalper_penalty * wr_factor * mdd_factor * vol_factor
     return max(raw, 0.0)
 
 
@@ -952,6 +1002,7 @@ async def fetch_top_traders_hl() -> list:
                         "n_trades_7j":  n_trades_7j,
                         "n_trades_at":  n_trades_at,
                         "roi_30j":      round(roi_30j, 1),
+                        "capital":      round(cap_30, 0),
                     }
 
                 except Exception as e:
@@ -991,6 +1042,11 @@ def rank_and_score_traders(traders: list) -> list:
     if not traders:
         return []
 
+    # Filtre dur WinRate < 45% — incopiable quelle que soit la perf brute
+    traders = [t for t in traders if t.get("winrate", 0) >= 45]
+    if not traders:
+        return []
+
     raw_scores = [
         compute_new_score(
             pnl_7j      = t.get("pnl_7j", 0),
@@ -999,6 +1055,7 @@ def rank_and_score_traders(traders: list) -> list:
             n_trades_7j = t.get("n_trades_7j", 0),
             pnl_30j     = t.get("pnl", 0),
             roi_30j     = t.get("roi_30j", t.get("roi", 0)),
+            capital     = t.get("capital", 0),
         )
         for t in traders
     ]
@@ -1030,15 +1087,32 @@ def build_top5_report(top5: list) -> str:
         "🏆 *SakaiBot — Top 5 Traders*",
         f"📅 {now}",
         "━━━━━━━━━━━━━━━━━━━━",
-        "*📊 Score = (PnL_7j/MDD) × WR_7j × log(trades) × bonus_30j*",
+        "*📊 Score = ROI% × Consistance × WinRate × Anti-scalper × MDD*",
         "",
     ]
     for i, t in enumerate(top5, 1):
-        verdict = "🟢 FORT" if t["score"] >= 70 else ("🟡 MOYEN" if t["score"] >= 40 else "🔴 FAIBLE")
-        bonus   = " ✨+30j" if t.get("roi_30j", 0) >= 20 and t.get("pnl", 0) > 0 else ""
-        lines.append(f"*#{i}* — Score: *{t['score']}/100* {verdict}{bonus}")
-        lines.append(f"PnL 7j: ${t.get('pnl_7j',0):+,.0f} | WR 7j: {t.get('winrate',0):.0f}% | Trades 7j: {t.get('n_trades_7j',0)}")
-        lines.append(f"MDD: {t['mdd']:.0f}% | PnL 30j: ${t.get('pnl',0):+,.0f} | Trades total: {t.get('n_trades_at',0)}")
+        score   = t["score"]
+        verdict = "🟢 FORT" if score >= 70 else ("🟡 MOYEN" if score >= 40 else "🔴 FAIBLE")
+
+        # Badges
+        badges = []
+        trades_per_day = t.get("n_trades_7j", 0) / 7
+        if trades_per_day > 30:
+            badges.append("⚡ SCALPER")
+        if t.get("winrate", 0) >= 65:
+            badges.append("🎯 WR>65%")
+        if t.get("mdd", 100) <= 40:
+            badges.append("🛡️ MDD<40%")
+        consistency = t.get("pnl_30j", t.get("pnl", 0)) / max(t.get("pnl_7j", 1), 1)
+        if consistency >= 3.0:
+            badges.append("📈 RÉGULIER")
+        badge_str = " " + " ".join(badges) if badges else ""
+
+        cap_str = f"${t.get('capital', 0):,.0f}" if t.get("capital") else "N/A"
+
+        lines.append(f"*#{i}* — Score: *{score}/100* {verdict}{badge_str}")
+        lines.append(f"PnL 7j: ${t.get('pnl_7j',0):+,.0f} | WR 7j: {t.get('winrate',0):.0f}% | Trades 7j: {t.get('n_trades_7j',0)} ({trades_per_day:.0f}/j)")
+        lines.append(f"MDD: {t['mdd']:.0f}% | PnL 30j: ${t.get('pnl',0):+,.0f} | Capital: {cap_str}")
         lines.append(f"`{t['address']}`")
         lines.append("")
     avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
@@ -1077,7 +1151,8 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 *TradeBot — Analyse en cours...*\n\n"
         "• Récupération du leaderboard Hyperliquid (top 200)\n"
         "• Filtres: MDD<85% | actif 15j | 60j ancienneté | 20 trades min\n"
-        "• Score: (PnL\\_7j/MDD) × WR × log(trades) + bonus 30j\n"
+        "• Score: ROI% × Consistance × WinRate × Anti-scalper × MDD\n"
+        "• Filtre dur: WR≥45% | ≤30 trades/jour privilégié\n"
         "• Sélection Top 5 multi-asset\n\n"
         "_Patiente quelques secondes..._",
         parse_mode="Markdown"
