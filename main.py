@@ -853,6 +853,18 @@ async def fetch_top_traders_hl() -> list:
                     ) as resp:
                         portfolio = await resp.json()
 
+                    # Fallback : essayer l'endpoint principal si UI retourne None
+                    if portfolio is None:
+                        try:
+                            async with session.post(
+                                HYPERLIQUID_API,
+                                json={"type": "portfolio", "user": address},
+                                timeout=aiohttp.ClientTimeout(total=10)
+                            ) as resp2:
+                                portfolio = await resp2.json()
+                        except Exception:
+                            pass
+
                     if not portfolio or not isinstance(portfolio, list):
                         port_type = type(portfolio).__name__
                         if isinstance(portfolio, dict):
@@ -1001,6 +1013,13 @@ async def fetch_top_traders_hl() -> list:
                         logger.info(
                             f"Exclu {address[:12]}: scalper {trades_per_day:.0f} trades/j "
                             f"(max {TRADEBOT_MAX_TRADES_DAY}) — incopiable"
+                        )
+                        return None
+
+                    # Filtre dur WinRate < 45% — incopiable
+                    if winrate_7j < 45.0:
+                        logger.info(
+                            f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 45% — incopiable"
                         )
                         return None
 
