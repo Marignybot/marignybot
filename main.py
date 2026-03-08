@@ -1814,7 +1814,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "👋 *Bienvenue sur SakaiBot v4.2! 🤖*\n\n"
+        "👋 *Bienvenue sur SakaiBot v4.4! 🤖*\n\n"
         "📊 *Marché & Analyse*\n"
         "   /prix — Prix en temps réel\n"
         "   /setup — Analyse technique complète\n"
@@ -1832,10 +1832,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /tb\\_historique — Historique des sélections\n"
         "   /tb\\_aide — Aide Copy Trading\n\n"
         "🎯 *Target Wallet Manuel*\n"
-        "   /target 0x... — Copier un wallet spécifique\n"
-        "   /target\\_pause — Mettre en pause\n"
-        "   /target\\_stop — Arrêter\n"
-        "   /target\\_status — Statut\n\n"
+        "   /target 0x... [label] — Surveiller + répliquer\n"
+        "   /target\\_sync 0x... — Copier positions existantes\n"
+        "   /target\\_stop 0x... — Stopper un target\n"
+        "   /target\\_status — État de tous les targets\n\n"
         "🔔 *Alertes*\n"
         "   /alertes — Activer les alertes auto\n"
         "   /desactiver\\_alertes — Stopper les alertes\n\n"
@@ -1976,20 +1976,368 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ============================================================
-# MODULE TARGET WALLET MANUEL
+# MODULE TARGET WALLET MANUEL v4.4
+# Logique :
+#   /target 0x...        → surveillance + réplication auto (ratio calculé au démarrage)
+#   /target_sync         → ouvre les positions déjà ouvertes du trader (optionnel)
+#   /target_stop 0x...   → stoppe un trader spécifique (ou tous si pas d'adresse)
+#   /target_status       → état de tous les traders surveillés
+#
+# Multi-target :
+#   Jusqu'à MAX_TARGETS traders simultanés.
+#   Conflit asset : premier arrivé premier servi — signal suivant ignoré + notif.
 # ============================================================
-target_state = {
-    "active":     False,
-    "paused":     False,
-    "address":    None,
-    "ws_task":    None,
-    "positions":  {},
-    "trades_log": [],
-}
 
+MAX_TARGETS = 3  # Nombre max de wallets cibles simultanés
+
+# target_registry : {address: {...}} — un dict par trader actif
+target_registry: dict = {}
+
+# Positions consolidées : {asset: {"side","size","entry","trader_addr"}}
+# Premier arrivé premier servi — un seul trader par asset
+target_positions: dict = {}
+
+# Log global
+target_trades_log: list = []
+
+
+# ── Helpers ordres ──────────────────────────────────────────
+
+async def place_limit_order(asset: str, is_buy: bool, size: float,
+                            ref_price: float, offset_pct: float = -0.1) -> dict:
+    """
+    Ordre LIMIT GTC à ref_price ± offset_pct%.
+    BUY  → ref × (1 - 0.001)  — légèrement sous marché
+    SELL → ref × (1 + 0.001)  — légèrement sur marché
+    """
+    try:
+        if not HL_PRIVATE_KEY:
+            return {"error": "HL_PRIVATE_KEY manquante"}
+        if not _HL_SDK_AVAILABLE:
+            return {"error": "hyperliquid-python-sdk non installé"}
+
+        key      = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+        wallet   = eth_account.Account.from_key(key)
+        exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+
+        if is_buy:
+            raw_px = ref_price * (1 + offset_pct / 100)
+        else:
+            raw_px = ref_price * (1 - offset_pct / 100)
+
+        magnitude = len(str(int(raw_px)))
+        decimals  = max(0, 5 - magnitude)
+        limit_px  = float(round(raw_px, decimals))
+
+        rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+        sz    = round(size, rules["decimals"])
+        sz    = max(sz, rules["min"])
+        if sz * ref_price < 10:
+            sz = max(round(11.0 / ref_price, rules["decimals"]), rules["min"])
+
+        logger.info(f"Limit {asset} {'BUY' if is_buy else 'SELL'} sz={sz} ref={ref_price:.2f} limit={limit_px:.2f}")
+
+        loop   = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Gtc"}})
+        )
+        logger.info(f"Limit {asset} résultat: {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"place_limit_order {asset}: {e}")
+        return {"error": str(e)}
+
+
+async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
+    """Clôture MARKET — IOC avec slippage 2% pour garantir le fill."""
+    try:
+        if not HL_PRIVATE_KEY:
+            return {"error": "HL_PRIVATE_KEY manquante"}
+        if not _HL_SDK_AVAILABLE:
+            return {"error": "hyperliquid-python-sdk non installé"}
+
+        key      = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+        wallet   = eth_account.Account.from_key(key)
+        exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+
+        mids  = await get_all_mids_cached()
+        price = float(mids.get(asset, 0))
+        if price <= 0:
+            return {"error": f"Prix {asset} introuvable"}
+
+        slippage = 1.02 if is_buy else 0.98
+        raw_px   = price * slippage
+        magnitude = len(str(int(raw_px)))
+        decimals  = max(0, 5 - magnitude)
+        limit_px  = float(round(raw_px, decimals))
+
+        rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+        sz    = round(size, rules["decimals"])
+        sz    = max(sz, rules["min"])
+
+        logger.info(f"Market close {asset} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*price:.0f}")
+
+        loop   = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
+        )
+        logger.info(f"Market close {asset} résultat: {result}")
+        return result
+
+    except Exception as e:
+        logger.error(f"place_market_close {asset}: {e}")
+        return {"error": str(e)}
+
+
+async def compute_target_ratio(trader_address: str) -> float | None:
+    """Ratio bot_capital / trader_capital — calculé une fois au démarrage."""
+    try:
+        _, bot_balance    = await get_wallet_data(COPY_BOT_ADDRESS)
+        _, trader_balance = await get_wallet_data(trader_address)
+        bot_cap    = bot_balance.get("accountValue", 0)
+        trader_cap = trader_balance.get("accountValue", 0)
+        if trader_cap <= 0:
+            return None
+        ratio = bot_cap / trader_cap
+        logger.info(f"Ratio {trader_address[:12]}: bot ${bot_cap:.0f} / trader ${trader_cap:.0f} = {ratio:.4f}")
+        return ratio
+    except Exception as e:
+        logger.error(f"compute_target_ratio: {e}")
+        return None
+
+
+def compute_my_size(asset: str, trader_size: float, trader_price: float,
+                    ratio: float) -> float:
+    """Taille bot = trader_size × ratio, arrondie aux règles de l'asset."""
+    rules    = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+    raw_size = trader_size * ratio
+    sz       = max(round(raw_size, rules["decimals"]), rules["min"])
+    if sz * trader_price < 10:
+        sz = max(round(11.0 / trader_price, rules["decimals"]), rules["min"])
+    return sz
+
+
+# ── WebSocket par trader ────────────────────────────────────
+
+async def target_watch_ws(address: str, app) -> None:
+    """Un WebSocket indépendant par trader cible."""
+    logger.info(f"Target WS démarré → {address[:12]}")
+
+    while address in target_registry and target_registry[address]["active"]:
+        if target_registry[address].get("paused"):
+            await asyncio.sleep(5)
+            continue
+        try:
+            async with websockets.connect(HYPERLIQUID_WS, ping_interval=20, ping_timeout=10) as ws:
+                await ws.send(json.dumps({
+                    "method": "subscribe",
+                    "subscription": {"type": "userEvents", "user": address}
+                }))
+                logger.info(f"✅ Target WS connecté → {address[:12]}")
+                ratio = target_registry[address].get("ratio", 0)
+                await send_copy_notification(app,
+                    f"📡 *Target connecté*\n"
+                    f"`{address}`\n"
+                    f"Ratio: {ratio:.4f} | Réplication ACTIVE\n"
+                    f"Ouverture/Renfort → LIMIT -0.1% | Fermeture → MARKET"
+                )
+
+                async for raw_msg in ws:
+                    if address not in target_registry or not target_registry[address]["active"]:
+                        break
+                    if target_registry[address].get("paused"):
+                        continue
+                    try:
+                        msg = json.loads(raw_msg)
+                        await process_target_event(address, msg, app)
+                    except Exception as e:
+                        logger.warning(f"Target WS {address[:12]} parse: {e}")
+
+        except Exception as e:
+            if address not in target_registry or not target_registry[address]["active"]:
+                break
+            logger.warning(f"Target WS {address[:12]} déconnecté: {e} — reconnexion 5s")
+            await asyncio.sleep(5)
+
+    logger.info(f"Target WS arrêté → {address[:12]}")
+
+
+async def process_target_event(address: str, msg: dict, app) -> None:
+    """
+    Traite un fill du trader cible.
+    Ouverture/Renfort → LIMIT -0.1%
+    Fermeture partielle ou totale → MARKET, proportionnelle au ratio de fermeture
+    Conflit asset → ignoré, premier arrivé premier servi
+    """
+    data  = msg.get("data", {})
+    if not data:
+        return
+    fills = data.get("fills", [])
+
+    trader_info = target_registry.get(address)
+    if not trader_info:
+        return
+
+    ratio = trader_info.get("ratio", 1.0)
+
+    for fill in fills:
+        asset      = fill.get("coin", "")
+        side       = fill.get("side", "")
+        size       = float(fill.get("sz",  0) or 0)
+        price      = float(fill.get("px",  0) or 0)
+        dir_fill   = fill.get("dir", "")
+        closed_pnl = float(fill.get("closedPnl", 0) or 0)
+
+        if size <= 0 or price <= 0 or not asset:
+            continue
+
+        is_opening = "Open"  in dir_fill
+        is_closing = "Close" in dir_fill
+        is_buy     = side == "B"
+
+        logger.info(f"Target {address[:12]} → {dir_fill} {asset} sz:{size} px:{price:.4f}")
+
+        result = {}
+
+        # ── OUVERTURE ou RENFORT ────────────────────────────
+        if is_opening:
+
+            # Conflit : un autre trader a déjà une position sur cet asset ?
+            existing_pos = target_positions.get(asset)
+            if existing_pos and existing_pos["trader_addr"] != address:
+                owner_rank = target_registry.get(existing_pos["trader_addr"], {}).get("label", existing_pos["trader_addr"][:10])
+                await send_copy_notification(app,
+                    f"⚠️ *Conflit ignoré — {asset}*\n"
+                    f"Trader: `{address[:16]}...`\n"
+                    f"Asset déjà ouvert par: `{owner_rank}`\n"
+                    f"Signal ignoré — premier arrivé premier servi."
+                )
+                continue
+
+            # Vérifier marge
+            if not await check_margin_ok():
+                await send_copy_notification(app,
+                    f"⚠️ *Marge insuffisante*\nAsset: {asset} | {dir_fill}\nOrdre annulé."
+                )
+                continue
+
+            my_size = compute_my_size(asset, size, price, ratio)
+            result  = await place_limit_order(asset, is_buy, my_size, price, offset_pct=-0.1)
+
+            limit_px = price * (1 - 0.001) if is_buy else price * (1 + 0.001)
+
+            # Mémoriser ou cumuler (renfort)
+            is_reinforce = asset in target_positions and target_positions[asset]["trader_addr"] == address
+            if is_reinforce:
+                pos = target_positions[asset]
+                total_size       = pos["size"] + my_size
+                pos["entry"]     = (pos["entry"] * pos["size"] + price * my_size) / total_size
+                pos["size"]      = total_size
+            else:
+                target_positions[asset] = {
+                    "side":        "long" if is_buy else "short",
+                    "size":        my_size,
+                    "entry":       price,
+                    "trader_addr": address,
+                }
+
+            status = "✅" if "error" not in result else "❌"
+            emoji  = "📈" if is_buy else "📉"
+            label  = trader_info.get("label", address[:16])
+            await send_copy_notification(app,
+                f"{status} *{'🔁 Renfort' if is_reinforce else 'Ouverture'} {emoji} LIMIT*\n"
+                f"Asset:   *{asset}*\n"
+                f"Action:  {dir_fill}\n"
+                f"Taille:  {my_size} (~${my_size*price:.0f})\n"
+                f"Ref:     ${price:,.4f} → limit ${limit_px:,.4f}\n"
+                f"Trader:  `{label}`"
+                + (f"\n⚠️ {result['error']}" if "error" in result else "")
+            )
+
+        # ── FERMETURE PARTIELLE OU TOTALE ──────────────────
+        elif is_closing:
+
+            my_pos = target_positions.get(asset)
+            if not my_pos or my_pos["trader_addr"] != address:
+                logger.info(f"Target: pas de position bot sur {asset} (ignoré)")
+                continue
+
+            # Calculer le ratio de fermeture du trader
+            # On approche via le fill : size = ce que le trader ferme
+            # On récupère la taille totale du trader pour calculer le %
+            trader_pos_size = trader_info.get("open_sizes", {}).get(asset, size)
+            close_ratio     = min(size / max(trader_pos_size, 0.0001), 1.0)
+            my_close_size   = round(my_pos["size"] * close_ratio, SIZE_RULES.get(asset, SIZE_RULES["_default"])["decimals"])
+            my_close_size   = max(my_close_size, SIZE_RULES.get(asset, SIZE_RULES["_default"])["min"])
+
+            is_close_buy = my_pos["side"] == "short"  # inverse pour clôturer
+            result       = await place_market_close(asset, is_close_buy, my_close_size)
+
+            is_full_close = close_ratio >= 0.99
+            if is_full_close:
+                target_positions.pop(asset, None)
+                trader_info.get("open_sizes", {}).pop(asset, None)
+            else:
+                my_pos["size"] = round(my_pos["size"] - my_close_size,
+                                       SIZE_RULES.get(asset, SIZE_RULES["_default"])["decimals"])
+
+            status = "✅" if "error" not in result else "❌"
+            label  = trader_info.get("label", address[:16])
+            pnl_str = f" | PnL trader: ${closed_pnl:+,.2f}" if closed_pnl != 0 else ""
+            await send_copy_notification(app,
+                f"{status} *Clôture {'totale' if is_full_close else f'{close_ratio*100:.0f}%'} MARKET*\n"
+                f"Asset:   *{asset}*\n"
+                f"Fermé:   {my_close_size} (~${my_close_size*price:.0f}){pnl_str}\n"
+                f"Ratio:   {close_ratio*100:.0f}% de la position\n"
+                f"Trader:  `{label}`"
+                + (f"\n⚠️ {result['error']}" if "error" in result else "")
+            )
+
+        # Mettre à jour open_sizes du trader (tracking taille trader)
+        if is_opening:
+            sizes = trader_info.setdefault("open_sizes", {})
+            sizes[asset] = sizes.get(asset, 0) + size
+        elif is_closing:
+            sizes = trader_info.get("open_sizes", {})
+            remaining = sizes.get(asset, 0) - size
+            if remaining <= 0:
+                sizes.pop(asset, None)
+            else:
+                sizes[asset] = remaining
+
+        # Log
+        log = {
+            "time":    datetime.now().strftime("%d/%m %H:%M"),
+            "asset":   asset,
+            "dir":     dir_fill,
+            "size":    size,
+            "price":   price,
+            "trader":  address[:12],
+            "result":  "ok" if "error" not in result else result.get("error", "?")[:30],
+        }
+        target_trades_log.append(log)
+        if len(target_trades_log) > 200:
+            target_trades_log[:] = target_trades_log[-200:]
+
+
+# ── Sync positions existantes (optionnel) ───────────────────
 
 async def target_sync_positions(address: str, app) -> None:
-    logger.info(f"Target sync — {address[:12]}...")
+    """
+    /target_sync — Ouvre les positions DÉJÀ ouvertes du trader en LIMIT -0.1%.
+    Optionnel — à appeler manuellement après /target si tu veux entrer sur
+    les positions en cours.
+    """
+    trader_info = target_registry.get(address)
+    if not trader_info:
+        return
+
+    ratio = trader_info.get("ratio", 1.0)
+    logger.info(f"Target sync positions → {address[:12]}")
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1999,22 +2347,20 @@ async def target_sync_positions(address: str, app) -> None:
             ) as resp:
                 state = await resp.json()
 
-        # [OPT] Cache prix
         mids = await get_all_mids_cached()
-
-        positions = [
+        open_pos = [
             p.get("position", {}) for p in state.get("assetPositions", [])
             if float(p.get("position", {}).get("szi", 0) or 0) != 0
         ]
 
-        if not positions:
+        if not open_pos:
             await send_copy_notification(app,
-                f"🎯 *Target Wallet actif*\n`{address[:20]}...`\nAucune position ouverte — surveillance active."
+                f"ℹ️ *Target Sync — {address[:16]}...*\nAucune position ouverte sur ce wallet."
             )
             return
 
         results = []
-        for p in positions:
+        for p in open_pos:
             asset  = p.get("coin", "")
             sz     = float(p.get("szi", 0) or 0)
             is_buy = sz > 0
@@ -2023,209 +2369,259 @@ async def target_sync_positions(address: str, app) -> None:
                 results.append(f"⚠️ {asset}: prix introuvable")
                 continue
 
-            pos_value        = abs(sz) * price
-            my_size, lev, my_usd = await get_proportional_size(asset, address, pos_value, price)
-            result           = await place_order(asset, is_buy, my_size, "Target Sync", lev)
-            status           = "✅" if "error" not in result else "❌"
-            side_str         = "Long 📈" if is_buy else "Short 📉"
-            results.append(f"{status} {asset} {side_str} x{lev} ~${my_usd:.0f}")
+            # Conflit ?
+            existing = target_positions.get(asset)
+            if existing and existing["trader_addr"] != address:
+                results.append(f"⚠️ {asset}: conflit avec `{existing['trader_addr'][:10]}`")
+                continue
 
-            target_state["positions"][asset] = {
-                "side": "long" if is_buy else "short",
-                "size": my_size, "entry": price,
-            }
+            my_size = compute_my_size(asset, abs(sz), price, ratio)
+            result  = await place_limit_order(asset, is_buy, my_size, price, offset_pct=-0.1)
+            status  = "✅" if "error" not in result else "❌"
+            side_str = "Long 📈" if is_buy else "Short 📉"
+            results.append(f"{status} {asset} {side_str} {my_size} (~${my_size*price:.0f})")
+
+            if "error" not in result:
+                target_positions[asset] = {
+                    "side":        "long" if is_buy else "short",
+                    "size":        my_size,
+                    "entry":       price,
+                    "trader_addr": address,
+                }
+                trader_info.setdefault("open_sizes", {})[asset] = abs(sz)
 
         await send_copy_notification(app,
-            f"🎯 *Target Wallet — Sync*\n`{address[:20]}...`\n\n" + "\n".join(results)
+            f"🔄 *Target Sync — {address[:16]}...*\n\n" + "\n".join(results)
         )
 
     except Exception as e:
-        logger.error(f"target_sync erreur: {e}")
-        await send_copy_notification(app, f"❌ Target sync erreur: `{str(e)[:100]}`")
+        logger.error(f"target_sync_positions {address[:12]}: {e}")
+        await send_copy_notification(app, f"❌ Sync erreur: `{str(e)[:100]}`")
 
 
-async def target_watch_ws(address: str, app) -> None:
-    logger.info(f"Target WebSocket → {address[:12]}...")
-
-    while target_state["active"]:
-        if target_state["paused"]:
-            await asyncio.sleep(5)
-            continue
-        try:
-            async with websockets.connect(HYPERLIQUID_WS, ping_interval=20, ping_timeout=10) as ws:
-                await ws.send(json.dumps({
-                    "method": "subscribe",
-                    "subscription": {"type": "userEvents", "user": address}
-                }))
-                logger.info(f"✅ Target WebSocket connecté → {address[:12]}")
-
-                async for raw_msg in ws:
-                    if not target_state["active"]:
-                        break
-                    if target_state["paused"]:
-                        continue
-                    try:
-                        msg   = json.loads(raw_msg)
-                        data  = msg.get("data", {})
-                        fills = data.get("fills", [])
-
-                        for fill in fills:
-                            asset    = fill.get("coin", "")
-                            side     = fill.get("side", "")
-                            size     = float(fill.get("sz", 0) or 0)
-                            price    = float(fill.get("px", 0) or 0)
-                            dir_fill = fill.get("dir", "")
-
-                            if size <= 0 or price <= 0:
-                                continue
-
-                            is_opening = "Open" in dir_fill
-                            is_closing = "Close" in dir_fill
-                            is_buy     = side == "B"
-
-                            if is_opening:
-                                pos_value            = size * price
-                                my_size, lev, my_usd = await get_proportional_size(asset, address, pos_value, price)
-                                result               = await place_order(asset, is_buy, my_size, dir_fill, lev)
-                                target_state["positions"][asset] = {
-                                    "side": "long" if is_buy else "short",
-                                    "size": my_size, "entry": price, "usd": my_usd,
-                                }
-                            elif is_closing:
-                                my_pos = target_state["positions"].get(asset)
-                                if not my_pos:
-                                    continue
-                                my_size = my_pos["size"]
-                                is_buy  = my_pos["side"] == "short"
-                                my_usd  = 0.0
-                                result  = await place_order(asset, is_buy, my_size, dir_fill, 1)
-                                target_state["positions"].pop(asset, None)
-                            else:
-                                continue
-
-                            status = "✅" if "error" not in result else "❌"
-                            emoji  = "📈" if is_buy else "📉"
-                            log    = {
-                                "time": datetime.now().strftime("%d/%m %H:%M"),
-                                "asset": asset, "dir": dir_fill,
-                                "size": my_size, "price": price,
-                                "result": "ok" if "error" not in result else "erreur",
-                            }
-                            target_state["trades_log"].append(log)
-                            if len(target_state["trades_log"]) > 100:
-                                target_state["trades_log"] = target_state["trades_log"][-100:]
-
-                            notif = (
-                                f"{status} *Target Copy {emoji}*\n"
-                                f"Asset:  *{asset}*\n"
-                                f"Action: {dir_fill}\n"
-                                f"Taille: {my_size} (~${my_usd:.0f})\n"
-                                f"Prix:   ${price:,.2f}\n"
-                                f"Wallet: `{address[:16]}...`"
-                            )
-                            if "error" in result:
-                                notif += f"\n⚠️ {result['error']}"
-                            await send_copy_notification(app, notif)
-
-                    except Exception as e:
-                        logger.warning(f"Target WS parse erreur: {e}")
-
-        except Exception as e:
-            if not target_state["active"]:
-                break
-            logger.warning(f"Target WS déconnecté: {e} — reconnexion 5s")
-            await asyncio.sleep(5)
-
-    logger.info("Target WebSocket arrêté")
-
+# ── Commandes Telegram ──────────────────────────────────────
 
 async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /target 0xADRESSE [label]
+    Lance surveillance + réplication immédiate.
+    Optionnel: label court pour identifier le trader (ex: /target 0xABC... Scalper1)
+    """
     if not is_authorized(update):
         return
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/target 0xADRESSE`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⚠️ Usage: `/target 0xADRESSE [label]`\n"
+            "Exemple: `/target 0xABC...123 Scalper1`",
+            parse_mode="Markdown"
+        )
         return
+
     address = context.args[0].strip().lower()
     if not address.startswith("0x") or len(address) != 42:
         await update.message.reply_text("❌ Adresse invalide. Format: `0x...` (42 caractères)", parse_mode="Markdown")
         return
-    if target_state["ws_task"] and not target_state["ws_task"].done():
-        target_state["active"] = False
-        target_state["ws_task"].cancel()
-        await asyncio.sleep(1)
-    target_state.update({
-        "address": address, "active": True, "paused": False, "positions": {}
-    })
+
+    label = " ".join(context.args[1:]) if len(context.args) > 1 else address[:16] + "..."
+
+    # Déjà en surveillance ?
+    if address in target_registry and target_registry[address]["active"]:
+        await update.message.reply_text(
+            f"ℹ️ `{address[:20]}...` déjà en surveillance.",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Limite MAX_TARGETS
+    active_count = sum(1 for t in target_registry.values() if t["active"])
+    if active_count >= MAX_TARGETS:
+        await update.message.reply_text(
+            f"⚠️ Maximum {MAX_TARGETS} targets simultanés atteint.\n"
+            f"Stoppe un wallet avec `/target_stop 0xADRESSE` avant d'en ajouter un.",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text("⏳ Calcul du ratio capital...", parse_mode="Markdown")
+
+    ratio = await compute_target_ratio(address)
+    if ratio is None:
+        await update.message.reply_text(
+            "❌ Impossible de calculer le ratio (API indisponible).\nRéessaie.",
+            parse_mode="Markdown"
+        )
+        return
+
+    _, bot_balance    = await get_wallet_data(COPY_BOT_ADDRESS)
+    _, trader_balance = await get_wallet_data(address)
+    bot_cap    = bot_balance.get("accountValue", 0)
+    trader_cap = trader_balance.get("accountValue", 0)
+
+    target_registry[address] = {
+        "active":     True,
+        "paused":     False,
+        "label":      label,
+        "ratio":      ratio,
+        "open_sizes": {},
+        "ws_task":    None,
+    }
+
+    task = asyncio.create_task(target_watch_ws(address, context.application))
+    target_registry[address]["ws_task"] = task
+
     await update.message.reply_text(
-        f"🎯 *Target Wallet Manuel activé*\n`{address}`\n\nSynchronisation en cours...",
+        f"🎯 *Target activé — {label}*\n"
+        f"`{address}`\n\n"
+        f"💼 Ton capital:    ${bot_cap:,.0f}\n"
+        f"🎯 Capital trader: ${trader_cap:,.0f}\n"
+        f"📐 Ratio:          {ratio:.4f}\n\n"
+        f"*Comportement:*\n"
+        f"• Ouverture/Renfort → LIMIT à -0.1%\n"
+        f"• Fermeture → MARKET immédiat (proportionnel)\n\n"
+        f"💡 `/target_sync {address}` pour copier les positions déjà ouvertes.\n"
+        f"🛑 `/target_stop {address}` pour arrêter.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_target_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /target_sync 0xADRESSE
+    Ouvre les positions déjà ouvertes du trader en LIMIT -0.1%.
+    """
+    if not is_authorized(update):
+        return
+    if not context.args:
+        # Si un seul target actif, on prend celui-là
+        active = [a for a, t in target_registry.items() if t["active"]]
+        if len(active) == 1:
+            address = active[0]
+        else:
+            await update.message.reply_text(
+                "⚠️ Usage: `/target_sync 0xADRESSE`",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        address = context.args[0].strip().lower()
+
+    if address not in target_registry or not target_registry[address]["active"]:
+        await update.message.reply_text(
+            f"⚠️ `{address[:20]}...` n'est pas en surveillance.\nLance d'abord `/target {address}`.",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔄 Sync positions de `{address[:20]}...` en cours...",
         parse_mode="Markdown"
     )
     await target_sync_positions(address, context.application)
-    target_state["ws_task"] = asyncio.create_task(target_watch_ws(address, context.application))
-
-
-async def cmd_target_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    if not target_state["active"]:
-        await update.message.reply_text("⏸ Aucun target actif.")
-        return
-    target_state["paused"] = True
-    await update.message.reply_text(
-        f"⏸ *Target en pause*\n`{target_state['address'][:20]}...`\n"
-        f"Lance `/target {target_state['address']}` pour reprendre.",
-        parse_mode="Markdown"
-    )
 
 
 async def cmd_target_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /target_stop 0xADRESSE  → stoppe un trader spécifique
+    /target_stop             → stoppe TOUS les traders
+    """
     if not is_authorized(update):
         return
-    if not target_state["active"]:
-        await update.message.reply_text("⏸ Aucun target actif.")
+
+    if context.args:
+        address = context.args[0].strip().lower()
+        targets_to_stop = [address] if address in target_registry else []
+        if not targets_to_stop:
+            await update.message.reply_text(f"⚠️ `{address[:20]}...` non trouvé.", parse_mode="Markdown")
+            return
+    else:
+        targets_to_stop = list(target_registry.keys())
+
+    if not targets_to_stop:
+        await update.message.reply_text("ℹ️ Aucun target actif.")
         return
-    addr = target_state["address"]
-    target_state["active"] = False
-    target_state["paused"] = False
-    if target_state["ws_task"] and not target_state["ws_task"].done():
-        target_state["ws_task"].cancel()
-    target_state.update({"ws_task": None, "address": None, "positions": {}})
+
+    stopped = []
+    for addr in targets_to_stop:
+        info = target_registry.get(addr, {})
+        task = info.get("ws_task")
+        if task and not task.done():
+            task.cancel()
+        target_registry.pop(addr, None)
+        # Libérer les positions associées
+        for asset, pos in list(target_positions.items()):
+            if pos["trader_addr"] == addr:
+                target_positions.pop(asset, None)
+        label = info.get("label", addr[:16])
+        stopped.append(f"🛑 {label} `{addr[:16]}...`")
+        logger.info(f"Target arrêté: {addr[:12]}")
+
     await update.message.reply_text(
-        f"🛑 *Target arrêté*\n`{addr[:20]}...`\nPositions conservées — gère-les manuellement.",
+        f"*Targets arrêtés:*\n" + "\n".join(stopped) + "\n\n"
+        f"_Positions ouvertes conservées — gère-les manuellement._",
         parse_mode="Markdown"
     )
 
 
 async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche l'état de tous les traders en surveillance."""
     if not is_authorized(update):
         return
-    if not target_state["address"]:
+
+    active_targets = {a: t for a, t in target_registry.items() if t["active"]}
+
+    if not active_targets:
         await update.message.reply_text(
-            "⏸ *Target inactif*\nUtilise `/target 0x...` pour démarrer.",
+            "⏸ *Aucun target actif*\n"
+            "Lance `/target 0xADRESSE` pour démarrer.",
             parse_mode="Markdown"
         )
         return
-    status_emoji = "⏸ EN PAUSE" if target_state["paused"] else ("🟢 ACTIF" if target_state["active"] else "🔴 INACTIF")
+
     lines = [
-        "🎯 *TARGET WALLET MANUEL*",
-        f"Status: {status_emoji}",
-        f"Wallet: `{target_state['address']}`",
-        "",
-        "📡 *Positions copiées:*",
+        f"🎯 *TARGET STATUS — {len(active_targets)}/{MAX_TARGETS} actifs*",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
-    if target_state["positions"]:
-        for asset, pos in target_state["positions"].items():
-            emoji = "📈" if pos["side"] == "long" else "📉"
-            lines.append(f"{emoji} {asset}: {pos['side'].upper()} sz:{pos['size']} @ ${pos['entry']:,.2f}")
-    else:
-        lines.append("_Aucune position active_")
-    if target_state["trades_log"]:
+
+    for addr, info in active_targets.items():
+        mode = "⏸ PAUSE" if info.get("paused") else "🟢 ACTIF"
+        lines.append(
+            f"*{info['label']}* {mode}\n"
+            f"`{addr}`\n"
+            f"Ratio: {info['ratio']:.4f}"
+        )
+        # Positions de ce trader
+        my_pos = [(a, p) for a, p in target_positions.items() if p["trader_addr"] == addr]
+        if my_pos:
+            for asset, pos in my_pos:
+                emoji = "📈" if pos["side"] == "long" else "📉"
+                lines.append(f"  {emoji} {asset} {pos['side'].upper()} sz:{pos['size']} @ ${pos['entry']:,.2f}")
+        else:
+            lines.append("  _Aucune position active_")
         lines.append("")
-        lines.append(f"📋 *Derniers trades ({min(3, len(target_state['trades_log']))}):*")
-        for t in target_state["trades_log"][-3:]:
-            s = "✅" if t["result"] == "ok" else "❌"
-            lines.append(f"{s} {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.0f}")
+
+    # Positions consolidées (vue globale)
+    if target_positions:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📊 *Positions bot ({len(target_positions)}):*")
+        for asset, pos in target_positions.items():
+            owner = target_registry.get(pos["trader_addr"], {}).get("label", pos["trader_addr"][:10])
+            emoji = "📈" if pos["side"] == "long" else "📉"
+            lines.append(f"  {emoji} *{asset}* {pos['side'].upper()} sz:{pos['size']} — via {owner}")
+
+    # Derniers trades
+    if target_trades_log:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        recent = target_trades_log[-5:]
+        lines.append(f"📋 *Derniers signaux ({len(recent)}):*")
+        for t in recent:
+            lines.append(f"  {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.2f} — {t['trader']}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("_/target_stop 0x... | /target_sync 0x..._")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 
 
 import urllib.request
@@ -2291,11 +2687,11 @@ def main():
 
     # Target Wallet Manuel
     app.add_handler(CommandHandler("target",        cmd_target))
-    app.add_handler(CommandHandler("target_pause",  cmd_target_pause))
+    app.add_handler(CommandHandler("target_sync",   cmd_target_sync))
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.2 démarré — Top 5 multi-asset, filtres ajustés!")
+    logger.info("🤖 SakaiBot v4.4 démarré — Multi-target, limit -0.1%, clôture market!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
