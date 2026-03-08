@@ -115,7 +115,7 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 # SCORING v4
 # ============================================================
-TRADEBOT_MIN_TRADES      = 5
+TRADEBOT_MIN_TRADES      = 1     # [v4.5] log(n) gere nativement score=0 pour 0 trade
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
 TRADEBOT_MAX_DRAWDOWN    = 85.0   # filtre dur MDD
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
@@ -708,9 +708,7 @@ def compute_new_score(pnl_7j: float, mdd: float, winrate_7j: float,
       - WinRate < 50% → score quasiment nul (incopiable)
       - Consistance 7j/30j récompense la régularité
     """
-    if n_trades_7j < TRADEBOT_MIN_TRADES:
-        return 0.0
-
+    # [v4.5] Guard n_trades supprime — log1p(0)=0 gere nativement score=0
     # ROI 7j en % (si capital inconnu, fallback sur PnL brut normalisé)
     if capital > 0:
         roi_7j = (pnl_7j / capital) * 100
@@ -1025,10 +1023,7 @@ async def fetch_top_traders_hl() -> list:
                         )
                         return None
 
-                    pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
-                    if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
-                        logger.info(f"Exclu {address[:12]}: {n_trades_7j} trades 7j, ratio {pnl_mdd_ratio:.1f}")
-                        return None
+                    # [v4.5] Filtre n_trades/pnl_mdd_ratio supprime — log1p(n) gere nativement
 
                     logger.info(
                         f"✅ Qualifié {address[:12]}: trades_at={n_trades_at} "
@@ -1097,7 +1092,7 @@ def rank_and_score_traders(traders: list) -> list:
     avant = len(traders)
 
     traders = [t for t in traders if t.get("winrate", 0) >= 50]
-    traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= 25]
+    traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= TRADEBOT_MAX_TRADES_DAY]  # [v4.5] etait 25
     traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
     traders = [t for t in traders if t.get("pnl", 0) > 0]
     traders = [t for t in traders if t.get("pnl_at", 0) > 0]
@@ -1123,7 +1118,10 @@ def rank_and_score_traders(traders: list) -> list:
 
         # Pénalité MDD légère — pénalise sans éliminer
         # MDD 30% → ×0.85 | MDD 60% → ×0.70 | MDD 90% → ×0.55
-        mdd_factor = max(0.3, 1.0 - (t.get("mdd", 0) / 200.0))
+        mdd        = t.get("mdd", 0)
+        mdd_factor = max(0.3, 1.0 - (mdd / 200.0))
+        if mdd > 60:
+            mdd_factor *= 0.5    # [v4.5] penalite hard MDD > 60%
         return roi_30j * consistance * mdd_factor
 
     raw_scores = [compute_score_v4(t) for t in traders]
