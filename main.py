@@ -1075,45 +1075,64 @@ async def fetch_top_traders_hl() -> list:
 
 def rank_and_score_traders(traders: list) -> list:
     """
-    [OPT] Fusion apply_exclusion_filters + scoring.
-    Filtre MDD≤60% et PnL allTime > 0, puis normalise le score sur 100.
+    Scoring v4 — ROI% 30j × consistance allTime.
+
+    Filtres durs :
+      - MDD <= TRADEBOT_MAX_DRAWDOWN (85%)
+      - WR >= 50%
+      - Trades/j <= 25
+      - PnL 7j > 0
+      - PnL 30j > 0
+      - PnL allTime > 0
+
+    Score = roi_30j × facteur_consistance
+      - roi_30j     : ROI% sur 30j (performance récente normalisée par capital)
+      - consistance : si PnL 30j > 60% du PnL allTime → one-shot → pénalité
+        consistance = 1.0 si pnl_30j <= 40% pnl_at (trader régulier)
+        consistance = 0.5 si pnl_30j entre 40-60% pnl_at
+        consistance = 0.2 si pnl_30j > 60% pnl_at (one-shot suspect)
     """
     if not traders:
         return []
 
-    # Filtres de sécurité intégrés
-    traders = [
-        t for t in traders
-        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_at", 0) > 0
-    ]
+    avant = len(traders)
+
+    traders = [t for t in traders if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN]
+    traders = [t for t in traders if t.get("winrate", 0) >= 50]
+    traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= 25]
+    traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
+    traders = [t for t in traders if t.get("pnl", 0) > 0]
+    traders = [t for t in traders if t.get("pnl_at", 0) > 0]
+
+    logger.info(f"Filtres v4: {len(traders)}/{avant} traders retenus")
     if not traders:
         return []
 
-    # Filtre dur WinRate < 45% — incopiable quelle que soit la perf brute
-    traders = [t for t in traders if t.get("winrate", 0) >= 45]
-    if not traders:
-        return []
+    def compute_score_v4(t):
+        pnl_30j  = t.get("pnl", 0)
+        pnl_at   = max(t.get("pnl_at", 1), 1)
+        capital  = max(t.get("capital", 1), 1)
+        roi_30j  = (pnl_30j / capital) * 100  # ROI% 30j
 
-    raw_scores = [
-        compute_new_score(
-            pnl_7j      = t.get("pnl_7j", 0),
-            mdd         = t.get("mdd", 1),
-            winrate_7j  = t.get("winrate", 50),
-            n_trades_7j = t.get("n_trades_7j", 0),
-            pnl_30j     = t.get("pnl", 0),
-            roi_30j     = t.get("roi_30j", t.get("roi", 0)),
-            capital     = t.get("capital", 0),
-        )
-        for t in traders
-    ]
+        # Consistance : part du PnL allTime réalisée ce mois
+        part_30j = pnl_30j / pnl_at
+        if part_30j <= 0.60:
+            consistance = 1.0   # trader régulier sur HL (plateforme récente)
+        elif part_30j <= 0.80:
+            consistance = 0.6   # mois fort mais historique partiel
+        else:
+            consistance = 0.3   # quasi tout le PnL allTime ce mois = one-shot
 
+        return roi_30j * consistance
+
+    raw_scores = [compute_score_v4(t) for t in traders]
     max_raw = max(raw_scores) if raw_scores else 1.0
-    if max_raw == 0:
+    if max_raw <= 0:
         max_raw = 1.0
 
     scored = [
-        {**t, "score": round((raw / max_raw) * 100, 1), "score_raw": round(raw, 4)}
-        for t, raw in zip(traders, raw_scores)
+        {**t, "score": round((r / max_raw) * 100, 1), "score_raw": round(r, 4)}
+        for t, r in zip(traders, raw_scores)
     ]
     return sorted(scored, key=lambda x: x["score"], reverse=True)
 
@@ -1134,38 +1153,35 @@ def build_top5_report(top5: list) -> str:
         "🏆 *SakaiBot — Top 5 Traders*",
         f"📅 {now}",
         "━━━━━━━━━━━━━━━━━━━━",
-        "*📊 Score = ROI% × Consistance × WinRate × Anti-scalper × MDD*",
+        "*📊 Tri: PnL 30j | Filtres: MDD<85% | WR≥50% | ≤25/j | PnL 7j>0*",
         "",
     ]
     for i, t in enumerate(top5, 1):
-        score   = t["score"]
-        verdict = "🟢 FORT" if score >= 70 else ("🟡 MOYEN" if score >= 40 else "🔴 FAIBLE")
+        trades_per_day = t.get("n_trades_7j", 0) / 7.0
 
         # Badges
         badges = []
-        trades_per_day = t.get("n_trades_7j", 0) / 7
-        if trades_per_day > 30:
-            badges.append("⚡ SCALPER")
         if t.get("winrate", 0) >= 65:
             badges.append("🎯 WR>65%")
         if t.get("mdd", 100) <= 40:
             badges.append("🛡️ MDD<40%")
-        consistency = t.get("pnl_30j", t.get("pnl", 0)) / max(t.get("pnl_7j", 1), 1)
-        if consistency >= 3.0:
+        if t.get("mdd", 100) <= 60:
+            badges.append("✅ MDD stable")
+        pnl_30j = t.get("pnl", 0)
+        pnl_7j  = t.get("pnl_7j", 1)
+        if pnl_30j > 0 and pnl_7j > 0 and (pnl_30j / pnl_7j) >= 3.0:
             badges.append("📈 RÉGULIER")
         badge_str = " " + " ".join(badges) if badges else ""
 
         cap_str = f"${t.get('capital', 0):,.0f}" if t.get("capital") else "N/A"
 
-        lines.append(f"*#{i}* — Score: *{score}/100* {verdict}{badge_str}")
-        lines.append(f"PnL 7j: ${t.get('pnl_7j',0):+,.0f} | WR 7j: {t.get('winrate',0):.0f}% | Trades 7j: {t.get('n_trades_7j',0)} ({trades_per_day:.0f}/j)")
-        lines.append(f"MDD: {t['mdd']:.0f}% | PnL 30j: ${t.get('pnl',0):+,.0f} | Capital: {cap_str}")
+        lines.append(f"*#{i}*{badge_str}")
+        lines.append(f"PnL 7j: ${t.get('pnl_7j',0):+,.0f} | WR: {t.get('winrate',0):.0f}% | {trades_per_day:.0f} trades/j")
+        lines.append(f"MDD: {t['mdd']:.0f}% | PnL 30j: ${pnl_30j:+,.0f} | Capital: {cap_str}")
         lines.append(f"`{t['address']}`")
         lines.append("")
-    avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"Score moyen: *{avg}/100*")
-    lines.append(f"_Ces 5 traders copiés sur tous leurs assets_")
+    lines.append(f"_Ces traders sont classés par performance réelle (PnL 30j)_")
     return "\n".join(lines)
 
 
