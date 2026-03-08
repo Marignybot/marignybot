@@ -513,22 +513,33 @@ def format_positions(positions: list, balance: dict) -> str:
     return "\n".join(lines)
 
 
+def escape_md(text: str) -> str:
+    """Échappe les caractères spéciaux Markdown v1 dans du texte dynamique externe."""
+    for c in ['_', '*', '`', '[', ']']:
+        text = text.replace(c, f'\\{c}')
+    return text
+
+
 def format_daily_summary(news: list, trending: list) -> str:
     now   = datetime.now().strftime("%d/%m/%Y %H:%M")
-    lines = [f"🌅 *Resume Crypto — {now}*\n", "━━━━━━━━━━━━━━━━━━━━", "📰 *3 Actus du Jour*\n"]
+    lines = [f"🌅 *Résumé Crypto — {now}*\n", "━━━━━━━━━━━━━━━━━━━━", "📰 *3 Actus du Jour*\n"]
     if news:
         for i, n in enumerate(news, 1):
-            lines.append(f"{i}. [{n['title']}]({n['url']})\n")
+            title = escape_md(n['title'])
+            url   = n['url']
+            lines.append(f"{i}. [{title}]({url})\n")
     else:
         lines.append("_Indisponible._\n")
     lines += ["━━━━━━━━━━━━━━━━━━━━", "🔥 *Top 3 Trending*\n"]
     if trending:
         for i, t in enumerate(trending, 1):
-            c = t.get("change", 0) or 0
-            lines.append(f"{i}. *{t['name']}* (${t['symbol']}) — Rank #{t['rank']} {'🟢' if c >= 0 else '🔴'} {c:+.1f}%\n")
+            c    = t.get("change", 0) or 0
+            name = escape_md(str(t['name']))
+            sym  = escape_md(str(t['symbol']))
+            lines.append(f"{i}. *{name}* (${sym}) — Rank \\#{t['rank']} {'🟢' if c >= 0 else '🔴'} {c:+.1f}%\n")
     else:
         lines.append("_Indisponible._\n")
-    lines += ["━━━━━━━━━━━━━━━━━━━━", "_Bonne journee depuis Vallauris! 🌴_"]
+    lines += ["━━━━━━━━━━━━━━━━━━━━", "_Bonne journée depuis Vallauris\\! 🌴_"]
     return "\n".join(lines)
 
 
@@ -2195,8 +2206,8 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     import time as _time
 
-    # Délai anti-conflit au démarrage (Railway peut lancer 2 instances)
-    _time.sleep(3)
+    # Anti-conflit Railway : attendre que l'ancienne instance libère le slot
+    _time.sleep(5)
 
     app = (
         Application.builder()
@@ -2204,13 +2215,14 @@ def main():
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
+        .pool_timeout(30)
         .build()
     )
 
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit détecté (autre instance) — attente 15s...")
-            await asyncio.sleep(15)
+            logger.warning("⚠️ Conflit détecté (autre instance) — attente 20s...")
+            await asyncio.sleep(20)
         else:
             logger.error(f"Erreur: {context.error}")
 
