@@ -728,6 +728,7 @@ async def fetch_top_traders_hl() -> list:
                 winrate_7j  = (wins_7j / max(n_trades_7j, 1)) * 100
 
                 # Récupérer aussi le nb de trades réels via userFills (7j)
+                n_trades_at = 0  # total allTime
                 try:
                     cutoff_7j = now_ms - (7 * 86400 * 1000)
                     async with session.post(
@@ -737,7 +738,10 @@ async def fetch_top_traders_hl() -> list:
                     ) as resp2:
                         fills = await resp2.json()
                     if isinstance(fills, list):
-                        # Trades fermés sur 7j (closedPnl != 0 = trade terminé)
+                        # Total allTime
+                        n_trades_at = len([f for f in fills if isinstance(f, dict)
+                                           and float(f.get("closedPnl", 0) or 0) != 0])
+                        # Trades fermés sur 7j
                         fills_7j    = [f for f in fills if isinstance(f, dict)
                                        and f.get("time", 0) >= cutoff_7j
                                        and float(f.get("closedPnl", 0) or 0) != 0]
@@ -806,25 +810,31 @@ async def fetch_top_traders_hl() -> list:
                     return None
 
                 # ── Eligibilité minimum ─────────────────────────────────
+                # 20 trades minimum sur l'historique total (élimine les chanceux)
+                if n_trades_at < 20:
+                    logger.debug(f"Exclu {address[:12]}: seulement {n_trades_at} trades allTime")
+                    return None
+
                 pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
                 if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
-                    logger.debug(f"Exclu {address[:12]}: {n_trades_7j} trades, ratio {pnl_mdd_ratio:.1f}")
+                    logger.debug(f"Exclu {address[:12]}: {n_trades_7j} trades 7j, ratio {pnl_mdd_ratio:.1f}")
                     return None
 
                 # Win rate : plus de filtre dur — composante du score uniquement
 
                 return {
-                    "address":     address,
-                    "pnl":         pnl_30j,          # affiché dans le rapport
-                    "pnl_7j":      round(pnl_7j, 2),
-                    "pnl_at":      pnl_at,
-                    "roi":         round(roi_30j, 1),
-                    "roe_at":      round(roe_at, 1),
-                    "mdd":         round(worst_mdd, 1),
-                    "winrate":     round(winrate_7j, 1),
-                    "winrate_30j": round((sum(1 for i in range(1, len(pnl_h30)) if pnl_h30[i] > pnl_h30[i-1]) / max(len(pnl_h30)-1, 1)) * 100, 1),
-                    "n_trades_7j": n_trades_7j,
-                    "roi_30j":     round(roi_30j, 1),
+                    "address":      address,
+                    "pnl":          pnl_30j,
+                    "pnl_7j":       round(pnl_7j, 2),
+                    "pnl_at":       pnl_at,
+                    "roi":          round(roi_30j, 1),
+                    "roe_at":       round(roe_at, 1),
+                    "mdd":          round(worst_mdd, 1),
+                    "winrate":      round(winrate_7j, 1),
+                    "winrate_30j":  round((sum(1 for i in range(1, len(pnl_h30)) if pnl_h30[i] > pnl_h30[i-1]) / max(len(pnl_h30)-1, 1)) * 100, 1),
+                    "n_trades_7j":  n_trades_7j,
+                    "n_trades_at":  n_trades_at,
+                    "roi_30j":      round(roi_30j, 1),
                 }
             except Exception as e:
                 logger.warning(f"Portfolio {address[:12]}... erreur: {e}")
@@ -900,7 +910,7 @@ def build_top5_report(top5: list) -> str:
         bonus   = " ✨+30j" if t.get("roi_30j", 0) >= 20 and t.get("pnl", 0) > 0 else ""
         lines.append(f"*#{i}* — Score: *{t['score']}/100* {verdict}{bonus}")
         lines.append(f"PnL 7j: ${t.get('pnl_7j',0):+,.0f} | WR 7j: {t.get('winrate',0):.0f}% | Trades 7j: {t.get('n_trades_7j',0)}")
-        lines.append(f"MDD: {t['mdd']:.0f}% | PnL 30j: ${t.get('pnl',0):+,.0f} | ROI 30j: {t.get('roi',0):.0f}%")
+        lines.append(f"MDD: {t['mdd']:.0f}% | PnL 30j: ${t.get('pnl',0):+,.0f} | Trades total: {t.get('n_trades_at',0)}")
         lines.append(f"`{t['address']}`")
         lines.append("")
     avg = round(sum(t["score"] for t in top5) / len(top5), 1) if top5 else 0
