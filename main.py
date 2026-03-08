@@ -2876,47 +2876,35 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    lines = [
-        f"🎯 *TARGET STATUS — {len(active_targets)}/{MAX_TARGETS} actifs*",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+    lines = [f"🎯 *TARGETS — {len(active_targets)}/{MAX_TARGETS}*"]
 
     for addr, info in active_targets.items():
-        mode = "⏸ PAUSE" if info.get("paused") else "🟢 ACTIF"
-        lines.append(
-            f"*{info['label']}* {mode}\n"
-            f"`{addr}`\n"
-            f"Ratio: {info['ratio']:.4f}"
-        )
-        # Positions de ce trader
+        mode   = "⏸" if info.get("paused") else "🟢"
+        label  = info.get("label", addr[:16])
+        short  = addr[:8] + "..." + addr[-6:]
+        ratio  = info.get("ratio", 0)
         my_pos = [(a, p) for a, p in target_positions.items() if p["trader_addr"] == addr]
+
+        lines.append(f"\n{mode} *{label}* `{short}`  ratio {ratio:.4f}")
         if my_pos:
             for asset, pos in my_pos:
-                emoji = "📈" if pos["side"] == "long" else "📉"
-                lines.append(f"  {emoji} {asset} {pos['side'].upper()} sz:{pos['size']} @ ${pos['entry']:,.2f}")
+                side_emoji = "📈" if pos["side"] == "long" else "📉"
+                size       = abs(float(pos["size"]))
+                lines.append(f"  {side_emoji} {asset} {pos['side'].upper()}  {size:.4f}  @ ${pos['entry']:,.2f}")
         else:
-            lines.append("  _Aucune position active_")
-        lines.append("")
+            lines.append("  _aucune position_")
 
-    # Positions consolidées (vue globale)
-    if target_positions:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"📊 *Positions bot ({len(target_positions)}):*")
+    # Vue consolidée seulement si plusieurs traders ont des positions
+    if len(target_positions) > 1:
+        lines.append(f"\n━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📊 *{len(target_positions)} positions ouvertes*")
         for asset, pos in target_positions.items():
-            owner = target_registry.get(pos["trader_addr"], {}).get("label", pos["trader_addr"][:10])
-            emoji = "📈" if pos["side"] == "long" else "📉"
-            lines.append(f"  {emoji} *{asset}* {pos['side'].upper()} sz:{pos['size']} — via {owner}")
+            owner      = target_registry.get(pos["trader_addr"], {}).get("label", pos["trader_addr"][:10])
+            side_emoji = "📈" if pos["side"] == "long" else "📉"
+            size       = abs(float(pos["size"]))
+            lines.append(f"  {side_emoji} *{asset}* {pos['side'].upper()}  {size:.4f}  — {owner}")
 
-    # Derniers trades
-    if target_trades_log:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        recent = target_trades_log[-5:]
-        lines.append(f"📋 *Derniers signaux ({len(recent)}):*")
-        for t in recent:
-            lines.append(f"  {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.2f} — {t['trader']}")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_/target_stop 0x... | /target_sync 0x..._")
+    lines.append(f"\n`/target_stop`  `/target_sync`")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
