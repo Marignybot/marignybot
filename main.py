@@ -116,6 +116,7 @@ EVENING_MIN_UTC           = 0
 # SCORING v4
 # ============================================================
 TRADEBOT_MIN_TRADES      = 5
+TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
 TRADEBOT_MAX_DRAWDOWN    = 85.0   # v4.2: 60→85% (HL traders agressifs, MDD médian ~97%)
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
@@ -992,6 +993,15 @@ async def fetch_top_traders_hl() -> list:
                     # ── Eligibilité finale ──────────────────────────────
                     if n_trades_at < 20:
                         logger.info(f"Exclu {address[:12]}: {n_trades_at} trades allTime < 20")
+                        return None
+
+                    # Filtre dur scalper — incopiable si > 30 trades/jour
+                    trades_per_day = n_trades_7j / 7.0
+                    if trades_per_day > TRADEBOT_MAX_TRADES_DAY:
+                        logger.info(
+                            f"Exclu {address[:12]}: scalper {trades_per_day:.0f} trades/j "
+                            f"(max {TRADEBOT_MAX_TRADES_DAY}) — incopiable"
+                        )
                         return None
 
                     pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
