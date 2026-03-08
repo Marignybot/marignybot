@@ -118,7 +118,7 @@ EVENING_MIN_UTC           = 0
 TRADEBOT_MIN_TRADES      = 5
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
 TRADEBOT_MAX_DRAWDOWN    = 85.0   # filtre dur MDD
-TRADEBOT_MIN_AGE_DAYS    = 90     # v4.2: 90→60j (HL plateforme récente)
+TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
 TRADER_BLACKLIST = {
@@ -982,8 +982,8 @@ async def fetch_top_traders_hl() -> list:
                     pnl_30j = pnl_h30[-1] if pnl_h30 else 0.0
                     cap_30  = acv_h30[-1] if acv_h30 else 0.0
 
-                    if cap_30 < 100000:
-                        logger.info(f"Exclu {address[:12]}: capital 30j ${cap_30:,.0f} < $100k")
+                    if cap_30 < 10000:
+                        logger.info(f"Exclu {address[:12]}: capital 30j ${cap_30:,.0f} < $10k")
                         return None
                     if pnl_30j < 0:
                         perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
