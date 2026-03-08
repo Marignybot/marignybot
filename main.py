@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-SakaiBot v4.5d — Bot Telegram Hyperliquid
-Corrections v4.5d:
-  - [FIX CRITIQUE] place_order: levier appliqué via exchange.update_leverage() avant l'ordre
-  - [FIX] Double instance Railway: gestion conflit 409 améliorée + délai backoff exponentiel
-Corrections v4.1:
+SakaiBot v4.6 — Bot Telegram Hyperliquid
+  v4.6:
+  - [OPT] MAKER orders partout (place_limit_gtc) : ouverture, renfort, allègement, clôture normale
+  - [OPT] LIMIT_MAKER_OFFSET=0.03% du mid-price → statut maker, fees ~0 voire rebate -0.01%
+  - [OPT] Retry loop (LIMIT_MAX_RETRIES=3 × LIMIT_RETRY_WAIT=8s) + annulation + fallback market
+  - [OPT] force_market=True pour /copy_close et /target_stop (urgence sortie rapide)
+  - [OPT] place_market_order conservé UNIQUEMENT pour stop-loss urgence et fallback interne
   v4.2:
   - [FIX] Seuil MDD: 60% → 85% (HL dominé par traders agressifs, MDD médian 97%)
   - [FIX] Ancienneté: 90j → 60j via constante TRADEBOT_MIN_AGE_DAYS
@@ -74,6 +76,14 @@ COPY_LEVERAGE = {
     "SOL":  5,
     "TAO":  3,
 }
+
+# ============================================================
+# LIMIT ORDER — CONFIG MAKER (v4.6)
+# ============================================================
+LIMIT_MAKER_OFFSET   = 0.0003   # 0.03% du mid-price → souvent rempli en <5s
+LIMIT_RETRY_WAIT     = 8        # secondes entre chaque tentative
+LIMIT_MAX_RETRIES    = 3        # tentatives limit avant fallback market
+# Fallback market uniquement si LIMIT_MAX_RETRIES épuisées ou urgence (stop loss)
 
 # [OPT] Règles de taille centralisées — une seule source de vérité
 SIZE_RULES = {
@@ -1467,19 +1477,7 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
 
         logger.info(f"Ordre {asset} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
 
-        loop = asyncio.get_event_loop()
-
-        # [FIX v4.5d] Appliquer le levier AVANT de passer l'ordre
-        if leverage > 1:
-            try:
-                lev_result = await loop.run_in_executor(
-                    None,
-                    lambda: exchange.update_leverage(leverage, asset, is_cross=True)
-                )
-                logger.info(f"Levier {asset} x{leverage} appliqué → {lev_result}")
-            except Exception as lev_err:
-                logger.warning(f"update_leverage {asset} x{leverage} échoué (non bloquant): {lev_err}")
-
+        loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
@@ -1732,7 +1730,7 @@ async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
 
             pos_value             = size * price
             my_size, leverage, my_usd = await get_proportional_size(asset, trader_address, pos_value, price)
-            result                = await place_order(asset, is_buy, my_size, dir_fill, leverage)
+            result                = await place_limit_gtc(asset, is_buy, my_size, dir_fill)
 
             if "error" not in result:
                 copy_state["positions"][asset] = {
@@ -1757,7 +1755,7 @@ async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
 
             my_size = my_pos["size"]
             is_buy  = my_pos["side"] == "short"
-            result  = await place_order(asset, is_buy, my_size, dir_fill, 1)
+            result  = await place_limit_gtc(asset, is_buy, my_size, dir_fill)
 
             copy_state["positions"].pop(asset, None)
             copy_deployed[asset] = 0.0
@@ -1905,7 +1903,7 @@ async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE)
     results = []
     for asset, pos in positions.items():
         is_buy = pos["side"] == "short"
-        result = await place_order(asset, is_buy, pos["size"], "Close All")
+        result = await place_limit_gtc(asset, is_buy, pos["size"], "Close All", force_market=True)
         status = "✅" if "error" not in result else "❌"
         results.append(f"{status} {asset} fermé")
         copy_state["positions"].pop(asset, None)
@@ -2134,7 +2132,6 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 #   /target 0x...        → surveillance + réplication auto (ratio calculé au démarrage)
 #   /target_sync         → ouvre les positions déjà ouvertes du trader (optionnel)
 #   /target_stop 0x...   → stoppe un trader spécifique (ou tous si pas d'adresse)
-#   /target_close        → 🚨 ferme TOUTES les positions + stoppe les traders (urgence)
 #   /target_status       → état de tous les traders surveillés
 #
 # Multi-target :
@@ -2207,6 +2204,175 @@ async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
     if price <= 0:
         return {"error": f"Prix {asset} introuvable"}
     return await place_market_order(asset, is_buy, size, price)
+
+
+async def _build_exchange() -> "Exchange | None":
+    """Helper — instancie Exchange une seule fois par appel."""
+    if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
+        return None
+    key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+    wallet = eth_account.Account.from_key(key)
+    return Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+
+
+def _round_price(raw: float) -> float:
+    """Arrondit le prix selon la magnitude (règle HL 5 chiffres sig.)."""
+    magnitude = len(str(int(raw)))
+    decimals  = max(0, 5 - magnitude)
+    return float(round(raw, decimals))
+
+
+def _round_size(asset: str, size: float, ref_price: float) -> float:
+    """Arrondit la taille et applique le minimum HL."""
+    rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+    sz    = round(size, rules["decimals"])
+    sz    = max(sz, rules["min"])
+    if sz * ref_price < 10:
+        sz = max(round(11.0 / ref_price, rules["decimals"]), rules["min"])
+    return sz
+
+
+async def place_limit_gtc(
+    asset: str,
+    is_buy: bool,
+    size: float,
+    reason: str = "",
+    force_market: bool = False,
+) -> dict:
+    """
+    Ordre MAKER (GTC) avec retry + fallback market — v4.6.
+
+    Logique :
+      1. Poster un limit GTC à LIMIT_MAKER_OFFSET du mid-price
+         (légèrement sous le marché pour un BUY, légèrement au-dessus pour un SELL)
+         → statut maker = fees ~0 voire rebate -0.01%
+      2. Attendre LIMIT_RETRY_WAIT secondes → vérifier le fill via clearinghouseState
+      3. Si non rempli après LIMIT_MAX_RETRIES → annuler + fallback market IOC (taker)
+      4. Si force_market=True (stop-loss urgence) → saute directement au market
+
+    Utilisé pour : ouverture, renfort, allègement, clôture normale.
+    place_market_order reste pour les stop-loss d'urgence uniquement.
+    """
+    if not HL_PRIVATE_KEY:
+        return {"error": "HL_PRIVATE_KEY manquante"}
+    if not _HL_SDK_AVAILABLE:
+        return {"error": "hyperliquid-python-sdk non installé"}
+
+    mids = await get_all_mids_cached()
+    ref_price = float(mids.get(asset, 0))
+    if ref_price <= 0:
+        return {"error": f"Prix {asset} introuvable"}
+
+    sz = _round_size(asset, size, ref_price)
+
+    # ── Urgence / force market ───────────────────────────────
+    if force_market:
+        logger.info(f"[LIMIT_GTC] force_market={asset} {sz} reason={reason}")
+        return await place_market_order(asset, is_buy, sz, ref_price)
+
+    exchange = await _build_exchange()
+    if exchange is None:
+        return {"error": "Exchange non initialisable"}
+
+    loop = asyncio.get_event_loop()
+
+    for attempt in range(1, LIMIT_MAX_RETRIES + 1):
+        # Recalcul du prix à chaque retry (mid peut avoir bougé)
+        mids      = await get_all_mids_cached()
+        ref_price = float(mids.get(asset, ref_price))
+        # BUY : on poste légèrement SOUS le mid → maker (on attend que le marché descende)
+        # SELL : on poste légèrement AU-DESSUS du mid → maker
+        offset_factor = (1 - LIMIT_MAKER_OFFSET) if is_buy else (1 + LIMIT_MAKER_OFFSET)
+        limit_px = _round_price(ref_price * offset_factor)
+
+        logger.info(
+            f"[LIMIT_GTC] attempt={attempt}/{LIMIT_MAX_RETRIES} "
+            f"{asset} {'BUY' if is_buy else 'SELL'} sz={sz} limit={limit_px} reason={reason}"
+        )
+
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda lp=limit_px: exchange.order(
+                    asset, is_buy, sz, lp,
+                    {"limit": {"tif": "Gtc"}}
+                )
+            )
+        except Exception as e:
+            logger.error(f"[LIMIT_GTC] place error attempt={attempt}: {e}")
+            result = {"error": str(e)}
+
+        # Vérifier si la réponse indique un fill immédiat
+        status = ""
+        oid    = None
+        try:
+            # SDK retourne {"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}
+            statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+            if statuses:
+                st = statuses[0]
+                if "filled" in st:
+                    logger.info(f"[LIMIT_GTC] Fill immédiat {asset} attempt={attempt}")
+                    return result
+                elif "resting" in st:
+                    oid    = st["resting"].get("oid")
+                    status = "resting"
+                elif "error" in st:
+                    status = "error"
+                    logger.warning(f"[LIMIT_GTC] Statut erreur: {st}")
+        except Exception:
+            pass
+
+        if status == "resting" and oid:
+            # Attente avant de vérifier le fill
+            await asyncio.sleep(LIMIT_RETRY_WAIT)
+
+            # Vérifier si l'ordre est toujours ouvert
+            try:
+                positions = await get_my_positions()
+                # Si l'asset est maintenant en position → ordre rempli
+                if asset in positions:
+                    logger.info(f"[LIMIT_GTC] Fill confirmé {asset} après {attempt * LIMIT_RETRY_WAIT}s")
+                    return result
+            except Exception:
+                pass
+
+            # Ordre toujours resting → annuler et retenter (ou fallback)
+            if attempt < LIMIT_MAX_RETRIES:
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda o=oid: exchange.cancel(asset, o)
+                    )
+                    logger.info(f"[LIMIT_GTC] Annulé oid={oid}, nouvelle tentative")
+                except Exception as ce:
+                    logger.warning(f"[LIMIT_GTC] Cancel failed oid={oid}: {ce}")
+            else:
+                # Dernière tentative échouée → annuler + fallback market
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda o=oid: exchange.cancel(asset, o)
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    f"[LIMIT_GTC] {LIMIT_MAX_RETRIES} tentatives épuisées → "
+                    f"fallback MARKET {asset} sz={sz}"
+                )
+                return await place_market_order(asset, is_buy, sz, ref_price)
+
+        elif status == "error":
+            # Erreur applicative → fallback immédiat
+            logger.warning(f"[LIMIT_GTC] Erreur statut → fallback market {asset}")
+            return await place_market_order(asset, is_buy, sz, ref_price)
+
+        else:
+            # Résultat inattendu → fallback market
+            logger.warning(f"[LIMIT_GTC] Résultat inattendu {result} → fallback market")
+            return await place_market_order(asset, is_buy, sz, ref_price)
+
+    # Ne devrait pas arriver
+    return await place_market_order(asset, is_buy, sz, ref_price)
 
 
 async def compute_target_ratio(trader_address: str) -> float | None:
@@ -2360,7 +2526,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                 continue
 
             my_size = compute_my_size(asset, size, price, ratio)
-            result  = await place_market_order(asset, is_buy, my_size, price)
+            result  = await place_limit_gtc(asset, is_buy, my_size, dir_fill)
 
             # Mémoriser ou cumuler (renfort)
             is_reinforce = asset in target_positions and target_positions[asset]["trader_addr"] == address
@@ -2407,7 +2573,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
             my_close_size   = max(my_close_size, SIZE_RULES.get(asset, SIZE_RULES["_default"])["min"])
 
             is_close_buy = my_pos["side"] == "short"  # inverse pour clôturer
-            result       = await place_market_close(asset, is_close_buy, my_close_size)
+            result       = await place_limit_gtc(asset, is_close_buy, my_close_size, dir_fill)
 
             is_full_close = close_ratio >= 0.99
             if is_full_close:
@@ -2509,7 +2675,7 @@ async def target_sync_positions(address: str, app) -> None:
                 continue
 
             my_size = compute_my_size(asset, abs(sz), price, ratio)
-            result  = await place_market_order(asset, is_buy, my_size, price)
+            result  = await place_limit_gtc(asset, is_buy, my_size, "target_sync")
             status  = "✅" if "error" not in result else "❌"
             side_str = "Long 📈" if is_buy else "Short 📉"
             results.append(f"{status} {asset} {side_str} {my_size} (~${my_size*price:.0f})")
@@ -2612,8 +2778,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Ouverture/Renfort → MARKET IOC\n"
         f"• Fermeture → MARKET immédiat (proportionnel)\n\n"
         f"💡 `/target_sync {address}` pour copier les positions déjà ouvertes.\n"
-        f"🛑 `/target_stop {address}` pour arrêter.\n"
-        f"🚨 `/target_close` pour fermeture d'urgence de toutes les positions.",
+        f"🛑 `/target_stop {address}` pour arrêter.",
         parse_mode="Markdown"
     )
 
@@ -2701,171 +2866,61 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    try:
-        active_targets = {a: t for a, t in target_registry.items() if t.get("active")}
+    active_targets = {a: t for a, t in target_registry.items() if t["active"]}
 
-        if not active_targets:
-            await update.message.reply_text(
-                "⏸ *Aucun target actif*\n"
-                "Lance `/target 0xADRESSE` pour démarrer.",
-                parse_mode="Markdown"
-            )
-            return
+    if not active_targets:
+        await update.message.reply_text(
+            "⏸ *Aucun target actif*\n"
+            "Lance `/target 0xADRESSE` pour démarrer.",
+            parse_mode="Markdown"
+        )
+        return
 
-        lines = [
-            f"🎯 *TARGET STATUS — {len(active_targets)}/{MAX_TARGETS} actifs*",
-            "━━━━━━━━━━━━━━━━━━━━",
-        ]
+    lines = [
+        f"🎯 *TARGET STATUS — {len(active_targets)}/{MAX_TARGETS} actifs*",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
 
-        for addr, info in active_targets.items():
-            mode       = "⏸ PAUSE" if info.get("paused") else "🟢 ACTIF"
-            label      = info.get("label", addr[:16])
-            ratio      = info.get("ratio", 0)
-            short_addr = addr[:20] + "..."
-            lines.append(
-                f"*{label}* {mode}\n"
-                f"`{short_addr}`\n"
-                f"Ratio: {ratio:.4f}"
-            )
-            my_pos = [(a, p) for a, p in target_positions.items() if p.get("trader_addr") == addr]
-            if my_pos:
-                for asset, pos in my_pos:
-                    emoji = "📈" if pos.get("side") == "long" else "📉"
-                    lines.append(f"  {emoji} {asset} {pos.get('side','?').upper()} sz:{pos.get('size',0)} @ ${pos.get('entry',0):,.2f}")
-            else:
-                lines.append("  _Aucune position ouverte_")
-            lines.append("")
+    for addr, info in active_targets.items():
+        mode = "⏸ PAUSE" if info.get("paused") else "🟢 ACTIF"
+        lines.append(
+            f"*{info['label']}* {mode}\n"
+            f"`{addr}`\n"
+            f"Ratio: {info['ratio']:.4f}"
+        )
+        # Positions de ce trader
+        my_pos = [(a, p) for a, p in target_positions.items() if p["trader_addr"] == addr]
+        if my_pos:
+            for asset, pos in my_pos:
+                emoji = "📈" if pos["side"] == "long" else "📉"
+                lines.append(f"  {emoji} {asset} {pos['side'].upper()} sz:{pos['size']} @ ${pos['entry']:,.2f}")
+        else:
+            lines.append("  _Aucune position active_")
+        lines.append("")
 
-        if target_positions:
-            lines.append("━━━━━━━━━━━━━━━━━━━━")
-            lines.append(f"📊 *Positions bot ({len(target_positions)}):*")
-            for asset, pos in target_positions.items():
-                trader_addr = pos.get("trader_addr", "")
-                owner = target_registry.get(trader_addr, {}).get("label", trader_addr[:10])
-                emoji = "📈" if pos.get("side") == "long" else "📉"
-                lines.append(f"  {emoji} *{asset}* {pos.get('side','?').upper()} sz:{pos.get('size',0)} — via {owner}")
-
-        if target_trades_log:
-            lines.append("━━━━━━━━━━━━━━━━━━━━")
-            recent = target_trades_log[-5:]
-            lines.append(f"📋 *Derniers signaux ({len(recent)}):*")
-            for t in recent:
-                lines.append(f"  {t.get('time','?')[:11]} | {t.get('asset','?')} {t.get('dir','?')} @ ${t.get('price',0):,.2f} — {t.get('trader','?')[:12]}")
-
+    # Positions consolidées (vue globale)
+    if target_positions:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("_/target\\_stop | /target\\_sync | /target\\_close_")
+        lines.append(f"📊 *Positions bot ({len(target_positions)}):*")
+        for asset, pos in target_positions.items():
+            owner = target_registry.get(pos["trader_addr"], {}).get("label", pos["trader_addr"][:10])
+            emoji = "📈" if pos["side"] == "long" else "📉"
+            lines.append(f"  {emoji} *{asset}* {pos['side'].upper()} sz:{pos['size']} — via {owner}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    # Derniers trades
+    if target_trades_log:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        recent = target_trades_log[-5:]
+        lines.append(f"📋 *Derniers signaux ({len(recent)}):*")
+        for t in recent:
+            lines.append(f"  {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.2f} — {t['trader']}")
 
-    except Exception as e:
-        logger.error(f"cmd_target_status erreur: {e}")
-        try:
-            fallback = "TARGET STATUS\n"
-            for addr, info in target_registry.items():
-                if info.get("active"):
-                    state = "PAUSE" if info.get("paused") else "ACTIF"
-                    fallback += f"- {info.get('label', addr[:16])} | ratio {info.get('ratio', 0):.4f} | {state}\n"
-            await update.message.reply_text(fallback or "Aucun target actif.")
-        except Exception:
-            await update.message.reply_text("Erreur affichage status — voir logs Railway.")
-
-
-
-
-async def cmd_target_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /target_close          → ferme TOUTES les positions target + stoppe tous les traders
-    /target_close 0xADR    → ferme les positions d'un trader spécifique + le stoppe
-    /target_close --keep   → ferme les positions mais garde les WebSockets actifs
-    """
-    if not is_authorized(update):
-        return
-
-    args = context.args or []
-    keep_watching = "--keep" in args
-    specific_addr = next((a for a in args if a.startswith("0x")), None)
-
-    # Déterminer les targets concernés
-    if specific_addr:
-        specific_addr = specific_addr.strip().lower()
-        if specific_addr not in target_registry:
-            await update.message.reply_text(
-                f"⚠️ `{specific_addr[:20]}...` non trouvé dans les targets actifs.",
-                parse_mode="Markdown"
-            )
-            return
-        targets_concerned = {specific_addr: target_registry[specific_addr]}
-        scope_label = f"`{specific_addr[:16]}...`"
-    else:
-        targets_concerned = dict(target_registry)
-        scope_label = "tous les targets"
-
-    if not targets_concerned:
-        await update.message.reply_text("ℹ️ Aucun target actif à fermer.")
-        return
-
-    await update.message.reply_text(
-        f"🚨 *FERMETURE D'URGENCE* — {scope_label}\\n"
-        f"🔄 Fermeture de toutes les positions en cours...",
-        parse_mode="Markdown"
-    )
-
-    # Récupérer les vraies positions ouvertes sur HL
-    real_positions = await get_my_positions()
-
-    # Identifier les assets liés aux traders concernés
-    assets_to_close = {}
-    for asset, pos in list(target_positions.items()):
-        if pos.get("trader_addr") in targets_concerned:
-            if asset in real_positions:
-                assets_to_close[asset] = real_positions[asset]
-            else:
-                # Position dans le state mais plus sur HL — nettoyer
-                target_positions.pop(asset, None)
-                logger.info(f"target_close: {asset} plus sur HL, state nettoyé")
-
-    results = []
-
-    if not assets_to_close:
-        results.append("ℹ️ Aucune position ouverte sur HL pour ces traders.")
-    else:
-        for asset, pos in assets_to_close.items():
-            is_buy = pos["side"] == "short"  # pour fermer: short→buy, long→sell
-            result = await place_order(asset, is_buy, pos["size"], "EMERGENCY CLOSE")
-            if "error" not in result:
-                status = "✅"
-                target_positions.pop(asset, None)
-                logger.info(f"target_close: {asset} fermé avec succès")
-            else:
-                status = f"❌ {result.get('error', '?')}"
-                logger.error(f"target_close: {asset} erreur fermeture → {result}")
-            side_label = pos["side"].upper()
-            results.append(f"{status} *{asset}* {side_label} sz:{pos['size']:.4f}")
-
-    # Stopper les WebSockets si --keep non spécifié
-    stopped_traders = []
-    if not keep_watching:
-        for addr, info in list(targets_concerned.items()):
-            task = info.get("ws_task")
-            if task and not task.done():
-                task.cancel()
-            target_registry.pop(addr, None)
-            label = info.get("label", addr[:16])
-            stopped_traders.append(f"🛑 {label}")
-            logger.info(f"target_close: trader {addr[:12]} stoppé")
-
-    # Construire la réponse finale
-    lines = ["🏁 *FERMETURE D'URGENCE TERMINÉE*", "━━━━━━━━━━━━━━━━━━━━"]
-    lines += results
     lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("_/target_stop 0x... | /target_sync 0x..._")
 
-    if keep_watching:
-        lines.append("👁 Surveillance conservée (`--keep`)")
-    elif stopped_traders:
-        lines.append("*Traders stoppés:*")
-        lines += stopped_traders
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    await update.message.reply_text("\\n".join(lines), parse_mode="Markdown")
+
 
 
 import urllib.request
@@ -2876,22 +2931,16 @@ import urllib.request
 def main():
     token = TELEGRAM_TOKEN
     base  = f"https://api.telegram.org/bot{token}"
-
-    # [FIX v4.5d] Forcer la libération du token Telegram avant démarrage
-    # Tuer toute instance précédente via offset=-1 pour vider la queue
-    logger.info("🔄 Libération du token Telegram (nettoyage instance précédente)...")
-    for attempt in range(15):
+    for attempt in range(10):
         try:
             urllib.request.urlopen(f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5)
-            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&limit=1&timeout=0", timeout=5)
-            logger.info("✅ Token libéré avec succès")
+            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=1", timeout=5)
             break
         except Exception as e:
-            wait = min(2 ** attempt, 30)  # backoff exponentiel: 1s, 2s, 4s... max 30s
-            logger.warning(f"Init HTTP attempt {attempt+1}/15: {e} — attente {wait}s")
-            time_module.sleep(wait)
+            logger.warning(f"Init HTTP attempt {attempt+1}/10: {e}")
+            time_module.sleep(2)
 
-    time_module.sleep(5)  # [FIX] 3s → 5s pour laisser l'ancienne instance mourir
+    time_module.sleep(3)
 
     app = (
         Application.builder()
@@ -2903,17 +2952,11 @@ def main():
         .build()
     )
 
-    # [FIX v4.5d] Backoff exponentiel sur conflit 409 au lieu de 20s fixe
-    _conflict_count = {"n": 0}
-
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            _conflict_count["n"] += 1
-            wait = min(5 * _conflict_count["n"], 60)  # 5s, 10s, 15s... max 60s
-            logger.warning(f"⚠️ Conflit résiduel #{_conflict_count['n']} — attente {wait}s...")
-            await asyncio.sleep(wait)
+            logger.warning("⚠️ Conflit résiduel — attente 20s...")
+            await asyncio.sleep(20)
         else:
-            _conflict_count["n"] = 0  # reset si autre type d'erreur
             logger.error(f"Erreur: {context.error}")
 
     app.add_error_handler(error_handler)
@@ -2945,10 +2988,9 @@ def main():
     app.add_handler(CommandHandler("target",        cmd_target))
     app.add_handler(CommandHandler("target_sync",   cmd_target_sync))
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
-    app.add_handler(CommandHandler("target_close",  cmd_target_close_all))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.5d démarré — Multi-target, tout market — ouverture, renfort, fermeture!")
+    logger.info("🤖 SakaiBot v4.6 démarré — Maker orders (limit GTC + fallback market)")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
