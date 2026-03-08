@@ -2,6 +2,10 @@
 """
 SakaiBot v4.1 — Bot Telegram Hyperliquid
 Corrections v4.1:
+  v4.2:
+  - [FIX] Seuil MDD: 60% → 85% (HL dominé par traders agressifs, MDD médian 97%)
+  - [FIX] Ancienneté: 90j → 60j via constante TRADEBOT_MIN_AGE_DAYS
+  - [OPT] Logging explicite sur TOUTES les exclusions (portfolio vide, inactif, cap)
   - [FIX CRITIQUE] at_pnl_raw utilisé avant définition → déplacé après at_data
   - [FIX] COPY_LEVERAGE ignoré → appliqué dans place_order via get_proportional_size
   - [FIX] tb_aide → scoring mis à jour v4
@@ -112,7 +116,8 @@ EVENING_MIN_UTC           = 0
 # SCORING v4
 # ============================================================
 TRADEBOT_MIN_TRADES      = 5
-TRADEBOT_MAX_DRAWDOWN    = 60.0
+TRADEBOT_MAX_DRAWDOWN    = 85.0   # v4.2: 60→85% (HL traders agressifs, MDD médian ~97%)
+TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
 TRADER_BLACKLIST = {
@@ -798,6 +803,7 @@ async def fetch_top_traders_hl() -> list:
                         portfolio = await resp.json()
 
                     if not portfolio or not isinstance(portfolio, list):
+                        logger.info(f"Exclu {address[:12]}: portfolio vide ou format invalide")
                         return None
 
                     windows = {item[0]: item[1] for item in portfolio
@@ -820,6 +826,7 @@ async def fetch_top_traders_hl() -> list:
                             days_ago = (now_ms - month_hist[-1][0]) / (86400 * 1000)
                             recent_activity = days_ago <= 15
                     if not recent_activity:
+                        logger.info(f"Exclu {address[:12]}: inactif depuis > 15j")
                         return None
 
                     # ── AllTime — défini EN PREMIER pour usage dans le reste ──
@@ -836,8 +843,8 @@ async def fetch_top_traders_hl() -> list:
                         logger.info(f"Exclu {address[:12]}: pas d'historique allTime")
                         return None
                     age_days = (now_ms - at_pnl_raw[0][0]) / (86400 * 1000)
-                    if age_days < 90:
-                        logger.info(f"Exclu {address[:12]}: ancienneté {age_days:.0f}j < 90j")
+                    if age_days < TRADEBOT_MIN_AGE_DAYS:
+                        logger.info(f"Exclu {address[:12]}: ancienneté {age_days:.0f}j < {TRADEBOT_MIN_AGE_DAYS}j")
                         return None
 
                     # ── Données 7j ──────────────────────────────────────
@@ -896,6 +903,7 @@ async def fetch_top_traders_hl() -> list:
                     cap_30  = acv_h30[-1] if acv_h30 else 0.0
 
                     if cap_30 < 10000:
+                        logger.info(f"Exclu {address[:12]}: capital 30j ${cap_30:,.0f} < $10k")
                         return None
                     if pnl_30j < 0:
                         perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
@@ -1068,7 +1076,7 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔍 *TradeBot — Analyse en cours...*\n\n"
         "• Récupération du leaderboard Hyperliquid (top 200)\n"
-        "• Filtres: MDD<60% | actif 15j | 3 mois ancienneté | 20 trades min\n"
+        "• Filtres: MDD<85% | actif 15j | 60j ancienneté | 20 trades min\n"
         "• Score: (PnL\\_7j/MDD) × WR × log(trades) + bonus 30j\n"
         "• Sélection Top 5 multi-asset\n\n"
         "_Patiente quelques secondes..._",
@@ -1448,7 +1456,7 @@ async def start_copy_trading(top_traders: list, app) -> None:
     copy_state["active"]   = True
 
     active_addrs = []
-    notif_lines  = ["🤖 *SakaiBot — Copy Trading v4.1*", "_Top 5 multi-asset_", ""]
+    notif_lines  = ["🤖 *SakaiBot — Copy Trading v4.2*", "_Top 5 multi-asset_", ""]
 
     for rank, trader in enumerate(top_traders[:5], 1):
         addr = trader["address"]
@@ -1806,7 +1814,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "👋 *Bienvenue sur SakaiBot v4.1! 🤖*\n\n"
+        "👋 *Bienvenue sur SakaiBot v4.2! 🤖*\n\n"
         "📊 *Marché & Analyse*\n"
         "   /prix — Prix en temps réel\n"
         "   /setup — Analyse technique complète\n"
@@ -2287,7 +2295,7 @@ def main():
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.1 démarré — Top 5 multi-asset, COPY_LEVERAGE actif!")
+    logger.info("🤖 SakaiBot v4.2 démarré — Top 5 multi-asset, filtres ajustés!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
