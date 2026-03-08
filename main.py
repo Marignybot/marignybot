@@ -853,11 +853,26 @@ async def fetch_top_traders_hl() -> list:
                         portfolio = await resp.json()
 
                     if not portfolio or not isinstance(portfolio, list):
-                        logger.info(f"Exclu {address[:12]}: portfolio vide ou format invalide")
+                        port_type = type(portfolio).__name__
+                        if isinstance(portfolio, dict):
+                            keys = list(portfolio.keys())[:5]
+                            logger.info(f"Exclu {address[:12]}: portfolio dict keys={keys}")
+                        elif isinstance(portfolio, list) and len(portfolio) == 0:
+                            logger.info(f"Exclu {address[:12]}: portfolio liste vide")
+                        elif portfolio is None:
+                            logger.info(f"Exclu {address[:12]}: portfolio None")
+                        else:
+                            snippet = str(portfolio)[:120]
+                            logger.info(f"Exclu {address[:12]}: format={port_type} snippet={snippet}")
                         return None
 
-                    windows = {item[0]: item[1] for item in portfolio
-                               if isinstance(item, list) and len(item) == 2}
+                    valid_items = [item for item in portfolio if isinstance(item, list) and len(item) == 2]
+                    if not valid_items:
+                        snippet = str(portfolio[0])[:100] if portfolio else "vide"
+                        logger.info(f"Exclu {address[:12]}: 0 items valides sur {len(portfolio)} — ex: {snippet}")
+                        return None
+
+                    windows = {item[0]: item[1] for item in valid_items}
 
                     now_ms    = datetime.now().timestamp() * 1000
                     cutoff_ms = now_ms - (15 * 86400 * 1000)
