@@ -1044,10 +1044,22 @@ def rank_and_score_traders(traders: list) -> list:
 
     traders = [t for t in traders if t.get("mdd", 999) <= TRADEBOT_MAX_DRAWDOWN]
     traders = [t for t in traders if t.get("winrate", 0) >= 50]
-    traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= TRADEBOT_MAX_TRADES_DAY]  # [v4.8] 25/j
+    traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= TRADEBOT_MAX_TRADES_DAY]  # [v4.8] 10/j
     traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
     traders = [t for t in traders if t.get("pnl", 0) > 0]
     traders = [t for t in traders if t.get("pnl_at", 0) > 0]
+
+    # [v4.9] Filtre one-week wonder : PnL 7j ne doit pas dépasser PnL 30j
+    # Si pnl_7j > pnl_30j → le trader a perdu les 3 autres semaines du mois
+    avant_oww = len(traders)
+    traders = [t for t in traders if t.get("pnl_7j", 0) <= t.get("pnl", 0)]
+    logger.info(f"Filtre one-week-wonder: {avant_oww - len(traders)} exclus")
+
+    # [v4.9] Filtre chute libre : PnL 7j doit représenter >= 10% du PnL 30j
+    # Si pnl_7j << pnl_30j → le trader est en train de tout perdre cette semaine
+    avant_chute = len(traders)
+    traders = [t for t in traders if t.get("pnl_7j", 0) >= t.get("pnl", 0) * 0.10]
+    logger.info(f"Filtre chute-libre: {avant_chute - len(traders)} exclus")
 
     logger.info(f"Filtres v5: {len(traders)}/{avant} traders retenus")
     if not traders:
@@ -1075,45 +1087,48 @@ def rank_and_score_traders(traders: list) -> list:
         winrate_30 = t.get("winrate_30j", 0)   # WinRate 30j (proxy pnlHistory)
         n_trades   = t.get("n_trades_7j", 0)
 
-        # ── ROI 7j — base du score (performance récente normalisée) ──
-        roi_7j = (pnl_7j / capital) * 100
-        if roi_7j <= 0:
+        # ── ROI 30j — ancre principale du score ─────────────────────
+        # Base : performance durable sur un mois complet, pas un coup de chance
+        roi_30j = (pnl_30j / capital) * 100
+        if roi_30j <= 0:
             return 0.0
 
-        # ── Consistance — régularité vraie 30j / 7j ──────────────────
-        # Idéal : pnl_30j ≈ 4× pnl_7j (4 semaines régulières)
-        # Corrige l'ancienne formule pnl_30j/pnl_at qui était faussée
-        # par le fait qu'HL est une plateforme jeune (historique court)
-        if pnl_30j > 0 and pnl_7j > 0:
-            ratio       = pnl_30j / pnl_7j
-            consistency = min(ratio / 4.0, 1.0)   # 1.0 = parfaitement régulier
-        elif pnl_30j > 0:
-            consistency = 0.4   # bon mois mais 7j pas top
+        # ── Momentum 7j — signal de forme actuelle (25% du score) ───
+        # La semaine en cours confirme ou infirme le mois.
+        # one-week-wonder et chute libre déjà éliminés par filtres durs.
+        # Idéal : pnl_7j ≈ 25% du pnl_30j (1 semaine sur 4 régulière)
+        semaine_ratio = t.get("pnl_7j", 0) / max(pnl_30j, 1)
+        if semaine_ratio >= 0.25:
+            momentum_factor = 1.0          # semaine égale ou supérieure à la moyenne
+        elif semaine_ratio >= 0.10:
+            momentum_factor = 0.75 + semaine_ratio  # entre 0.85 et 1.0
         else:
-            consistency = 0.05  # pnl_30j <= 0 = déjà filtré mais sécurité
+            momentum_factor = 0.75         # semaine calme (plancher)
+
+        # ── Régularité 30j — cœur du scoring ─────────────────────────
+        # pnl_30j / (pnl_7j × 4) : idéal = toutes les semaines pareilles
+        ratio       = pnl_30j / max(t.get("pnl_7j", 1), 1)
+        consistency = min(ratio / 4.0, 1.0)
 
         # ── WinRate — le meilleur des deux périodes ───────────────────
-        # Prend le max(7j, 30j) pour être bienveillant mais pas naïf
         best_wr = max(winrate, winrate_30) / 100.0
         if best_wr < 0.50:
-            wr_factor = best_wr ** 2          # 45% → 0.20 | 40% → 0.16
+            wr_factor = best_wr ** 2
         elif best_wr >= 0.65:
-            wr_factor = min(best_wr * 1.25, 1.0)  # bonus fort au-dessus de 65%
+            wr_factor = min(best_wr * 1.25, 1.0)
         else:
-            wr_factor = best_wr               # linéaire entre 50% et 65%
+            wr_factor = best_wr
 
         # ── MDD — pénalité forte et progressive ──────────────────────
-        # Exposant 1.8 > 1.5 → punit beaucoup plus les MDD élevés
         # MDD 20% → ×0.91 | 40% → ×0.65 | 60% → ×0.31 | 80% → ×0.05
         mdd_factor = max(0.02, 1.0 - (mdd / 85.0) ** 1.8)
 
-        # ── Anti-scalper — pénalité dans le score dès 5 trades/j ─────
-        # Filtre dur à 10/j, pénalité progressive dès 5/j
-        # → on privilégie les traders qui prennent 1-5 positions/jour max
-        trades_per_day  = n_trades / 7.0
-        scalper_factor  = min(1.0, 5.0 / max(trades_per_day, 0.1))
+        # ── Anti-scalper — pénalité dès 5 trades/j ───────────────────
+        trades_per_day = n_trades / 7.0
+        scalper_factor = min(1.0, 5.0 / max(trades_per_day, 0.1))
 
-        score = roi_7j * consistency * wr_factor * mdd_factor * scalper_factor
+        # Score final : ROI 30j × momentum × régularité × WR × MDD × anti-scalper
+        score = roi_30j * momentum_factor * consistency * wr_factor * mdd_factor * scalper_factor
         return max(score, 0.0)
 
     raw_scores = [compute_score_v5(t) for t in traders]
