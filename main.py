@@ -117,7 +117,7 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 TRADEBOT_MIN_TRADES      = 5
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
-TRADEBOT_MAX_DRAWDOWN    = 40.0   # v4.4: abaissé à 40% — copytrading exige stabilité
+TRADEBOT_MAX_DRAWDOWN    = 60.0   # v4.4: 60% — compromis HL (perp levier) / stabilité
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
