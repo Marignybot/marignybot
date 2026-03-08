@@ -117,8 +117,8 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 TRADEBOT_MIN_TRADES      = 5
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
-TRADEBOT_MAX_DRAWDOWN    = 50.0   # v4.4: max 50% MDD
-TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
+TRADEBOT_MAX_DRAWDOWN    = 40.0   # v4.4: aligné ApexLiquid max 40% MDD
+TRADEBOT_MIN_AGE_DAYS    = 90     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
 TRADER_BLACKLIST = {
@@ -983,8 +983,8 @@ async def fetch_top_traders_hl() -> list:
                     pnl_30j = pnl_h30[-1] if pnl_h30 else 0.0
                     cap_30  = acv_h30[-1] if acv_h30 else 0.0
 
-                    if cap_30 < 10000:
-                        logger.info(f"Exclu {address[:12]}: capital 30j ${cap_30:,.0f} < $10k")
+                    if cap_30 < 100000:
+                        logger.info(f"Exclu {address[:12]}: capital 30j ${cap_30:,.0f} < $100k")
                         return None
                     if pnl_30j < 0:
                         perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
@@ -1020,9 +1020,9 @@ async def fetch_top_traders_hl() -> list:
                         return None
 
                     # Filtre dur WinRate < 45% — incopiable
-                    if winrate_7j < 45.0:
+                    if winrate_7j < 80.0:
                         logger.info(
-                            f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 45% — incopiable"
+                            f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 80% — incopiable"
                         )
                         return None
 
@@ -1098,7 +1098,7 @@ def rank_and_score_traders(traders: list) -> list:
     avant = len(traders)
 
     traders = [t for t in traders if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN]
-    traders = [t for t in traders if t.get("winrate", 0) >= 50]
+    traders = [t for t in traders if t.get("winrate", 0) >= 80]
     traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= 25]
     traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
     traders = [t for t in traders if t.get("pnl", 0) > 0]
