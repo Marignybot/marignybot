@@ -2205,9 +2205,24 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 def main():
     import time as _time
+    import urllib.request, json as _json
 
-    # Anti-conflit Railway : attendre que l'ancienne instance libère le slot
-    _time.sleep(5)
+    # ── Forcer la libération du token avant de démarrer ────────
+    # Tue toute instance existante via un appel HTTP direct (avant même asyncio)
+    token = TELEGRAM_TOKEN
+    base  = f"https://api.telegram.org/bot{token}"
+    for attempt in range(10):
+        try:
+            # deleteWebhook pour s'assurer qu'aucun webhook actif
+            urllib.request.urlopen(f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5)
+            # getUpdates avec offset=-1 pour vider la queue et libérer le slot polling
+            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=1", timeout=5)
+            break
+        except Exception as e:
+            logger.warning(f"Init HTTP attempt {attempt+1}/10: {e}")
+            _time.sleep(2)
+
+    _time.sleep(3)  # Laisser Telegram propager la libération
 
     app = (
         Application.builder()
@@ -2221,7 +2236,7 @@ def main():
 
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit détecté (autre instance) — attente 20s...")
+            logger.warning("⚠️ Conflit résiduel — attente 20s...")
             await asyncio.sleep(20)
         else:
             logger.error(f"Erreur: {context.error}")
