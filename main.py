@@ -566,9 +566,14 @@ tradebot_history = []
 # Bonus 30j : ×1.2 si PnL_30j > 0 ET ROI_30j ≥ 20%
 # ============================================================
 
-TRADEBOT_MIN_TRADES   = 5
-TRADEBOT_MAX_DRAWDOWN = 40.0
+TRADEBOT_MIN_TRADES      = 5
+TRADEBOT_MAX_DRAWDOWN    = 40.0
 TRADEBOT_EXCELLENT_RATIO = 5.0   # PnL_7j / MDD ≥ 5 → éligible même avec < 5 trades
+
+# Adresses bannies — jamais sélectionnées ni copiées
+TRADER_BLACKLIST = {
+    "0x9cd0a696c7cbb9d44de99268194cb08e5684e5fe",
+}
 
 
 def compute_new_score(pnl_7j: float, mdd: float, winrate_7j: float,
@@ -644,6 +649,8 @@ async def fetch_top_traders_hl() -> list:
                     continue
 
                 if not address or len(address) < 10:
+                    continue
+                if address.lower() in TRADER_BLACKLIST:
                     continue
 
                 metrics = {}
