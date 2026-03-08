@@ -1091,6 +1091,7 @@ def rank_and_score_traders(traders: list) -> list:
 
     avant = len(traders)
 
+    traders = [t for t in traders if t.get("mdd", 999) <= TRADEBOT_MAX_DRAWDOWN]
     traders = [t for t in traders if t.get("winrate", 0) >= 50]
     traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= TRADEBOT_MAX_TRADES_DAY]  # [v4.5] etait 25
     traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
