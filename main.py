@@ -117,7 +117,7 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 TRADEBOT_MIN_TRADES      = 5
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
-TRADEBOT_MAX_DRAWDOWN    = 60.0   # v4.4: 60% — compromis HL (perp levier) / stabilité
+TRADEBOT_MAX_DRAWDOWN    = 85.0   # filtre dur MDD — la formule pénalise déjà le MDD dans le score
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
@@ -963,10 +963,13 @@ async def fetch_top_traders_hl() -> list:
                     except Exception:
                         pass  # Fallback proxy pnlHistory
 
-                    # ── MDD — pire des deux fenêtres ───────────────────
-                    mdd_7j    = calc_mdd(acv_h7)
-                    mdd_at    = calc_mdd(acv_hat)
-                    worst_mdd = max(mdd_7j, mdd_at)
+                    # ── MDD — calculé sur perpMonth uniquement ─────────
+                    # allTime contient des 0.0 lors des périodes inactives
+                    # ce qui faussait le MDD à 100% artificiellement
+                    m30_for_mdd = windows.get("perpMonth") or windows.get("month", {})
+                    acv_m30 = [float(p[1]) for p in m30_for_mdd.get("accountValueHistory", [])
+                               if isinstance(p, list) and len(p) == 2 and float(p[1]) > 0]
+                    worst_mdd = calc_mdd(acv_m30) if acv_m30 else calc_mdd(acv_h7)
                     if worst_mdd > TRADEBOT_MAX_DRAWDOWN:
                         logger.info(f"Exclu {address[:12]}: MDD {worst_mdd:.0f}% > {TRADEBOT_MAX_DRAWDOWN}%")
                         return None
