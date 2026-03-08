@@ -2125,25 +2125,41 @@ def compute_my_size(asset: str, trader_size: float, trader_price: float,
 async def target_watch_ws(address: str, app) -> None:
     """Un WebSocket indépendant par trader cible."""
     logger.info(f"Target WS démarré → {address[:12]}")
+    first_connect = True
+    reconnect_count = 0
 
     while address in target_registry and target_registry[address]["active"]:
         if target_registry[address].get("paused"):
             await asyncio.sleep(5)
             continue
         try:
-            async with websockets.connect(HYPERLIQUID_WS, ping_interval=20, ping_timeout=10) as ws:
+            async with websockets.connect(
+                HYPERLIQUID_WS,
+                ping_interval=10,   # ping toutes les 10s pour maintenir la connexion
+                ping_timeout=30,    # timeout généreux
+                close_timeout=5,
+            ) as ws:
                 await ws.send(json.dumps({
                     "method": "subscribe",
                     "subscription": {"type": "userEvents", "user": address}
                 }))
-                logger.info(f"✅ Target WS connecté → {address[:12]}")
-                ratio = target_registry[address].get("ratio", 0)
-                await send_copy_notification(app,
-                    f"📡 *Target connecté*\n"
-                    f"`{address}`\n"
-                    f"Ratio: {ratio:.4f} | Réplication ACTIVE\n"
-                    f"Ouverture/Renfort → LIMIT -0.1% | Fermeture → MARKET"
-                )
+                logger.info(f"✅ Target WS connecté → {address[:12]} (reconnexions: {reconnect_count})")
+
+                # Notif Telegram uniquement au premier démarrage
+                if first_connect:
+                    ratio = target_registry[address].get("ratio", 0)
+                    await send_copy_notification(app,
+                        f"📡 *Target connecté*\n"
+                        f"`{address}`\n"
+                        f"Ratio: {ratio:.4f} | Réplication ACTIVE\n"
+                        f"Ouverture/Renfort → LIMIT -0.1% | Fermeture → MARKET"
+                    )
+                    first_connect = False
+                else:
+                    # Reconnexion silencieuse — log seulement
+                    logger.info(f"Target WS reconnecté silencieusement → {address[:12]}")
+
+                reconnect_count = 0  # Reset compteur sur connexion réussie
 
                 async for raw_msg in ws:
                     if address not in target_registry or not target_registry[address]["active"]:
@@ -2159,8 +2175,10 @@ async def target_watch_ws(address: str, app) -> None:
         except Exception as e:
             if address not in target_registry or not target_registry[address]["active"]:
                 break
-            logger.warning(f"Target WS {address[:12]} déconnecté: {e} — reconnexion 5s")
-            await asyncio.sleep(5)
+            reconnect_count += 1
+            wait = min(5 * reconnect_count, 30)  # backoff progressif: 5s, 10s, 15s... max 30s
+            logger.warning(f"Target WS {address[:12]} déconnecté (#{reconnect_count}): {e} — reconnexion {wait}s")
+            await asyncio.sleep(wait)
 
     logger.info(f"Target WS arrêté → {address[:12]}")
 
