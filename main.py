@@ -728,7 +728,9 @@ async def fetch_top_traders_hl() -> list:
                 winrate_7j  = (wins_7j / max(n_trades_7j, 1)) * 100
 
                 # Récupérer aussi le nb de trades réels via userFills (7j)
-                n_trades_at = 0  # total allTime
+                # userFills retourne les ~100 derniers fills seulement —
+                # on l'utilise pour les stats 7j, pas pour le total allTime
+                n_trades_at = len(at_pnl_raw)  # proxy fiable : nb de snapshots pnlHistory allTime
                 try:
                     cutoff_7j = now_ms - (7 * 86400 * 1000)
                     async with session.post(
@@ -738,19 +740,20 @@ async def fetch_top_traders_hl() -> list:
                     ) as resp2:
                         fills = await resp2.json()
                     if isinstance(fills, list):
-                        # Total allTime
-                        n_trades_at = len([f for f in fills if isinstance(f, dict)
-                                           and float(f.get("closedPnl", 0) or 0) != 0])
-                        # Trades fermés sur 7j
-                        fills_7j    = [f for f in fills if isinstance(f, dict)
-                                       and f.get("time", 0) >= cutoff_7j
-                                       and float(f.get("closedPnl", 0) or 0) != 0]
+                        # Trades fermés sur 7j uniquement
+                        fills_7j = [f for f in fills if isinstance(f, dict)
+                                    and f.get("time", 0) >= cutoff_7j
+                                    and float(f.get("closedPnl", 0) or 0) != 0]
                         n_trades_7j = max(len(fills_7j), n_trades_7j)
                         if fills_7j:
-                            wins_fills  = sum(1 for f in fills_7j if float(f.get("closedPnl", 0)) > 0)
-                            winrate_7j  = (wins_fills / len(fills_7j)) * 100
+                            wins_fills = sum(1 for f in fills_7j if float(f.get("closedPnl", 0)) > 0)
+                            winrate_7j = (wins_fills / len(fills_7j)) * 100
+                        # Pour allTime : si fills retourne plus que le proxy, on prend le max
+                        fills_at = [f for f in fills if isinstance(f, dict)
+                                    and float(f.get("closedPnl", 0) or 0) != 0]
+                        n_trades_at = max(n_trades_at, len(fills_at))
                 except Exception:
-                    pass  # Fallback sur proxy pnlHistory
+                    pass  # Fallback sur proxy pnlHistory allTime
 
                 # ── MDD — pire des deux fenêtres (7j et allTime) ───────
                 def calc_mdd(hist):
