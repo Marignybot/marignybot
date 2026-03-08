@@ -788,6 +788,19 @@ async def fetch_top_traders_hl() -> list:
                 peak_at    = max(acv_hat) if acv_hat else 1
                 roe_at     = min((pnl_at / max(peak_at, 1)) * 100, 9999)
 
+                # ── Ancienneté minimale : 3 mois d'activité ────────────
+                # On vérifie via le premier timestamp de pnlHistory allTime
+                at_pnl_raw = [p for p in at_data.get("pnlHistory", []) if isinstance(p, list) and len(p) == 2]
+                if at_pnl_raw:
+                    first_ts_ms  = at_pnl_raw[0][0]
+                    age_days     = (now_ms - first_ts_ms) / (86400 * 1000)
+                    if age_days < 90:
+                        logger.debug(f"Exclu {address[:12]}: ancienneté {age_days:.0f}j < 90j")
+                        return None
+                else:
+                    # Pas d'historique allTime → impossible de vérifier → on exclut
+                    return None
+
                 # ── Eligibilité minimum ─────────────────────────────────
                 pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
                 if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
