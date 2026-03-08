@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-SakaiBot v4.1 — Bot Telegram Hyperliquid
+SakaiBot v4.5d — Bot Telegram Hyperliquid
+Corrections v4.5d:
+  - [FIX CRITIQUE] place_order: levier appliqué via exchange.update_leverage() avant l'ordre
+  - [FIX] Double instance Railway: gestion conflit 409 améliorée + délai backoff exponentiel
 Corrections v4.1:
   v4.2:
   - [FIX] Seuil MDD: 60% → 85% (HL dominé par traders agressifs, MDD médian 97%)
@@ -1464,7 +1467,19 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
 
         logger.info(f"Ordre {asset} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
 
-        loop   = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
+
+        # [FIX v4.5d] Appliquer le levier AVANT de passer l'ordre
+        if leverage > 1:
+            try:
+                lev_result = await loop.run_in_executor(
+                    None,
+                    lambda: exchange.update_leverage(leverage, asset, is_cross=True)
+                )
+                logger.info(f"Levier {asset} x{leverage} appliqué → {lev_result}")
+            except Exception as lev_err:
+                logger.warning(f"update_leverage {asset} x{leverage} échoué (non bloquant): {lev_err}")
+
         result = await loop.run_in_executor(
             None,
             lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
@@ -2119,6 +2134,7 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 #   /target 0x...        → surveillance + réplication auto (ratio calculé au démarrage)
 #   /target_sync         → ouvre les positions déjà ouvertes du trader (optionnel)
 #   /target_stop 0x...   → stoppe un trader spécifique (ou tous si pas d'adresse)
+#   /target_close        → 🚨 ferme TOUTES les positions + stoppe les traders (urgence)
 #   /target_status       → état de tous les traders surveillés
 #
 # Multi-target :
@@ -2596,7 +2612,8 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Ouverture/Renfort → MARKET IOC\n"
         f"• Fermeture → MARKET immédiat (proportionnel)\n\n"
         f"💡 `/target_sync {address}` pour copier les positions déjà ouvertes.\n"
-        f"🛑 `/target_stop {address}` pour arrêter.",
+        f"🛑 `/target_stop {address}` pour arrêter.\n"
+        f"🚨 `/target_close` pour fermeture d'urgence de toutes les positions.",
         parse_mode="Markdown"
     )
 
@@ -2734,11 +2751,107 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.2f} — {t['trader']}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_/target_stop 0x... | /target_sync 0x..._")
+    lines.append("_/target_stop 0x... | /target_sync 0x... | /target_close_")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+
+
+async def cmd_target_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /target_close          → ferme TOUTES les positions target + stoppe tous les traders
+    /target_close 0xADR    → ferme les positions d'un trader spécifique + le stoppe
+    /target_close --keep   → ferme les positions mais garde les WebSockets actifs
+    """
+    if not is_authorized(update):
+        return
+
+    args = context.args or []
+    keep_watching = "--keep" in args
+    specific_addr = next((a for a in args if a.startswith("0x")), None)
+
+    # Déterminer les targets concernés
+    if specific_addr:
+        specific_addr = specific_addr.strip().lower()
+        if specific_addr not in target_registry:
+            await update.message.reply_text(
+                f"⚠️ `{specific_addr[:20]}...` non trouvé dans les targets actifs.",
+                parse_mode="Markdown"
+            )
+            return
+        targets_concerned = {specific_addr: target_registry[specific_addr]}
+        scope_label = f"`{specific_addr[:16]}...`"
+    else:
+        targets_concerned = dict(target_registry)
+        scope_label = "tous les targets"
+
+    if not targets_concerned:
+        await update.message.reply_text("ℹ️ Aucun target actif à fermer.")
+        return
+
+    await update.message.reply_text(
+        f"🚨 *FERMETURE D'URGENCE* — {scope_label}\\n"
+        f"🔄 Fermeture de toutes les positions en cours...",
+        parse_mode="Markdown"
+    )
+
+    # Récupérer les vraies positions ouvertes sur HL
+    real_positions = await get_my_positions()
+
+    # Identifier les assets liés aux traders concernés
+    assets_to_close = {}
+    for asset, pos in list(target_positions.items()):
+        if pos.get("trader_addr") in targets_concerned:
+            if asset in real_positions:
+                assets_to_close[asset] = real_positions[asset]
+            else:
+                # Position dans le state mais plus sur HL — nettoyer
+                target_positions.pop(asset, None)
+                logger.info(f"target_close: {asset} plus sur HL, state nettoyé")
+
+    results = []
+
+    if not assets_to_close:
+        results.append("ℹ️ Aucune position ouverte sur HL pour ces traders.")
+    else:
+        for asset, pos in assets_to_close.items():
+            is_buy = pos["side"] == "short"  # pour fermer: short→buy, long→sell
+            result = await place_order(asset, is_buy, pos["size"], "EMERGENCY CLOSE")
+            if "error" not in result:
+                status = "✅"
+                target_positions.pop(asset, None)
+                logger.info(f"target_close: {asset} fermé avec succès")
+            else:
+                status = f"❌ {result.get('error', '?')}"
+                logger.error(f"target_close: {asset} erreur fermeture → {result}")
+            side_label = pos["side"].upper()
+            results.append(f"{status} *{asset}* {side_label} sz:{pos['size']:.4f}")
+
+    # Stopper les WebSockets si --keep non spécifié
+    stopped_traders = []
+    if not keep_watching:
+        for addr, info in list(targets_concerned.items()):
+            task = info.get("ws_task")
+            if task and not task.done():
+                task.cancel()
+            target_registry.pop(addr, None)
+            label = info.get("label", addr[:16])
+            stopped_traders.append(f"🛑 {label}")
+            logger.info(f"target_close: trader {addr[:12]} stoppé")
+
+    # Construire la réponse finale
+    lines = ["🏁 *FERMETURE D'URGENCE TERMINÉE*", "━━━━━━━━━━━━━━━━━━━━"]
+    lines += results
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    if keep_watching:
+        lines.append("👁 Surveillance conservée (`--keep`)")
+    elif stopped_traders:
+        lines.append("*Traders stoppés:*")
+        lines += stopped_traders
+
+    await update.message.reply_text("\\n".join(lines), parse_mode="Markdown")
 
 
 import urllib.request
@@ -2749,16 +2862,22 @@ import urllib.request
 def main():
     token = TELEGRAM_TOKEN
     base  = f"https://api.telegram.org/bot{token}"
-    for attempt in range(10):
+
+    # [FIX v4.5d] Forcer la libération du token Telegram avant démarrage
+    # Tuer toute instance précédente via offset=-1 pour vider la queue
+    logger.info("🔄 Libération du token Telegram (nettoyage instance précédente)...")
+    for attempt in range(15):
         try:
             urllib.request.urlopen(f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5)
-            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=1", timeout=5)
+            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&limit=1&timeout=0", timeout=5)
+            logger.info("✅ Token libéré avec succès")
             break
         except Exception as e:
-            logger.warning(f"Init HTTP attempt {attempt+1}/10: {e}")
-            time_module.sleep(2)
+            wait = min(2 ** attempt, 30)  # backoff exponentiel: 1s, 2s, 4s... max 30s
+            logger.warning(f"Init HTTP attempt {attempt+1}/15: {e} — attente {wait}s")
+            time_module.sleep(wait)
 
-    time_module.sleep(3)
+    time_module.sleep(5)  # [FIX] 3s → 5s pour laisser l'ancienne instance mourir
 
     app = (
         Application.builder()
@@ -2770,11 +2889,17 @@ def main():
         .build()
     )
 
+    # [FIX v4.5d] Backoff exponentiel sur conflit 409 au lieu de 20s fixe
+    _conflict_count = {"n": 0}
+
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit résiduel — attente 20s...")
-            await asyncio.sleep(20)
+            _conflict_count["n"] += 1
+            wait = min(5 * _conflict_count["n"], 60)  # 5s, 10s, 15s... max 60s
+            logger.warning(f"⚠️ Conflit résiduel #{_conflict_count['n']} — attente {wait}s...")
+            await asyncio.sleep(wait)
         else:
+            _conflict_count["n"] = 0  # reset si autre type d'erreur
             logger.error(f"Erreur: {context.error}")
 
     app.add_error_handler(error_handler)
@@ -2806,9 +2931,10 @@ def main():
     app.add_handler(CommandHandler("target",        cmd_target))
     app.add_handler(CommandHandler("target_sync",   cmd_target_sync))
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
+    app.add_handler(CommandHandler("target_close",  cmd_target_close_all))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.4 démarré — Multi-target, tout market — ouverture, renfort, fermeture!")
+    logger.info("🤖 SakaiBot v4.5d démarré — Multi-target, tout market — ouverture, renfort, fermeture!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
