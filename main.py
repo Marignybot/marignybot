@@ -1096,7 +1096,7 @@ def rank_and_score_traders(traders: list) -> list:
 
     avant = len(traders)
 
-    traders = [t for t in traders if t.get("winrate", 0) >= 80]
+    traders = [t for t in traders if t.get("winrate", 0) >= 50]
     traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= 25]
     traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
     traders = [t for t in traders if t.get("pnl", 0) > 0]
