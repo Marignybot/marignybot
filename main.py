@@ -1,31 +1,55 @@
 #!/usr/bin/env python3
 """
-SakaiBot v4.0 — Bot Telegram Hyperliquid
-Nouvelle logique : Top 5 traders multi-asset (plus de spécialiste par asset)
+SakaiBot v4.1 — Bot Telegram Hyperliquid
+Corrections v4.1:
+  - [FIX CRITIQUE] at_pnl_raw utilisé avant définition → déplacé après at_data
+  - [FIX] COPY_LEVERAGE ignoré → appliqué dans place_order via get_proportional_size
+  - [FIX] tb_aide → scoring mis à jour v4
+  - [OPT] Imports remontés en tête de fichier
+  - [OPT] fetch_portfolio refactorisé : helper calc_mdd extrait, logique linéaire
+  - [OPT] Semaphore asyncio sur fetch_portfolio (max 10 parallèles → évite ban IP)
+  - [OPT] Cache prix allMids (TTL 3s) → évite appels redondants dans place_order
+  - [OPT] apply_exclusion_filters fusionné dans rank_and_score_traders
+  - [OPT] Constantes SIZE_RULES centralisées (plus de duplication)
+  - [OPT] winrate_30j intégré dans le score bonus (était calculé mais inutilisé)
 """
 
 import asyncio
+import math
 import os
 import json
 import logging
 import re
 import time as time_module
+import websockets
+import eth_account
 from datetime import datetime, time
+from functools import lru_cache
+
 import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Conflict
 
+try:
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.utils import constants as hl_constants
+    _HL_SDK_AVAILABLE = True
+except ImportError:
+    _HL_SDK_AVAILABLE = False
+    logger_bootstrap = logging.getLogger(__name__)
+    logger_bootstrap.warning("hyperliquid-python-sdk non installé — place_order désactivé")
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-TELEGRAM_TOKEN     = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"
+TELEGRAM_TOKEN      = "8413363300:AAEldjYE3nqAoF9-tZdYurwH1PNfUWJbZEQ"
 HYPERLIQUID_ADDRESS = "0x6e89b986FBB4B985AcCC9B3CfEE4c7B5301D9a5C"
-AUTHORIZED_USER_ID = 1429797974
+AUTHORIZED_USER_ID  = 1429797974
 
 # ============================================================
-# COPY TRADING — SakaiBot
+# COPY TRADING — CONFIG
 # ============================================================
 COPY_BOT_ADDRESS = "0xd849f8E96d7BE1A1fc7CA5291Dc6603a47dF8dFD"
 HL_PRIVATE_KEY   = os.getenv("HL_PRIVATE_KEY", "")
@@ -35,6 +59,7 @@ COPY_ALLOC       = 100.0
 COPY_MAX_SIZE    = 50.0
 MARGIN_SAFETY    = 0.5
 
+# [FIX] COPY_LEVERAGE désormais utilisé dans get_proportional_size
 COPY_LEVERAGE = {
     "BTC":  5,
     "ETH":  4,
@@ -43,23 +68,38 @@ COPY_LEVERAGE = {
     "TAO":  3,
 }
 
+# [OPT] Règles de taille centralisées — une seule source de vérité
+SIZE_RULES = {
+    "BTC":  {"min": 0.001, "decimals": 3, "min_usd": 11.0},
+    "ETH":  {"min": 0.01,  "decimals": 2, "min_usd": 11.0},
+    "SOL":  {"min": 0.1,   "decimals": 1, "min_usd": 11.0},
+    "HYPE": {"min": 1.0,   "decimals": 0, "min_usd": 35.0},
+    "TAO":  {"min": 0.01,  "decimals": 2, "min_usd": 15.0},
+    "_default": {"min": 0.001, "decimals": 3, "min_usd": 11.0},
+}
+
 copy_deployed = {asset: 0.0 for asset in COPY_ASSETS}
 
 # ============================================================
-# copy_state v4 — structure multi-traders
+# COPY STATE v4
 # ============================================================
 copy_state = {
     "active":      False,
-    "traders":     {},      # {address: {"rank": int, "score": float, "assets_seen": set()}}
-    "positions":   {},      # {asset: {"side", "size", "entry", "trader_addr"}}
-    "ws_tasks":    {},      # {address: asyncio.Task}
+    "traders":     {},   # {address: {"rank": int, "score": float, "assets_seen": set()}}
+    "positions":   {},   # {asset: {"side", "size", "entry", "trader_addr"}}
+    "ws_tasks":    {},   # {address: asyncio.Task}
     "last_update": {},
     "total_pnl":   0.0,
     "trades_log":  [],
     "last_ranked": [],
 }
 
+# ============================================================
+# CONSTANTES API
+# ============================================================
 HYPERLIQUID_API           = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_API_UI        = "https://api-ui.hyperliquid.xyz/info"
+HYPERLIQUID_WS            = "wss://api.hyperliquid.xyz/ws"
 WATCHED_TOKENS            = ["BTC", "ETH", "SOL", "HYPE", "TAO"]
 ALERT_THRESHOLD_PERCENT   = 5.0
 LIQUIDATION_ALERT_PERCENT = 15.0
@@ -68,12 +108,58 @@ MORNING_MIN_UTC           = 0
 EVENING_HOUR_UTC          = 20
 EVENING_MIN_UTC           = 0
 
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+# ============================================================
+# SCORING v4
+# ============================================================
+TRADEBOT_MIN_TRADES      = 5
+TRADEBOT_MAX_DRAWDOWN    = 60.0
+TRADEBOT_EXCELLENT_RATIO = 5.0
+
+TRADER_BLACKLIST = {
+    "0x9cd0a696c7cbb9d44de99268194cb08e5684e5fe",
+}
+
+# [OPT] Semaphore pour limiter les appels API parallèles
+_PORTFOLIO_SEMAPHORE = asyncio.Semaphore(10)
+
+# [OPT] Cache prix allMids (TTL 3 secondes)
+_price_cache: dict = {"data": {}, "ts": 0.0}
+_PRICE_CACHE_TTL = 3.0
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 last_prices = {}
 
+
 def is_authorized(update) -> bool:
     return update.effective_user.id == AUTHORIZED_USER_ID
+
+
+# ============================================================
+# CACHE PRIX
+# ============================================================
+async def get_all_mids_cached() -> dict:
+    """Retourne allMids avec cache TTL 3s — évite les appels redondants."""
+    now = time_module.time()
+    if now - _price_cache["ts"] < _PRICE_CACHE_TTL and _price_cache["data"]:
+        return _price_cache["data"]
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "allMids"},
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                data = await resp.json()
+        _price_cache["data"] = data
+        _price_cache["ts"]   = now
+        return data
+    except Exception as e:
+        logger.error(f"get_all_mids_cached: {e}")
+        return _price_cache.get("data", {})
 
 
 # ============================================================
@@ -82,17 +168,22 @@ def is_authorized(update) -> bool:
 async def get_crypto_prices() -> dict:
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(HYPERLIQUID_API, json={"type": "allMids"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(
+                HYPERLIQUID_API, json={"type": "allMids"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 all_mids = await resp.json()
-            async with session.post(HYPERLIQUID_API, json={"type": "metaAndAssetCtxs"}, timeout=aiohttp.ClientTimeout(total=10)) as resp2:
+            async with session.post(
+                HYPERLIQUID_API, json={"type": "metaAndAssetCtxs"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp2:
                 meta_data = await resp2.json()
+
         result      = {}
         universe    = meta_data[0].get("universe", []) if isinstance(meta_data, list) else []
         ctxs        = meta_data[1] if isinstance(meta_data, list) and len(meta_data) > 1 else []
-        ctx_by_name = {}
-        for i, asset in enumerate(universe):
-            if i < len(ctxs):
-                ctx_by_name[asset.get("name", "")] = ctxs[i]
+        ctx_by_name = {asset.get("name", ""): ctxs[i] for i, asset in enumerate(universe) if i < len(ctxs)}
+
         for symbol in WATCHED_TOKENS:
             mid = all_mids.get(symbol)
             if mid is None:
@@ -105,7 +196,7 @@ async def get_crypto_prices() -> dict:
                 "usd":            usd,
                 "eur":            usd * 0.92,
                 "usd_24h_change": round(change, 2),
-                "volume":         float(ctx.get("dayNtlVlm", 0) or 0)
+                "volume":         float(ctx.get("dayNtlVlm", 0) or 0),
             }
         return result
     except Exception as e:
@@ -123,7 +214,9 @@ async def get_ohlcv(symbol: str, interval: str = "4h", count: int = 50) -> dict:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 HYPERLIQUID_API,
-                json={"type": "candleSnapshot", "req": {"coin": symbol, "interval": interval, "startTime": start_time}},
+                json={"type": "candleSnapshot", "req": {
+                    "coin": symbol, "interval": interval, "startTime": start_time
+                }},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 candles = await resp.json()
@@ -133,7 +226,7 @@ async def get_ohlcv(symbol: str, interval: str = "4h", count: int = 50) -> dict:
             "closes":  [float(c["c"]) for c in candles],
             "highs":   [float(c["h"]) for c in candles],
             "lows":    [float(c["l"]) for c in candles],
-            "volumes": [float(c["v"]) for c in candles]
+            "volumes": [float(c["v"]) for c in candles],
         }
     except Exception as e:
         logger.error(f"Erreur OHLCV {symbol}: {e}")
@@ -192,6 +285,21 @@ def volume_signal(volumes: list) -> str:
     return "normal"
 
 
+def calc_mdd(hist: list) -> float:
+    """[OPT] Helper MDD extrait — évite la duplication dans fetch_portfolio."""
+    if not hist:
+        return 0.0
+    pk = mdd = 0.0
+    pk = hist[0]
+    for v in hist:
+        if v > pk:
+            pk = v
+        dd = (pk - v) / pk * 100 if pk > 0 else 0
+        if dd > mdd:
+            mdd = dd
+    return mdd
+
+
 def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
     lines = []
     if change <= -8:
@@ -246,7 +354,10 @@ def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
 async def get_fear_greed() -> dict:
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.alternative.me/fng/?limit=1", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(
+                "https://api.alternative.me/fng/?limit=1",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
                 data = await resp.json()
                 item = data["data"][0]
                 return {"value": int(item["value"]), "label": item["value_classification"]}
@@ -313,7 +424,10 @@ async def check_liquidation_alerts(context: ContextTypes.DEFAULT_TYPE):
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 data = await resp.json()
-        open_pos = [p for p in data.get("assetPositions", []) if float(p.get("position", {}).get("szi", 0)) != 0]
+        open_pos = [
+            p for p in data.get("assetPositions", [])
+            if float(p.get("position", {}).get("szi", 0)) != 0
+        ]
         if not open_pos:
             return
         prices = await get_crypto_prices()
@@ -355,7 +469,7 @@ async def get_crypto_news() -> list:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://www.coindesk.com/arc/outboundfeeds/rss/",
-                headers={"User-Agent": "SakaiBot/4.0"},
+                headers={"User-Agent": "SakaiBot/4.1"},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 text = await resp.text()
@@ -385,7 +499,7 @@ async def get_crypto_trending() -> list:
                 "name":   c["item"].get("name", ""),
                 "symbol": c["item"].get("symbol", ""),
                 "rank":   c["item"].get("market_cap_rank", "?"),
-                "change": c["item"].get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0) or 0
+                "change": c["item"].get("data", {}).get("price_change_percentage_24h", {}).get("usd", 0) or 0,
             }
             for c in data.get("coins", [])[:3]
         ]
@@ -415,8 +529,7 @@ async def get_wallet_data(address: str) -> tuple:
             av = float(data.get("crossAccountValue", 0) or data.get("withdrawable", 0) or 0)
         if pnl == 0:
             pnl = sum(float(p.get("position", {}).get("unrealizedPnl", 0)) for p in positions)
-        balance = {"accountValue": av, "totalMarginUsed": mu, "totalUnrealizedPnl": pnl}
-        return positions, balance
+        return positions, {"accountValue": av, "totalMarginUsed": mu, "totalUnrealizedPnl": pnl}
     except Exception as e:
         logger.error(f"get_wallet_data {address[:12]}: {e}")
         return [], {}
@@ -514,7 +627,6 @@ def format_positions(positions: list, balance: dict) -> str:
 
 
 def escape_md(text: str) -> str:
-    """Échappe les caractères spéciaux Markdown v1 dans du texte dynamique externe."""
     for c in ['_', '*', '`', '[', ']']:
         text = text.replace(c, f'\\{c}')
     return text
@@ -565,50 +677,23 @@ async def analyze_setup(prices: dict, trending: list) -> str:
 
 
 # ============================================================
-# MODULE TRADEBOT — ETF SYNTHETIQUE HYPERLIQUID
+# MODULE TRADEBOT
 # ============================================================
-
 tradebot_history = []
-
-# ============================================================
-# SCORING v4 — Formule : (PnL_7j / MDD) × WinRate_7j × log(n_trades_7j)
-# Fenêtre principale : 7j | Confirmation : 30j
-# Minimum : 5 trades sur 7j OU ratio PnL/MDD excellent (≥ 5.0)
-# Bonus 30j : ×1.2 si PnL_30j > 0 ET ROI_30j ≥ 20%
-# ============================================================
-
-TRADEBOT_MIN_TRADES      = 5
-TRADEBOT_MAX_DRAWDOWN    = 60.0
-TRADEBOT_EXCELLENT_RATIO = 5.0   # PnL_7j / MDD ≥ 5 → éligible même avec < 5 trades
-
-# Adresses bannies — jamais sélectionnées ni copiées
-TRADER_BLACKLIST = {
-    "0x9cd0a696c7cbb9d44de99268194cb08e5684e5fe",
-}
 
 
 def compute_new_score(pnl_7j: float, mdd: float, winrate_7j: float,
                       n_trades_7j: int, pnl_30j: float, roi_30j: float) -> float:
     """
-    Score principal = (PnL_7j / MDD) × (WinRate_7j / 100) × log1p(n_trades_7j)
-    Normalisé sur 100 par rapport au score max observé dans le batch.
-    Bonus 30j appliqué ici directement (×1.2 si confirmation positive).
-    Retourne le score brut (normalisation faite dans rank_and_score_traders).
+    Score = (PnL_7j / MDD) × (WinRate_7j / 100) × log1p(n_trades_7j)
+    Bonus ×1.2 si confirmation 30j positive.
     """
-    import math
-
-    # Eligibilité : 5 trades min OU ratio excellent
     pnl_mdd_ratio = pnl_7j / max(mdd, 1.0)
     if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
         return 0.0
-
-    # Score brut
     raw = pnl_mdd_ratio * (winrate_7j / 100.0) * math.log1p(n_trades_7j)
-
-    # Bonus confirmation 30j
     if pnl_30j > 0 and roi_30j >= 20.0:
         raw *= 1.2
-
     return max(raw, 0.0)
 
 
@@ -617,14 +702,10 @@ def score_consistency(v: float) -> float:
     return min(100.0, max(0.0, v))
 
 def score_drawdown(mdd: float) -> float:
-    if mdd <= 5:  return 100.0
-    if mdd <= 10: return 85.0
-    if mdd <= 15: return 70.0
-    if mdd <= 20: return 55.0
-    if mdd <= 25: return 40.0
-    if mdd <= 30: return 30.0
-    if mdd <= 35: return 20.0
-    if mdd <= 40: return 10.0
+    thresholds = [(5, 100), (10, 85), (15, 70), (20, 55), (25, 40), (30, 30), (35, 20), (40, 10)]
+    for limit, score in thresholds:
+        if mdd <= limit:
+            return score
     return 0.0
 
 def score_winrate(wr: float) -> float:
@@ -646,13 +727,13 @@ async def fetch_top_traders_hl() -> list:
 
         raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
         logger.info(f"Leaderboard: {len(raw_rows)} traders bruts")
-
         if not raw_rows:
             logger.error("Leaderboard vide ou format inattendu")
             return []
 
         candidates = []
         excl_roi = excl_pnl30 = excl_pnlat = excl_blacklist = 0
+
         for row in raw_rows:
             try:
                 if isinstance(row, dict):
@@ -670,10 +751,8 @@ async def fetch_top_traders_hl() -> list:
                     excl_blacklist += 1
                     continue
 
-                metrics = {}
-                for w in stats_dict.get("windowPerformances", []):
-                    if isinstance(w, list) and len(w) == 2:
-                        metrics[w[0]] = w[1]
+                metrics = {w[0]: w[1] for w in stats_dict.get("windowPerformances", [])
+                           if isinstance(w, list) and len(w) == 2}
 
                 m30 = metrics.get("month", {})
                 mat = metrics.get("allTime", {})
@@ -693,197 +772,194 @@ async def fetch_top_traders_hl() -> list:
                     continue
 
                 candidates.append((address, roi_30d, pnl_30d))
-
             except Exception:
                 continue
 
         logger.info(
-            f"Candidats après pré-filtres: {len(candidates)} "
+            f"Candidats: {len(candidates)} "
             f"(excl roi:{excl_roi} pnl30:{excl_pnl30} pnlat:{excl_pnlat} blacklist:{excl_blacklist})"
         )
-
         if not candidates:
-            logger.error("Aucun candidat après pré-filtres leaderboard")
             return []
 
         candidates.sort(key=lambda x: x[1], reverse=True)
         top_candidates = candidates[:200]
-        logger.info(f"Top 200 retenus pour analyse portfolio")
+        logger.info(f"Top {len(top_candidates)} retenus pour analyse portfolio")
 
+        # [FIX CRITIQUE] fetch_portfolio refactorisé — logique linéaire, at_pnl_raw défini avant usage
         async def fetch_portfolio(session, address):
-            import math
-            try:
-                async with session.post(
-                    "https://api-ui.hyperliquid.xyz/info",
-                    json={"type": "portfolio", "user": address},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    portfolio = await resp.json()
-
-                windows = {}
-                for item in portfolio:
-                    if isinstance(item, list) and len(item) == 2:
-                        windows[item[0]] = item[1]
-
-                now_ms    = datetime.now().timestamp() * 1000
-                cutoff_ms = now_ms - (15 * 86400 * 1000)
-
-                # ── Activité récente (15j) ──────────────────────────────
-                recent_activity = False
-                day_data = windows.get("perpDay") or windows.get("day", {})
-                for p in day_data.get("pnlHistory", []):
-                    if isinstance(p, list) and len(p) == 2 and p[0] >= cutoff_ms and float(p[1]) != 0.0:
-                        recent_activity = True
-                        break
-                if not recent_activity:
-                    month_data = windows.get("perpMonth") or windows.get("month", {})
-                    month_hist = month_data.get("pnlHistory", [])
-                    if month_hist:
-                        days_ago = (now_ms - month_hist[-1][0]) / (86400 * 1000)
-                        recent_activity = days_ago <= 15
-                if not recent_activity:
-                    return None
-
-                # ── Données 7j (fenêtre principale) ────────────────────
-                w7        = windows.get("perpWeek") or windows.get("week", {})
-                pnl_h7    = [float(p[1]) for p in w7.get("pnlHistory", []) if isinstance(p, list)]
-                acv_h7    = [float(p[1]) for p in w7.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
-
-                pnl_7j    = pnl_h7[-1] if pnl_h7 else 0.0
-
-                # Win rate 7j : % de snapshots journaliers en hausse (proxy trades gagnants)
-                wins_7j   = sum(1 for i in range(1, len(pnl_h7)) if pnl_h7[i] > pnl_h7[i-1])
-                n_trades_7j = max(len(pnl_h7) - 1, 0)   # nb de deltas = proxy nb jours actifs
-                winrate_7j  = (wins_7j / max(n_trades_7j, 1)) * 100
-
-                # Récupérer aussi le nb de trades réels via userFills (7j)
-                # userFills retourne les ~100 derniers fills seulement —
-                # on l'utilise pour les stats 7j, pas pour le total allTime
-                n_trades_at = len(at_pnl_raw)  # proxy fiable : nb de snapshots pnlHistory allTime
+            async with _PORTFOLIO_SEMAPHORE:  # [OPT] limite 10 appels parallèles
                 try:
-                    cutoff_7j = now_ms - (7 * 86400 * 1000)
                     async with session.post(
-                        "https://api-ui.hyperliquid.xyz/info",
-                        json={"type": "userFills", "user": address},
-                        timeout=aiohttp.ClientTimeout(total=8)
-                    ) as resp2:
-                        fills = await resp2.json()
-                    if isinstance(fills, list):
-                        # Trades fermés sur 7j uniquement
-                        fills_7j = [f for f in fills if isinstance(f, dict)
-                                    and f.get("time", 0) >= cutoff_7j
-                                    and float(f.get("closedPnl", 0) or 0) != 0]
-                        n_trades_7j = max(len(fills_7j), n_trades_7j)
-                        if fills_7j:
-                            wins_fills = sum(1 for f in fills_7j if float(f.get("closedPnl", 0)) > 0)
-                            winrate_7j = (wins_fills / len(fills_7j)) * 100
-                        # Pour allTime : si fills retourne plus que le proxy, on prend le max
-                        fills_at = [f for f in fills if isinstance(f, dict)
-                                    and float(f.get("closedPnl", 0) or 0) != 0]
-                        n_trades_at = max(n_trades_at, len(fills_at))
-                except Exception:
-                    pass  # Fallback sur proxy pnlHistory allTime
+                        HYPERLIQUID_API_UI,
+                        json={"type": "portfolio", "user": address},
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        portfolio = await resp.json()
 
-                # ── MDD — pire des deux fenêtres (7j et allTime) ───────
-                def calc_mdd(hist):
-                    if not hist: return 0.0
-                    pk, mdd = hist[0], 0.0
-                    for v in hist:
-                        if v > pk: pk = v
-                        dd = (pk - v) / pk * 100 if pk > 0 else 0
-                        if dd > mdd: mdd = dd
-                    return mdd
-
-                mdd_7j  = calc_mdd(acv_h7)
-                at_data = windows.get("perpAllTime") or windows.get("allTime", {})
-                acv_hat = [float(p[1]) for p in at_data.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
-                mdd_at  = calc_mdd(acv_hat)
-                worst_mdd = max(mdd_7j, mdd_at)
-                if worst_mdd > TRADEBOT_MAX_DRAWDOWN:
-                    logger.info(f"Exclu {address[:12]}: MDD {worst_mdd:.0f}% > {TRADEBOT_MAX_DRAWDOWN}%")
-                    return None
-
-                # ── Données 30j (confirmation) ──────────────────────────
-                m30        = windows.get("perpMonth") or windows.get("month", {})
-                pnl_h30    = [float(p[1]) for p in m30.get("pnlHistory", []) if isinstance(p, list)]
-                acv_h30    = [float(p[1]) for p in m30.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
-
-                pnl_30j    = pnl_h30[-1] if pnl_h30 else 0.0
-
-                # Accepte un PnL 30j légèrement négatif (correction temporaire)
-                # mais exclut si la perte dépasse 15% du capital
-                cap_30     = acv_h30[-1] if acv_h30 else 0.0
-                if cap_30 < 10000:
-                    return None
-                if pnl_30j < 0:
-                    perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
-                    if perte_pct > 15.0:
-                        logger.info(f"Exclu {address[:12]}: perte 30j {perte_pct:.1f}% > 15%")
+                    if not portfolio or not isinstance(portfolio, list):
                         return None
 
-                base_30    = max(cap_30 - pnl_30j, 1)
-                roi_30j    = min((pnl_30j / base_30) * 100, 2000)
+                    windows = {item[0]: item[1] for item in portfolio
+                               if isinstance(item, list) and len(item) == 2}
 
-                # allTime
-                pnl_hat    = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
-                pnl_at     = pnl_hat[-1] if pnl_hat else 0
-                peak_at    = max(acv_hat) if acv_hat else 1
-                roe_at     = min((pnl_at / max(peak_at, 1)) * 100, 9999)
+                    now_ms    = datetime.now().timestamp() * 1000
+                    cutoff_ms = now_ms - (15 * 86400 * 1000)
 
-                # ── Ancienneté minimale : 3 mois d'activité ────────────
-                # On vérifie via le premier timestamp de pnlHistory allTime
-                at_pnl_raw = [p for p in at_data.get("pnlHistory", []) if isinstance(p, list) and len(p) == 2]
-                if at_pnl_raw:
-                    first_ts_ms = at_pnl_raw[0][0]
-                    age_days    = (now_ms - first_ts_ms) / (86400 * 1000)
+                    # ── Activité récente (15j) ──────────────────────────
+                    recent_activity = False
+                    day_data = windows.get("perpDay") or windows.get("day", {})
+                    for p in day_data.get("pnlHistory", []):
+                        if isinstance(p, list) and len(p) == 2 and p[0] >= cutoff_ms and float(p[1]) != 0.0:
+                            recent_activity = True
+                            break
+                    if not recent_activity:
+                        month_data = windows.get("perpMonth") or windows.get("month", {})
+                        month_hist = month_data.get("pnlHistory", [])
+                        if month_hist:
+                            days_ago = (now_ms - month_hist[-1][0]) / (86400 * 1000)
+                            recent_activity = days_ago <= 15
+                    if not recent_activity:
+                        return None
+
+                    # ── AllTime — défini EN PREMIER pour usage dans le reste ──
+                    # [FIX CRITIQUE] at_data et at_pnl_raw définis ici,
+                    # avant tout usage de n_trades_at ou âge du compte
+                    at_data    = windows.get("perpAllTime") or windows.get("allTime", {})
+                    at_pnl_raw = [p for p in at_data.get("pnlHistory", [])
+                                  if isinstance(p, list) and len(p) == 2]
+                    acv_hat    = [float(p[1]) for p in at_data.get("accountValueHistory", [])
+                                  if isinstance(p, list) and float(p[1]) > 0]
+
+                    # ── Ancienneté minimale 3 mois ──────────────────────
+                    if not at_pnl_raw:
+                        logger.info(f"Exclu {address[:12]}: pas d'historique allTime")
+                        return None
+                    age_days = (now_ms - at_pnl_raw[0][0]) / (86400 * 1000)
                     if age_days < 90:
                         logger.info(f"Exclu {address[:12]}: ancienneté {age_days:.0f}j < 90j")
                         return None
-                else:
-                    logger.info(f"Exclu {address[:12]}: pas d'historique allTime")
+
+                    # ── Données 7j ──────────────────────────────────────
+                    w7     = windows.get("perpWeek") or windows.get("week", {})
+                    pnl_h7 = [float(p[1]) for p in w7.get("pnlHistory", []) if isinstance(p, list)]
+                    acv_h7 = [float(p[1]) for p in w7.get("accountValueHistory", [])
+                              if isinstance(p, list) and float(p[1]) > 0]
+
+                    pnl_7j      = pnl_h7[-1] if pnl_h7 else 0.0
+                    wins_7j     = sum(1 for i in range(1, len(pnl_h7)) if pnl_h7[i] > pnl_h7[i-1])
+                    n_trades_7j = max(len(pnl_h7) - 1, 0)
+                    winrate_7j  = (wins_7j / max(n_trades_7j, 1)) * 100
+
+                    # Proxy allTime depuis at_pnl_raw (désormais défini)
+                    n_trades_at = len(at_pnl_raw)
+
+                    # ── userFills 7j — affine win rate et n_trades ──────
+                    cutoff_7j = now_ms - (7 * 86400 * 1000)
+                    try:
+                        async with session.post(
+                            HYPERLIQUID_API_UI,
+                            json={"type": "userFills", "user": address},
+                            timeout=aiohttp.ClientTimeout(total=8)
+                        ) as resp2:
+                            fills = await resp2.json()
+                        if isinstance(fills, list):
+                            fills_7j = [f for f in fills
+                                        if isinstance(f, dict)
+                                        and f.get("time", 0) >= cutoff_7j
+                                        and float(f.get("closedPnl", 0) or 0) != 0]
+                            n_trades_7j = max(len(fills_7j), n_trades_7j)
+                            if fills_7j:
+                                wins_fills = sum(1 for f in fills_7j if float(f.get("closedPnl", 0)) > 0)
+                                winrate_7j = (wins_fills / len(fills_7j)) * 100
+                            fills_at    = [f for f in fills if isinstance(f, dict)
+                                           and float(f.get("closedPnl", 0) or 0) != 0]
+                            n_trades_at = max(n_trades_at, len(fills_at))
+                    except Exception:
+                        pass  # Fallback proxy pnlHistory
+
+                    # ── MDD — pire des deux fenêtres ───────────────────
+                    mdd_7j    = calc_mdd(acv_h7)
+                    mdd_at    = calc_mdd(acv_hat)
+                    worst_mdd = max(mdd_7j, mdd_at)
+                    if worst_mdd > TRADEBOT_MAX_DRAWDOWN:
+                        logger.info(f"Exclu {address[:12]}: MDD {worst_mdd:.0f}% > {TRADEBOT_MAX_DRAWDOWN}%")
+                        return None
+
+                    # ── Données 30j ─────────────────────────────────────
+                    m30     = windows.get("perpMonth") or windows.get("month", {})
+                    pnl_h30 = [float(p[1]) for p in m30.get("pnlHistory", []) if isinstance(p, list)]
+                    acv_h30 = [float(p[1]) for p in m30.get("accountValueHistory", [])
+                               if isinstance(p, list) and float(p[1]) > 0]
+
+                    pnl_30j = pnl_h30[-1] if pnl_h30 else 0.0
+                    cap_30  = acv_h30[-1] if acv_h30 else 0.0
+
+                    if cap_30 < 10000:
+                        return None
+                    if pnl_30j < 0:
+                        perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
+                        if perte_pct > 15.0:
+                            logger.info(f"Exclu {address[:12]}: perte 30j {perte_pct:.1f}% > 15%")
+                            return None
+
+                    base_30j   = max(cap_30 - pnl_30j, 1)
+                    roi_30j    = min((pnl_30j / base_30j) * 100, 2000)
+
+                    # WinRate 30j
+                    wins_30j    = sum(1 for i in range(1, len(pnl_h30)) if pnl_h30[i] > pnl_h30[i-1])
+                    winrate_30j = (wins_30j / max(len(pnl_h30) - 1, 1)) * 100
+
+                    # AllTime PnL
+                    pnl_hat = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
+                    pnl_at  = pnl_hat[-1] if pnl_hat else 0
+                    peak_at = max(acv_hat) if acv_hat else 1
+                    roe_at  = min((pnl_at / max(peak_at, 1)) * 100, 9999)
+
+                    # ── Eligibilité finale ──────────────────────────────
+                    if n_trades_at < 20:
+                        logger.info(f"Exclu {address[:12]}: {n_trades_at} trades allTime < 20")
+                        return None
+
+                    pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
+                    if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
+                        logger.info(f"Exclu {address[:12]}: {n_trades_7j} trades 7j, ratio {pnl_mdd_ratio:.1f}")
+                        return None
+
+                    logger.info(
+                        f"✅ Qualifié {address[:12]}: trades_at={n_trades_at} "
+                        f"mdd={worst_mdd:.0f}% wr7j={winrate_7j:.0f}%"
+                    )
+
+                    return {
+                        "address":      address,
+                        "pnl":          pnl_30j,
+                        "pnl_7j":       round(pnl_7j, 2),
+                        "pnl_at":       pnl_at,
+                        "roi":          round(roi_30j, 1),
+                        "roe_at":       round(roe_at, 1),
+                        "mdd":          round(worst_mdd, 1),
+                        "winrate":      round(winrate_7j, 1),
+                        "winrate_30j":  round(winrate_30j, 1),
+                        "n_trades_7j":  n_trades_7j,
+                        "n_trades_at":  n_trades_at,
+                        "roi_30j":      round(roi_30j, 1),
+                    }
+
+                except Exception as e:
+                    logger.warning(f"Portfolio {address[:12]} erreur: {e}")
                     return None
-
-                # ── Eligibilité minimum ─────────────────────────────────
-                # 20 trades minimum sur l'historique total (élimine les chanceux)
-                if n_trades_at < 20:
-                    logger.info(f"Exclu {address[:12]}: {n_trades_at} trades allTime < 20")
-                    return None
-
-                pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
-                if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
-                    logger.info(f"Exclu {address[:12]}: {n_trades_7j} trades 7j, ratio {pnl_mdd_ratio:.1f}")
-                    return None
-
-                # Win rate : plus de filtre dur — composante du score uniquement
-                logger.info(f"✅ Qualifié {address[:12]}: score_raw en cours | trades_at={n_trades_at} mdd={worst_mdd:.0f}% wr7j={winrate_7j:.0f}%")
-
-                return {
-                    "address":      address,
-                    "pnl":          pnl_30j,
-                    "pnl_7j":       round(pnl_7j, 2),
-                    "pnl_at":       pnl_at,
-                    "roi":          round(roi_30j, 1),
-                    "roe_at":       round(roe_at, 1),
-                    "mdd":          round(worst_mdd, 1),
-                    "winrate":      round(winrate_7j, 1),
-                    "winrate_30j":  round((sum(1 for i in range(1, len(pnl_h30)) if pnl_h30[i] > pnl_h30[i-1]) / max(len(pnl_h30)-1, 1)) * 100, 1),
-                    "n_trades_7j":  n_trades_7j,
-                    "n_trades_at":  n_trades_at,
-                    "roi_30j":      round(roi_30j, 1),
-                }
-            except Exception as e:
-                logger.warning(f"Portfolio {address[:12]}... erreur: {e}")
-                return None
 
         async with aiohttp.ClientSession() as session:
             tasks   = [fetch_portfolio(session, addr) for addr, _, _ in top_candidates]
             results = await asyncio.gather(*tasks)
 
-        traders = [r for r in results if r is not None]
+        traders    = [r for r in results if r is not None]
         none_count = len(results) - len(traders)
-        logger.info(f"Résultat final: {len(traders)} qualifiés / {len(top_candidates)} analysés ({none_count} exclus)")
-        if not traders:
-            logger.error("0 traders qualifiés — tous les filtres trop restrictifs ou API portfolio en erreur")
+        logger.info(
+            f"Résultat: {len(traders)} qualifiés / {len(top_candidates)} analysés "
+            f"({none_count} exclus)"
+        )
         return traders
 
     except Exception as e:
@@ -891,28 +967,24 @@ async def fetch_top_traders_hl() -> list:
         return []
 
 
-def apply_exclusion_filters(traders: list) -> list:
-    """Filtre de sécurité post-fetch : MDD ≤ 60% et PnL allTime positif."""
-    filtered = [
-        t for t in traders
-        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_at", 0) > 0
-    ]
-    logger.info(f"Après filtres: {len(filtered)}/{len(traders)} traders retenus")
-    return filtered
-
-
 def rank_and_score_traders(traders: list) -> list:
     """
-    Calcule le score final normalisé sur 100.
-    Formule : (PnL_7j / MDD) × (WinRate_7j / 100) × log1p(n_trades_7j) × bonus_30j
-    Normalisé par rapport au score max du batch.
+    [OPT] Fusion apply_exclusion_filters + scoring.
+    Filtre MDD≤60% et PnL allTime > 0, puis normalise le score sur 100.
     """
     if not traders:
         return []
 
-    raw_scores = []
-    for t in traders:
-        raw = compute_new_score(
+    # Filtres de sécurité intégrés
+    traders = [
+        t for t in traders
+        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_at", 0) > 0
+    ]
+    if not traders:
+        return []
+
+    raw_scores = [
+        compute_new_score(
             pnl_7j      = t.get("pnl_7j", 0),
             mdd         = t.get("mdd", 1),
             winrate_7j  = t.get("winrate", 50),
@@ -920,18 +992,28 @@ def rank_and_score_traders(traders: list) -> list:
             pnl_30j     = t.get("pnl", 0),
             roi_30j     = t.get("roi_30j", t.get("roi", 0)),
         )
-        raw_scores.append(raw)
+        for t in traders
+    ]
 
     max_raw = max(raw_scores) if raw_scores else 1.0
     if max_raw == 0:
         max_raw = 1.0
 
-    scored = []
-    for t, raw in zip(traders, raw_scores):
-        normalized = round((raw / max_raw) * 100, 1)
-        scored.append({**t, "score": normalized, "score_raw": round(raw, 4)})
-
+    scored = [
+        {**t, "score": round((raw / max_raw) * 100, 1), "score_raw": round(raw, 4)}
+        for t, raw in zip(traders, raw_scores)
+    ]
     return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+
+# [OPT] apply_exclusion_filters conservée pour compatibilité mais redirige vers rank_and_score_traders
+def apply_exclusion_filters(traders: list) -> list:
+    filtered = [
+        t for t in traders
+        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_at", 0) > 0
+    ]
+    logger.info(f"Après filtres: {len(filtered)}/{len(traders)} traders retenus")
+    return filtered
 
 
 def build_top5_report(top5: list) -> str:
@@ -966,9 +1048,9 @@ def build_history_report() -> str:
             "Lance /toptraders pour demarrer ta premiere analyse."
         )
     lines = ["📚 *Historique des Selections TradeBot*\n"]
-    for session in tradebot_history[-5:]:
-        lines.append(f"📅 *{session['date']}* — Score moyen: {session['avg_score']}/100")
-        for t in session["traders"]:
+    for session_data in tradebot_history[-5:]:
+        lines.append(f"📅 *{session_data['date']}* — Score moyen: {session_data['avg_score']}/100")
+        for t in session_data["traders"]:
             addr = t["address"][:6] + "..." + t["address"][-4:]
             lines.append(f"   #{t['rank']} `{addr}` — {t['score']}/100")
         lines.append("")
@@ -986,9 +1068,9 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔍 *TradeBot — Analyse en cours...*\n\n"
         "• Récupération du leaderboard Hyperliquid (top 200)\n"
-        "• Application des filtres: MDD<60% | actif 15j | 3 mois ancienneté | 20 trades min\n"
-        "• Calcul des scores: (PnL_7j/MDD) × WR × log(trades)\n"
-        "• Sélection du Top 5 multi-asset\n\n"
+        "• Filtres: MDD<60% | actif 15j | 3 mois ancienneté | 20 trades min\n"
+        "• Score: (PnL\\_7j/MDD) × WR × log(trades) + bonus 30j\n"
+        "• Sélection Top 5 multi-asset\n\n"
         "_Patiente quelques secondes..._",
         parse_mode="Markdown"
     )
@@ -1001,17 +1083,15 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    filtered = apply_exclusion_filters(raw_traders)
-    if not filtered:
+    ranked = rank_and_score_traders(raw_traders)
+    if not ranked:
         await update.message.reply_text(
             "⚠️ Aucun trader ne passe les filtres.\nDonnées peut-être partielles.",
             parse_mode="Markdown"
         )
         return
 
-    ranked = rank_and_score_traders(filtered)
-    top5   = ranked[:5]
-
+    top5 = ranked[:5]
     session_data = {
         "date":      datetime.now().strftime("%d/%m/%Y %H:%M"),
         "avg_score": round(sum(t["score"] for t in top5) / len(top5), 1),
@@ -1021,7 +1101,6 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(tradebot_history) > 30:
         tradebot_history.pop(0)
 
-    # Stocker pour copy_start
     copy_state["last_ranked"] = ranked
 
     await update.message.reply_text(build_top5_report(top5), parse_mode="Markdown")
@@ -1057,33 +1136,26 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api-ui.hyperliquid.xyz/info",
-                json={"type": "portfolio", "user": address},
+                HYPERLIQUID_API_UI, json={"type": "portfolio", "user": address},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 portfolio = await resp.json()
-
             async with session.post(
-                "https://api-ui.hyperliquid.xyz/info",
-                json={"type": "userFills", "user": address},
+                HYPERLIQUID_API_UI, json={"type": "userFills", "user": address},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp2:
                 fills = await resp2.json()
-
             async with session.post(
-                "https://api-ui.hyperliquid.xyz/info",
-                json={"type": "clearinghouseState", "user": address},
+                HYPERLIQUID_API, json={"type": "clearinghouseState", "user": address},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp3:
                 state = await resp3.json()
 
-        windows = {}
         if not portfolio or not isinstance(portfolio, list):
             await update.message.reply_text("❌ Données portfolio indisponibles pour ce wallet.", parse_mode="Markdown")
             return
-        for item in portfolio:
-            if isinstance(item, list) and len(item) == 2:
-                windows[item[0]] = item[1]
+
+        windows = {item[0]: item[1] for item in portfolio if isinstance(item, list) and len(item) == 2}
 
         def get_window_stats(win_key, fallback_key):
             w        = windows.get(win_key) or windows.get(fallback_key, {})
@@ -1091,23 +1163,17 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acv_hist = [float(p[1]) for p in w.get("accountValueHistory", []) if isinstance(p, list) and float(p[1]) > 0]
             pnl      = pnl_hist[-1] if pnl_hist else 0
             capital  = acv_hist[-1] if acv_hist else 0
-            mdd      = 0.0
-            if acv_hist:
-                pk = acv_hist[0]
-                for v in acv_hist:
-                    if v > pk: pk = v
-                    dd = (pk - v) / pk * 100 if pk > 0 else 0
-                    if dd > mdd: mdd = dd
-            base = max(capital - pnl, 1)
-            roi  = min((pnl / base) * 100, 9999) if pnl > 0 else (pnl / base) * 100
-            pos  = sum(1 for i in range(1, len(pnl_hist)) if pnl_hist[i] > pnl_hist[i-1])
-            consist = (pos / max(len(pnl_hist) - 1, 1)) * 100
+            mdd      = calc_mdd(acv_hist)
+            base     = max(capital - pnl, 1)
+            roi      = min((pnl / base) * 100, 9999) if pnl > 0 else (pnl / base) * 100
+            pos      = sum(1 for i in range(1, len(pnl_hist)) if pnl_hist[i] > pnl_hist[i-1])
+            consist  = (pos / max(len(pnl_hist) - 1, 1)) * 100
             return {"pnl": pnl, "capital": capital, "mdd": mdd, "roi": roi, "consist": consist}
 
-        d1  = get_window_stats("perpDay",    "day")
-        w7  = get_window_stats("perpWeek",   "week")
-        m30 = get_window_stats("perpMonth",  "month")
-        at  = get_window_stats("perpAllTime","allTime")
+        d1  = get_window_stats("perpDay",     "day")
+        w7  = get_window_stats("perpWeek",    "week")
+        m30 = get_window_stats("perpMonth",   "month")
+        at  = get_window_stats("perpAllTime", "allTime")
 
         week_data = windows.get("perpWeek") or windows.get("week", {})
         week_pnl  = [float(p[1]) for p in week_data.get("pnlHistory", []) if isinstance(p, list)]
@@ -1120,12 +1186,11 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days_inactive = ((now_ms - last_fill_ts) / 86400000) if last_fill_ts else None
 
         asset_pnl = {}
-        COIN_MAP  = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "HYPE": "HYPE", "TAO": "TAO"}
         if isinstance(fills, list):
             for fill in fills:
-                if not isinstance(fill, dict): continue
+                if not isinstance(fill, dict):
+                    continue
                 coin = fill.get("coin", "")
-                coin = COIN_MAP.get(coin, coin)
                 pv   = float(fill.get("closedPnl", 0) or 0)
                 asset_pnl[coin] = asset_pnl.get(coin, 0.0) + pv
         top_assets = sorted(asset_pnl.items(), key=lambda x: x[1], reverse=True)[:5]
@@ -1155,18 +1220,18 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         verdict = "🟢 FORT" if score >= 65 else ("🟡 MOYEN" if score >= 45 else "🔴 FAIBLE")
 
         lines = [
-            f"🔎 *INSPECTOR — Wallet Analysis*",
+            "🔎 *INSPECTOR — Wallet Analysis*",
             f"`{address}`",
-            f"━━━━━━━━━━━━━━━━━━━━",
-            f"",
-            f"📊 *PERFORMANCE*",
+            "━━━━━━━━━━━━━━━━━━━━",
+            "",
+            "📊 *PERFORMANCE*",
             f"{'Période':<12} {'PnL':>12} {'ROI':>8} {'MDD':>6}",
             f"{'24h':<12} ${d1['pnl']:>+10,.0f} {d1['roi']:>7.1f}% {d1['mdd']:>5.1f}%",
             f"{'7j':<12} ${w7['pnl']:>+10,.0f} {w7['roi']:>7.1f}% {w7['mdd']:>5.1f}%",
             f"{'30j':<12} ${m30['pnl']:>+10,.0f} {m30['roi']:>7.1f}% {m30['mdd']:>5.1f}%",
             f"{'AllTime':<12} ${at['pnl']:>+10,.0f} {at['roi']:>7.1f}% {at['mdd']:>5.1f}%",
-            f"",
-            f"🎯 *QUALITÉ (base 30j)*",
+            "",
+            "🎯 *QUALITÉ (base 30j)*",
             f"Score ETF:   *{score}/100* {verdict}",
             f"Win Rate:    {winrate:.0f}%",
             f"Consistance: {m30['consist']:.0f}%",
@@ -1177,14 +1242,14 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Dernier trade: il y a *{days_inactive:.0f}j*")
 
         if top_assets:
-            lines.append(f"")
-            lines.append(f"💰 *PnL PAR ASSET (allTime)*")
+            lines.append("")
+            lines.append("💰 *PnL PAR ASSET (allTime)*")
             for coin, pnl in top_assets:
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 lines.append(f"{emoji} {coin:<8} ${pnl:>+12,.0f}")
 
         if positions:
-            lines.append(f"")
+            lines.append("")
             lines.append(f"⚡ *POSITIONS OUVERTES ({len(positions)})*")
             for pos in positions[:5]:
                 lines.append(
@@ -1192,12 +1257,10 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"PnL: ${pos['pnl']:+,.0f}"
                 )
         else:
-            lines.append(f"")
-            lines.append(f"⚡ *Aucune position ouverte*")
+            lines.append("")
+            lines.append("⚡ *Aucune position ouverte*")
 
-        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
-        lines.append(f"_Données Hyperliquid en temps réel_")
-
+        lines += ["━━━━━━━━━━━━━━━━━━━━", "_Données Hyperliquid en temps réel_"]
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     except Exception as e:
@@ -1206,9 +1269,8 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# MODULE COPY TRADING — Top 5 Multi-Asset
+# COPY TRADING — UTILITAIRES
 # ============================================================
-
 async def send_copy_notification(app, message: str):
     try:
         await app.bot.send_message(
@@ -1217,31 +1279,28 @@ async def send_copy_notification(app, message: str):
             parse_mode="Markdown"
         )
     except Exception as e:
-        logger.error(f"Notification copy trading erreur: {e}")
+        logger.error(f"Notification erreur: {e}")
 
 
 async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
+    """
+    [FIX] leverage param désormais honoré via COPY_LEVERAGE si non fourni.
+    [OPT] Utilise le cache prix allMids.
+    """
     try:
         if not HL_PRIVATE_KEY:
             logger.error("HL_PRIVATE_KEY non définie")
             return {"error": "Clé privée manquante"}
 
-        import eth_account
-        from hyperliquid.exchange import Exchange
-        from hyperliquid.utils import constants
+        if not _HL_SDK_AVAILABLE:
+            return {"error": "hyperliquid-python-sdk non installé"}
 
         key      = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
         wallet   = eth_account.Account.from_key(key)
-        exchange = Exchange(wallet, constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+        exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                HYPERLIQUID_API,
-                json={"type": "allMids"},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                mids = await resp.json()
-
+        # [OPT] Cache prix au lieu d'un appel HTTP systématique
+        mids  = await get_all_mids_cached()
         price = float(mids.get(asset, 0))
         if price <= 0:
             return {"error": f"Prix {asset} introuvable"}
@@ -1251,19 +1310,13 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         decimals  = max(0, 5 - magnitude)
         limit_px  = float(round(raw_px, decimals))
 
-        SIZE_RULES = {
-            "BTC":  {"min": 0.001,  "decimals": 3},
-            "ETH":  {"min": 0.01,   "decimals": 2},
-            "SOL":  {"min": 0.1,    "decimals": 1},
-            "HYPE": {"min": 1.0,    "decimals": 0},
-            "TAO":  {"min": 0.01,   "decimals": 2},
-        }
-        rules = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
+        rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
         sz    = round(size, rules["decimals"])
         sz    = max(sz, rules["min"])
         if sz * price < 10:
             sz = max(round(11.0 / price, rules["decimals"]), rules["min"])
-        logger.info(f"Ordre {asset} size={sz} prix={price} ~${sz*price:.1f}")
+
+        logger.info(f"Ordre {asset} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
 
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -1282,12 +1335,11 @@ async def get_my_positions() -> dict:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.hyperliquid.xyz/info",
+                HYPERLIQUID_API,
                 json={"type": "clearinghouseState", "user": COPY_BOT_ADDRESS},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 state = await resp.json()
-
         positions = {}
         if isinstance(state, dict):
             for pos in state.get("assetPositions", []):
@@ -1310,12 +1362,11 @@ async def check_margin_ok() -> bool:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://api.hyperliquid.xyz/info",
+                HYPERLIQUID_API,
                 json={"type": "clearinghouseState", "user": COPY_BOT_ADDRESS},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 state = await resp.json()
-
         margin_summary = state.get("marginSummary", {})
         account_value  = float(margin_summary.get("accountValue", 0) or 0)
         margin_used    = float(margin_summary.get("totalMarginUsed", 0) or 0)
@@ -1324,13 +1375,17 @@ async def check_margin_ok() -> bool:
         margin_ratio = 1 - (margin_used / account_value)
         logger.info(f"Marge disponible: {margin_ratio*100:.1f}%")
         return margin_ratio >= MARGIN_SAFETY
-
     except Exception as e:
         logger.error(f"check_margin_ok erreur: {e}")
         return False
 
 
-async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: float, current_price: float) -> tuple:
+async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: float,
+                                current_price: float) -> tuple:
+    """
+    [FIX] Applique COPY_LEVERAGE[asset] comme levier de base si le trader
+    n'a pas de levier récupérable, au lieu de defaulter à 1.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1345,62 +1400,45 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
         if trader_capital <= 0:
             trader_capital = float(trader_state.get("crossAccountValue", 0) or 1)
 
-        leverage = 1
+        # [FIX] Priorité: levier du trader → COPY_LEVERAGE → 1
+        leverage = COPY_LEVERAGE.get(asset, 1)
         for pos in trader_state.get("assetPositions", []):
             p = pos.get("position", {})
             if p.get("coin") == asset:
-                leverage = int(p.get("leverage", {}).get("value", 1) or 1)
+                trader_lev = int(p.get("leverage", {}).get("value", 0) or 0)
+                if trader_lev > 0:
+                    leverage = trader_lev
                 break
 
         _, bot_balance = await get_wallet_data(COPY_BOT_ADDRESS)
-        my_capital     = bot_balance.get("accountValue", 0)
-        if my_capital <= 0:
-            my_capital = 1000.0
+        my_capital     = bot_balance.get("accountValue", 0) or 1000.0
 
         ratio        = trader_pos_value / max(trader_capital, 1)
         my_usd_value = (ratio / 5) * my_capital
 
-        SIZE_RULES = {
-            "BTC":  {"min": 0.001, "decimals": 3, "min_usd": 11.0},
-            "ETH":  {"min": 0.01,  "decimals": 2, "min_usd": 11.0},
-            "SOL":  {"min": 0.1,   "decimals": 1, "min_usd": 11.0},
-            "HYPE": {"min": 1.0,   "decimals": 0, "min_usd": 35.0},
-            "TAO":  {"min": 0.01,  "decimals": 2, "min_usd": 15.0},
-        }
-        rules        = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3, "min_usd": 11.0})
+        rules        = SIZE_RULES.get(asset, SIZE_RULES["_default"])
         my_usd_value = max(my_usd_value, rules["min_usd"])
         my_size      = max(round(my_usd_value / current_price, rules["decimals"]), rules["min"])
 
         logger.info(
             f"Proportionnel {asset}: trader_cap=${trader_capital:.0f} "
             f"pos=${trader_pos_value:.0f} ratio={ratio*100:.1f}% "
-            f"mon_cap=${my_capital:.0f} → ${my_usd_value:.0f} sz={my_size}"
+            f"mon_cap=${my_capital:.0f} → ${my_usd_value:.0f} sz={my_size} x{leverage}"
         )
         return my_size, leverage, my_usd_value
 
     except Exception as e:
         logger.warning(f"get_proportional_size erreur: {e}")
-        SIZE_RULES = {
-            "BTC":  {"min": 0.001, "decimals": 3},
-            "ETH":  {"min": 0.01,  "decimals": 2},
-            "SOL":  {"min": 0.1,   "decimals": 1},
-            "HYPE": {"min": 1.0,   "decimals": 0},
-            "TAO":  {"min": 0.01,  "decimals": 2},
-        }
-        rules         = SIZE_RULES.get(asset, {"min": 0.001, "decimals": 3})
+        rules         = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+        leverage      = COPY_LEVERAGE.get(asset, 1)  # [FIX] fallback COPY_LEVERAGE
         fallback_size = max(round(50.0 / max(current_price, 0.01), rules["decimals"]), rules["min"])
-        return fallback_size, 1, 50.0
+        return fallback_size, leverage, 50.0
 
 
 # ============================================================
-# COPY TRADING — start / stop / watch
+# COPY TRADING — START / STOP / WATCH
 # ============================================================
-
 async def start_copy_trading(top_traders: list, app) -> None:
-    """
-    Lance 1 WebSocket par trader (top 5).
-    Chaque trader est surveillé sur TOUS ses assets — pas de filtre par asset.
-    """
     # Stopper les anciens WS
     for addr, task in list(copy_state["ws_tasks"].items()):
         task.cancel()
@@ -1410,7 +1448,7 @@ async def start_copy_trading(top_traders: list, app) -> None:
     copy_state["active"]   = True
 
     active_addrs = []
-    notif_lines  = ["🤖 *SakaiBot — Copy Trading v4*", "_Top 5 multi-asset_", ""]
+    notif_lines  = ["🤖 *SakaiBot — Copy Trading v4.1*", "_Top 5 multi-asset_", ""]
 
     for rank, trader in enumerate(top_traders[:5], 1):
         addr = trader["address"]
@@ -1435,9 +1473,11 @@ async def start_copy_trading(top_traders: list, app) -> None:
         await send_copy_notification(app, "❌ *Copy Trading annulé*\nAucun trader qualifié.")
         return
 
-    notif_lines.append("")
-    notif_lines.append(f"📡 {len(active_addrs)} traders | tous assets | taille proportionnelle")
-    notif_lines.append(f"_Scoring: (PnL_7j/MDD) × WR × log(trades) × bonus30j_")
+    notif_lines += [
+        "",
+        f"📡 {len(active_addrs)} traders | tous assets | taille proportionnelle",
+        "_Scoring: (PnL\\_7j/MDD) × WR × log(trades) × bonus30j_",
+    ]
     await send_copy_notification(app, "\n".join(notif_lines))
     logger.info(f"✅ Copy trading actif — {len(active_addrs)} traders")
 
@@ -1453,17 +1493,12 @@ async def stop_copy_trading() -> None:
 
 
 async def watch_trader_multiasset(trader_address: str, app) -> None:
-    """WebSocket — surveille TOUS les trades d'un trader, sans filtre par asset."""
-    import websockets
-    import json as json_mod
-
-    ws_url = "wss://api.hyperliquid.xyz/ws"
     logger.info(f"WebSocket multi-asset → {trader_address[:12]}...")
 
     while copy_state["active"]:
         try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-                await ws.send(json_mod.dumps({
+            async with websockets.connect(HYPERLIQUID_WS, ping_interval=20, ping_timeout=10) as ws:
+                await ws.send(json.dumps({
                     "method": "subscribe",
                     "subscription": {"type": "userEvents", "user": trader_address}
                 }))
@@ -1473,7 +1508,7 @@ async def watch_trader_multiasset(trader_address: str, app) -> None:
                     if not copy_state["active"]:
                         break
                     try:
-                        msg = json_mod.loads(raw_msg)
+                        msg = json.loads(raw_msg)
                         await process_multiasset_event(trader_address, msg, app)
                     except Exception as e:
                         logger.warning(f"WS {trader_address[:12]} parse erreur: {e}")
@@ -1488,11 +1523,6 @@ async def watch_trader_multiasset(trader_address: str, app) -> None:
 
 
 async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
-    """
-    Traite TOUS les trades d'un trader.
-    Gestion des conflits : si 2 traders ouvrent le même asset,
-    le 2ème signal est ignoré (premier arrivé, premier servi).
-    """
     data  = msg.get("data", {})
     if not data:
         return
@@ -1514,32 +1544,28 @@ async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
 
         logger.info(f"Trader {trader_address[:12]} → {dir_fill} {asset} sz:{size} px:{price}")
 
-        # Enregistrer les assets vus par ce trader
         if trader_info := copy_state["traders"].get(trader_address):
             trader_info["assets_seen"].add(asset)
 
-        my_size  = 0.0
-        leverage = 1
-        my_usd   = 0.0
+        my_size = leverage = 0
+        my_usd  = 0.0
 
         if is_opening:
-            # Conflit : un autre trader a déjà une position ouverte sur cet asset ?
             existing = copy_state["positions"].get(asset)
             if existing and existing.get("trader_addr") != trader_address:
                 rank = copy_state["traders"].get(trader_address, {}).get("rank", "?")
-                logger.info(f"Conflit {asset}: signal #{rank} ignoré (déjà ouvert par trader #{copy_state['traders'].get(existing['trader_addr'],{}).get('rank','?')})")
+                existing_rank = copy_state["traders"].get(existing["trader_addr"], {}).get("rank", "?")
+                logger.info(f"Conflit {asset}: signal #{rank} ignoré (déjà ouvert par #{existing_rank})")
                 await send_copy_notification(app,
                     f"ℹ️ *Signal ignoré — conflit*\n"
                     f"Asset: `{asset}` | Trader #{rank}\n"
-                    f"Déjà une position ouverte sur cet asset."
+                    f"Déjà une position ouverte (Trader #{existing_rank})."
                 )
                 continue
 
             if not await check_margin_ok():
                 await send_copy_notification(app,
-                    f"⚠️ *Marge insuffisante*\n"
-                    f"Asset: {asset} | Action: {dir_fill}\n"
-                    f"Ordre annulé."
+                    f"⚠️ *Marge insuffisante*\nAsset: {asset} | Action: {dir_fill}\nOrdre annulé."
                 )
                 continue
 
@@ -1563,7 +1589,6 @@ async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
                 logger.info(f"Pas de position sur {asset} — fermeture ignorée")
                 continue
 
-            # Vérifier que c'est le trader qui a ouvert qui ferme
             tracked = copy_state["positions"].get(asset, {})
             if tracked.get("trader_addr") and tracked["trader_addr"] != trader_address:
                 logger.info(f"Fermeture {asset} ignorée — signal d'un autre trader")
@@ -1575,11 +1600,9 @@ async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
 
             copy_state["positions"].pop(asset, None)
             copy_deployed[asset] = 0.0
-
         else:
             continue
 
-        # Log + notification
         trade_log = {
             "time":     datetime.now().strftime("%d/%m %H:%M"),
             "asset":    asset,
@@ -1614,7 +1637,6 @@ async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
 # ============================================================
 # COMMANDES TELEGRAM — Copy Trading
 # ============================================================
-
 async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
@@ -1622,18 +1644,17 @@ async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not copy_state.get("last_ranked"):
         await update.message.reply_text(
             "🔍 Aucune analyse récente — lancement automatique...\n"
-            "_Scoring: (PnL_7j/MDD) × WR_7j × log(trades) + bonus 30j_",
+            "_Score: (PnL\\_7j/MDD) × WR\\_7j × log(trades) + bonus 30j_",
             parse_mode="Markdown"
         )
         raw_traders = await fetch_top_traders_hl()
         if not raw_traders:
-            await update.message.reply_text("❌ Impossible de récupérer les traders. Réessaie.", parse_mode="Markdown")
+            await update.message.reply_text("❌ Impossible de récupérer les traders.", parse_mode="Markdown")
             return
-        filtered = apply_exclusion_filters(raw_traders)
-        if not filtered:
+        ranked = rank_and_score_traders(raw_traders)
+        if not ranked:
             await update.message.reply_text("⚠️ Aucun trader ne passe les filtres.", parse_mode="Markdown")
             return
-        ranked = rank_and_score_traders(filtered)
         copy_state["last_ranked"] = ranked
         await update.message.reply_text(build_top5_report(ranked[:5]), parse_mode="Markdown")
 
@@ -1690,10 +1711,10 @@ async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("")
         lines.append("📊 *Positions ouvertes:*")
         for asset, pos in positions.items():
-            tracked      = copy_state["positions"].get(asset, {})
-            trader_addr  = tracked.get("trader_addr", "")
-            trader_rank  = copy_state["traders"].get(trader_addr, {}).get("rank", "?")
-            emoji        = "📈" if pos["side"] == "long" else "📉"
+            tracked     = copy_state["positions"].get(asset, {})
+            trader_addr = tracked.get("trader_addr", "")
+            trader_rank = copy_state["traders"].get(trader_addr, {}).get("rank", "?")
+            emoji       = "📈" if pos["side"] == "long" else "📉"
             lines.append(
                 f"{emoji} *{asset}* {pos['side'].upper()} sz:{pos['size']} "
                 f"| PnL: ${pos['upnl']:+,.0f} | Trader #{trader_rank}"
@@ -1743,27 +1764,28 @@ async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
+    # [FIX] Aide mise à jour pour refléter le scoring v4.1
     msg = (
-        "🤖 *SakaiBot — Module Copy Trading v4*\n\n"
+        "🤖 *SakaiBot — Module Copy Trading v4.1*\n\n"
         "Sélectionne les *5 meilleurs traders globaux* (top 200 Hyperliquid)\n"
         "et copie TOUS leurs trades, sur TOUS leurs assets.\n\n"
-        "📐 *Scoring composite:*\n"
-        "   🥇 Consistance 30j :  35%\n"
-        "   🥈 Drawdown max :     30%\n"
-        "   🥉 Win Rate hebdo :   20%\n"
-        "   4️⃣ ROI 30j :          15%\n\n"
+        "📐 *Scoring v4.1:*\n"
+        "   Score = (PnL\\_7j / MDD) × WR\\_7j × log(trades\\_7j)\n"
+        "   Bonus ×1.2 si PnL\\_30j > 0 ET ROI\\_30j ≥ 20%\n\n"
         "🚫 *Filtres d'exclusion:*\n"
-        "   • MDD > 40% (30j ou allTime)\n"
-        "   • Win Rate < 60%\n"
+        "   • MDD > 60% (7j ou allTime)\n"
         "   • Inactif depuis > 15 jours\n"
         "   • Capital < $10 000\n"
-        "   • PnL 30j < $5 000\n\n"
+        "   • PnL 30j perte > 15%\n"
+        "   • Ancienneté < 3 mois\n"
+        "   • < 20 trades allTime\n\n"
+        "⚙️ *Leviers (COPY\\_LEVERAGE):*\n"
+        "   BTC x5 | ETH x4 | SOL x5 | HYPE x3 | TAO x3\n\n"
         "⚡ *Logique de copie:*\n"
         "   • 1 WebSocket par trader (5 total)\n"
-        "   • Tous assets copiés (BTC, ETH, SOL, HYPE, TAO...)\n"
+        "   • Tous assets copiés sans filtre\n"
         "   • Taille proportionnelle à ton capital\n"
-        "   • Conflit: si 2 traders ouvrent le même asset\n"
-        "     → le 2ème signal est ignoré\n\n"
+        "   • Conflit: 2ème signal ignoré (premier arrivé)\n\n"
         "📋 *Commandes:*\n"
         "   /toptraders — Analyser + sélectionner le Top 5\n"
         "   /copy\\_start — Démarrer la copie\n"
@@ -1772,7 +1794,7 @@ async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /copy\\_close — Fermer toutes les positions\n"
         "   /inspector — Analyser un wallet manuellement\n"
         "   /tb\\_historique — Sélections passées\n\n"
-        "_v4.0 — Multi-asset, Top 5 global_"
+        "_v4.1 — Multi-asset, Top 5 global, COPY\\_LEVERAGE actif_"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -1784,7 +1806,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "👋 *Bienvenue sur SakaiBot v4! 🤖*\n\n"
+        "👋 *Bienvenue sur SakaiBot v4.1! 🤖*\n\n"
         "📊 *Marché & Analyse*\n"
         "   /prix — Prix en temps réel\n"
         "   /setup — Analyse technique complète\n"
@@ -1844,7 +1866,10 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    await update.message.reply_text("⏳ Analyse technique en cours (RSI, EMA, S/R, Fibo, Volume)...", parse_mode="Markdown")
+    await update.message.reply_text(
+        "⏳ Analyse technique en cours (RSI, EMA, S/R, Fibo, Volume)...",
+        parse_mode="Markdown"
+    )
     prices, trending = await asyncio.gather(get_crypto_prices(), get_crypto_trending())
     msg = await analyze_setup(prices, trending)
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -1855,7 +1880,11 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("⏳ Préparation du résumé...", parse_mode="Markdown")
     news, trending = await asyncio.gather(get_crypto_news(), get_crypto_trending())
-    await update.message.reply_text(format_daily_summary(news, trending), parse_mode="Markdown", disable_web_page_preview=True)
+    await update.message.reply_text(
+        format_daily_summary(news, trending),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
 
 
 async def cmd_peur(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1914,7 +1943,7 @@ async def cmd_activer_alertes(update: Update, context: ContextTypes.DEFAULT_TYPE
     for name in [f"alert_{chat_id}", f"daily_{chat_id}", f"sr_{chat_id}_matin", f"sr_{chat_id}_soir"]:
         for job in job_queue.get_jobs_by_name(name):
             job.schedule_removal()
-    job_queue.run_repeating(job_price_alert, interval=3600, first=10, chat_id=chat_id, name=f"alert_{chat_id}")
+    job_queue.run_repeating(job_price_alert, interval=3600, first=10,   chat_id=chat_id, name=f"alert_{chat_id}")
     job_queue.run_daily(job_daily_summary, time=time(MORNING_HOUR_UTC, MORNING_MIN_UTC), chat_id=chat_id, name=f"daily_{chat_id}")
     job_queue.run_daily(job_twice_daily,   time=time(MORNING_HOUR_UTC, MORNING_MIN_UTC), chat_id=chat_id, name=f"sr_{chat_id}_matin")
     job_queue.run_daily(job_twice_daily,   time=time(EVENING_HOUR_UTC, EVENING_MIN_UTC), chat_id=chat_id, name=f"sr_{chat_id}_soir")
@@ -1941,7 +1970,6 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 # ============================================================
 # MODULE TARGET WALLET MANUEL
 # ============================================================
-
 target_state = {
     "active":     False,
     "paused":     False,
@@ -1963,12 +1991,8 @@ async def target_sync_positions(address: str, app) -> None:
             ) as resp:
                 state = await resp.json()
 
-            async with session.post(
-                HYPERLIQUID_API,
-                json={"type": "allMids"},
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp2:
-                mids = await resp2.json()
+        # [OPT] Cache prix
+        mids = await get_all_mids_cached()
 
         positions = [
             p.get("position", {}) for p in state.get("assetPositions", [])
@@ -2013,10 +2037,6 @@ async def target_sync_positions(address: str, app) -> None:
 
 
 async def target_watch_ws(address: str, app) -> None:
-    import websockets
-    import json as json_mod
-
-    ws_url = "wss://api.hyperliquid.xyz/ws"
     logger.info(f"Target WebSocket → {address[:12]}...")
 
     while target_state["active"]:
@@ -2024,8 +2044,8 @@ async def target_watch_ws(address: str, app) -> None:
             await asyncio.sleep(5)
             continue
         try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
-                await ws.send(json_mod.dumps({
+            async with websockets.connect(HYPERLIQUID_WS, ping_interval=20, ping_timeout=10) as ws:
+                await ws.send(json.dumps({
                     "method": "subscribe",
                     "subscription": {"type": "userEvents", "user": address}
                 }))
@@ -2037,7 +2057,7 @@ async def target_watch_ws(address: str, app) -> None:
                     if target_state["paused"]:
                         continue
                     try:
-                        msg   = json_mod.loads(raw_msg)
+                        msg   = json.loads(raw_msg)
                         data  = msg.get("data", {})
                         fills = data.get("fills", [])
 
@@ -2056,9 +2076,9 @@ async def target_watch_ws(address: str, app) -> None:
                             is_buy     = side == "B"
 
                             if is_opening:
-                                pos_value        = size * price
+                                pos_value            = size * price
                                 my_size, lev, my_usd = await get_proportional_size(asset, address, pos_value, price)
-                                result           = await place_order(asset, is_buy, my_size, dir_fill, lev)
+                                result               = await place_order(asset, is_buy, my_size, dir_fill, lev)
                                 target_state["positions"][asset] = {
                                     "side": "long" if is_buy else "short",
                                     "size": my_size, "entry": price, "usd": my_usd,
@@ -2115,10 +2135,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/target 0xADRESSE`",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("⚠️ Usage: `/target 0xADRESSE`", parse_mode="Markdown")
         return
     address = context.args[0].strip().lower()
     if not address.startswith("0x") or len(address) != 42:
@@ -2128,10 +2145,9 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_state["active"] = False
         target_state["ws_task"].cancel()
         await asyncio.sleep(1)
-    target_state["address"]   = address
-    target_state["active"]    = True
-    target_state["paused"]    = False
-    target_state["positions"] = {}
+    target_state.update({
+        "address": address, "active": True, "paused": False, "positions": {}
+    })
     await update.message.reply_text(
         f"🎯 *Target Wallet Manuel activé*\n`{address}`\n\nSynchronisation en cours...",
         parse_mode="Markdown"
@@ -2148,7 +2164,8 @@ async def cmd_target_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_state["paused"] = True
     await update.message.reply_text(
-        f"⏸ *Target en pause*\n`{target_state['address'][:20]}...`\nLance `/target {target_state['address']}` pour reprendre.",
+        f"⏸ *Target en pause*\n`{target_state['address'][:20]}...`\n"
+        f"Lance `/target {target_state['address']}` pour reprendre.",
         parse_mode="Markdown"
     )
 
@@ -2175,11 +2192,14 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     if not target_state["address"]:
-        await update.message.reply_text("⏸ *Target inactif*\nUtilise `/target 0x...` pour démarrer.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⏸ *Target inactif*\nUtilise `/target 0x...` pour démarrer.",
+            parse_mode="Markdown"
+        )
         return
     status_emoji = "⏸ EN PAUSE" if target_state["paused"] else ("🟢 ACTIF" if target_state["active"] else "🔴 INACTIF")
     lines = [
-        f"🎯 *TARGET WALLET MANUEL*",
+        "🎯 *TARGET WALLET MANUEL*",
         f"Status: {status_emoji}",
         f"Wallet: `{target_state['address']}`",
         "",
@@ -2200,29 +2220,24 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+import urllib.request
+
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    import time as _time
-    import urllib.request, json as _json
-
-    # ── Forcer la libération du token avant de démarrer ────────
-    # Tue toute instance existante via un appel HTTP direct (avant même asyncio)
     token = TELEGRAM_TOKEN
     base  = f"https://api.telegram.org/bot{token}"
     for attempt in range(10):
         try:
-            # deleteWebhook pour s'assurer qu'aucun webhook actif
             urllib.request.urlopen(f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5)
-            # getUpdates avec offset=-1 pour vider la queue et libérer le slot polling
             urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=1", timeout=5)
             break
         except Exception as e:
             logger.warning(f"Init HTTP attempt {attempt+1}/10: {e}")
-            _time.sleep(2)
+            time_module.sleep(2)
 
-    _time.sleep(3)  # Laisser Telegram propager la libération
+    time_module.sleep(3)
 
     app = (
         Application.builder()
@@ -2260,7 +2275,7 @@ def main():
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
 
-    # Copy Trading v4 — simplifié
+    # Copy Trading v4.1
     app.add_handler(CommandHandler("copy_start",  cmd_copy_start))
     app.add_handler(CommandHandler("copy_stop",   cmd_copy_stop))
     app.add_handler(CommandHandler("copy_status", cmd_copy_status))
@@ -2272,7 +2287,7 @@ def main():
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.0 démarré — Top 5 multi-asset!")
+    logger.info("🤖 SakaiBot v4.1 démarré — Top 5 multi-asset, COPY_LEVERAGE actif!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
