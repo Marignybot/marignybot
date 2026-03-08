@@ -634,9 +634,14 @@ async def fetch_top_traders_hl() -> list:
                 data = await resp.json()
 
         raw_rows = data.get("leaderboardRows", []) if isinstance(data, dict) else data
-        logger.info(f"Leaderboard: {len(raw_rows)} traders")
+        logger.info(f"Leaderboard: {len(raw_rows)} traders bruts")
+
+        if not raw_rows:
+            logger.error("Leaderboard vide ou format inattendu")
+            return []
 
         candidates = []
+        excl_roi = excl_pnl30 = excl_pnlat = excl_blacklist = 0
         for row in raw_rows:
             try:
                 if isinstance(row, dict):
@@ -651,6 +656,7 @@ async def fetch_top_traders_hl() -> list:
                 if not address or len(address) < 10:
                     continue
                 if address.lower() in TRADER_BLACKLIST:
+                    excl_blacklist += 1
                     continue
 
                 metrics = {}
@@ -666,10 +672,13 @@ async def fetch_top_traders_hl() -> list:
                 pnl_at  = float(mat.get("pnl", 0) or 0)
 
                 if not (20 <= roi_30d <= 10000):
+                    excl_roi += 1
                     continue
                 if pnl_30d < 5000:
+                    excl_pnl30 += 1
                     continue
                 if pnl_at < 10000:
+                    excl_pnlat += 1
                     continue
 
                 candidates.append((address, roi_30d, pnl_30d))
@@ -677,9 +686,18 @@ async def fetch_top_traders_hl() -> list:
             except Exception:
                 continue
 
+        logger.info(
+            f"Candidats après pré-filtres: {len(candidates)} "
+            f"(excl roi:{excl_roi} pnl30:{excl_pnl30} pnlat:{excl_pnlat} blacklist:{excl_blacklist})"
+        )
+
+        if not candidates:
+            logger.error("Aucun candidat après pré-filtres leaderboard")
+            return []
+
         candidates.sort(key=lambda x: x[1], reverse=True)
         top_candidates = candidates[:200]
-        logger.info(f"{len(candidates)} candidats qualifiés | top 200 retenus")
+        logger.info(f"Top 200 retenus pour analyse portfolio")
 
         async def fetch_portfolio(session, address):
             import math
@@ -771,6 +789,7 @@ async def fetch_top_traders_hl() -> list:
                 mdd_at  = calc_mdd(acv_hat)
                 worst_mdd = max(mdd_7j, mdd_at)
                 if worst_mdd > TRADEBOT_MAX_DRAWDOWN:
+                    logger.info(f"Exclu {address[:12]}: MDD {worst_mdd:.0f}% > {TRADEBOT_MAX_DRAWDOWN}%")
                     return None
 
                 # ── Données 30j (confirmation) ──────────────────────────
@@ -788,6 +807,7 @@ async def fetch_top_traders_hl() -> list:
                 if pnl_30j < 0:
                     perte_pct = abs(pnl_30j) / max(cap_30, 1) * 100
                     if perte_pct > 15.0:
+                        logger.info(f"Exclu {address[:12]}: perte 30j {perte_pct:.1f}% > 15%")
                         return None
 
                 base_30    = max(cap_30 - pnl_30j, 1)
@@ -803,27 +823,28 @@ async def fetch_top_traders_hl() -> list:
                 # On vérifie via le premier timestamp de pnlHistory allTime
                 at_pnl_raw = [p for p in at_data.get("pnlHistory", []) if isinstance(p, list) and len(p) == 2]
                 if at_pnl_raw:
-                    first_ts_ms  = at_pnl_raw[0][0]
-                    age_days     = (now_ms - first_ts_ms) / (86400 * 1000)
+                    first_ts_ms = at_pnl_raw[0][0]
+                    age_days    = (now_ms - first_ts_ms) / (86400 * 1000)
                     if age_days < 90:
-                        logger.debug(f"Exclu {address[:12]}: ancienneté {age_days:.0f}j < 90j")
+                        logger.info(f"Exclu {address[:12]}: ancienneté {age_days:.0f}j < 90j")
                         return None
                 else:
-                    # Pas d'historique allTime → impossible de vérifier → on exclut
+                    logger.info(f"Exclu {address[:12]}: pas d'historique allTime")
                     return None
 
                 # ── Eligibilité minimum ─────────────────────────────────
                 # 20 trades minimum sur l'historique total (élimine les chanceux)
                 if n_trades_at < 20:
-                    logger.debug(f"Exclu {address[:12]}: seulement {n_trades_at} trades allTime")
+                    logger.info(f"Exclu {address[:12]}: {n_trades_at} trades allTime < 20")
                     return None
 
                 pnl_mdd_ratio = pnl_7j / max(worst_mdd, 1.0)
                 if n_trades_7j < TRADEBOT_MIN_TRADES and pnl_mdd_ratio < TRADEBOT_EXCELLENT_RATIO:
-                    logger.debug(f"Exclu {address[:12]}: {n_trades_7j} trades 7j, ratio {pnl_mdd_ratio:.1f}")
+                    logger.info(f"Exclu {address[:12]}: {n_trades_7j} trades 7j, ratio {pnl_mdd_ratio:.1f}")
                     return None
 
                 # Win rate : plus de filtre dur — composante du score uniquement
+                logger.info(f"✅ Qualifié {address[:12]}: score_raw en cours | trades_at={n_trades_at} mdd={worst_mdd:.0f}% wr7j={winrate_7j:.0f}%")
 
                 return {
                     "address":      address,
@@ -848,7 +869,10 @@ async def fetch_top_traders_hl() -> list:
             results = await asyncio.gather(*tasks)
 
         traders = [r for r in results if r is not None]
-        logger.info(f"Traders qualifiés après filtres: {len(traders)}")
+        none_count = len(results) - len(traders)
+        logger.info(f"Résultat final: {len(traders)} qualifiés / {len(top_candidates)} analysés ({none_count} exclus)")
+        if not traders:
+            logger.error("0 traders qualifiés — tous les filtres trop restrictifs ou API portfolio en erreur")
         return traders
 
     except Exception as e:
@@ -951,8 +975,8 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔍 *TradeBot — Analyse en cours...*\n\n"
         "• Récupération du leaderboard Hyperliquid (top 200)\n"
-        "• Application des filtres: MDD<40% | WR≥60% | actif 15j\n"
-        "• Calcul des scores composites\n"
+        "• Application des filtres: MDD<60% | actif 15j | 3 mois ancienneté | 20 trades min\n"
+        "• Calcul des scores: (PnL_7j/MDD) × WR × log(trades)\n"
         "• Sélection du Top 5 multi-asset\n\n"
         "_Patiente quelques secondes..._",
         parse_mode="Markdown"
