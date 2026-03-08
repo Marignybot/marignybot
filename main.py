@@ -2193,12 +2193,24 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ============================================================
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    import time as _time
+
+    # Délai anti-conflit au démarrage (Railway peut lancer 2 instances)
+    _time.sleep(3)
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
 
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit détecté (autre instance) — attente 10s...")
-            await asyncio.sleep(10)
+            logger.warning("⚠️ Conflit détecté (autre instance) — attente 15s...")
+            await asyncio.sleep(15)
         else:
             logger.error(f"Erreur: {context.error}")
 
