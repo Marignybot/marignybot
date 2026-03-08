@@ -117,7 +117,7 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 TRADEBOT_MIN_TRADES      = 5
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
-TRADEBOT_MAX_DRAWDOWN    = 40.0   # v4.4: aligné ApexLiquid max 40% MDD
+TRADEBOT_MAX_DRAWDOWN    = 85.0   # filtre dur MDD
 TRADEBOT_MIN_AGE_DAYS    = 90     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
@@ -970,9 +970,8 @@ async def fetch_top_traders_hl() -> list:
                     acv_m30 = [float(p[1]) for p in m30_for_mdd.get("accountValueHistory", [])
                                if isinstance(p, list) and len(p) == 2 and float(p[1]) > 0]
                     worst_mdd = calc_mdd(acv_m30) if acv_m30 else calc_mdd(acv_h7)
-                    if worst_mdd > TRADEBOT_MAX_DRAWDOWN:
-                        logger.info(f"Exclu {address[:12]}: MDD {worst_mdd:.0f}% > {TRADEBOT_MAX_DRAWDOWN}%")
-                        return None
+                    # MDD affiché mais non filtré — le scoring pénalise implicitement
+                    logger.info(f"MDD {address[:12]}: {worst_mdd:.0f}%")
 
                     # ── Données 30j ─────────────────────────────────────
                     m30     = windows.get("perpMonth") or windows.get("month", {})
@@ -1020,9 +1019,9 @@ async def fetch_top_traders_hl() -> list:
                         return None
 
                     # Filtre dur WinRate < 45% — incopiable
-                    if winrate_7j < 80.0:
+                    if winrate_7j < 45.0:
                         logger.info(
-                            f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 80% — incopiable"
+                            f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 45% — incopiable"
                         )
                         return None
 
@@ -1097,7 +1096,6 @@ def rank_and_score_traders(traders: list) -> list:
 
     avant = len(traders)
 
-    traders = [t for t in traders if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN]
     traders = [t for t in traders if t.get("winrate", 0) >= 80]
     traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= 25]
     traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
@@ -1123,7 +1121,10 @@ def rank_and_score_traders(traders: list) -> list:
         else:
             consistance = 0.3   # quasi tout le PnL allTime ce mois = one-shot
 
-        return roi_30j * consistance
+        # Pénalité MDD légère — pénalise sans éliminer
+        # MDD 30% → ×0.85 | MDD 60% → ×0.70 | MDD 90% → ×0.55
+        mdd_factor = max(0.3, 1.0 - (t.get("mdd", 0) / 200.0))
+        return roi_30j * consistance * mdd_factor
 
     raw_scores = [compute_score_v4(t) for t in traders]
     max_raw = max(raw_scores) if raw_scores else 1.0
