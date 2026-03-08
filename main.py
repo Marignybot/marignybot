@@ -117,7 +117,7 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 TRADEBOT_MIN_TRADES      = 1     # [v4.5] log(n) gere nativement score=0 pour 0 trade
 TRADEBOT_MAX_TRADES_DAY  = 30    # filtre dur scalper: > 30 trades/jour = exclu
-TRADEBOT_MAX_DRAWDOWN    = 85.0   # filtre dur MDD
+TRADEBOT_MAX_DRAWDOWN    = 65.0   # filtre dur MDD
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
