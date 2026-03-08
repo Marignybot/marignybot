@@ -839,7 +839,7 @@ async def fetch_top_traders_hl() -> list:
             return []
 
         candidates.sort(key=lambda x: x[1], reverse=True)
-        top_candidates = candidates[:1000]
+        top_candidates = candidates[:700]
         logger.info(f"Top {len(top_candidates)} retenus pour analyse portfolio")
 
         # [FIX CRITIQUE] fetch_portfolio refactorisé — logique linéaire, at_pnl_raw défini avant usage
@@ -1193,7 +1193,7 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "🔍 *TradeBot — Analyse en cours...*\n\n"
-        "• Récupération du leaderboard Hyperliquid (top 1000)\n"
+        "• Récupération du leaderboard Hyperliquid (top 700)\n"
         "• Filtres: MDD<85% | actif 15j | 60j ancienneté | 20 trades min\n"
         "• Score: ROI% × Consistance × WinRate × Anti-scalper × MDD\n"
         "• Filtre dur: WR≥45% | ≤30 trades/jour privilégié\n"
@@ -1894,7 +1894,7 @@ async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # [FIX] Aide mise à jour pour refléter le scoring v4.1
     msg = (
         "🤖 *SakaiBot — Module Copy Trading v4.1*\n\n"
-        "Sélectionne les *5 meilleurs traders globaux* (top 1000 Hyperliquid)\n"
+        "Sélectionne les *5 meilleurs traders globaux* (top 700 Hyperliquid)\n"
         "et copie TOUS leurs trades, sur TOUS leurs assets.\n\n"
         "📐 *Scoring v4.1:*\n"
         "   Score = (PnL\\_7j / MDD) × WR\\_7j × log(trades\\_7j)\n"
