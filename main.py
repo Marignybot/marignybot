@@ -2158,6 +2158,41 @@ target_positions: dict = {}
 # Log global
 target_trades_log: list = []
 
+# ============================================================
+# PERSISTANCE TARGET REGISTRY
+# ============================================================
+TARGET_REGISTRY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "target_registry.json")
+
+def save_target_registry() -> None:
+    """Sauvegarde target_registry + target_positions sur disque (JSON)."""
+    try:
+        data = {
+            "registry": {
+                addr: {k: v for k, v in info.items() if k != "ws_task"}
+                for addr, info in target_registry.items()
+                if info.get("active")
+            },
+            "positions": target_positions,
+        }
+        with open(TARGET_REGISTRY_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info(f"💾 target_registry sauvegardé ({len(data['registry'])} traders)")
+    except Exception as e:
+        logger.error(f"save_target_registry: {e}")
+
+def load_target_registry() -> dict:
+    """Charge target_registry depuis disque. Retourne le dict registry sauvegardé."""
+    try:
+        if not os.path.exists(TARGET_REGISTRY_FILE):
+            return {}
+        with open(TARGET_REGISTRY_FILE) as f:
+            data = json.load(f)
+        logger.info(f"📂 target_registry chargé ({len(data.get('registry', {}))} traders)")
+        return data
+    except Exception as e:
+        logger.error(f"load_target_registry: {e}")
+        return {}
+
 
 # ── Helpers ordres ──────────────────────────────────────────
 
@@ -2228,7 +2263,7 @@ async def enable_hip3_abstraction() -> bool:
         exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
         loop = asyncio.get_event_loop()
         # user_dex_abstraction(True) = activer le transfert auto de collateral vers HIP-3 DEXs
-        result = await loop.run_in_executor(None, lambda: exchange.user_dex_abstraction(True))
+        result = await loop.run_in_executor(None, lambda: exchange.user_dex_abstraction(enabled=True))
         logger.info(f"HIP-3 DEX abstraction activée: {result}")
         return True
     except Exception as e:
@@ -2577,6 +2612,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                     "entry":       price,
                     "trader_addr": address,
                 }
+            save_target_registry()
 
             status = "✅" if "error" not in result else "❌"
             emoji  = "📈" if is_buy else "📉"
@@ -2617,6 +2653,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
             else:
                 my_pos["size"] = round(my_pos["size"] - my_close_size,
                                        SIZE_RULES.get(asset, SIZE_RULES["_default"])["decimals"])
+            save_target_registry()
 
             status = "✅" if "error" not in result else "❌"
             label  = trader_info.get("label", address[:16])
@@ -2808,6 +2845,7 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     task = asyncio.create_task(target_watch_ws(address, context.application))
     target_registry[address]["ws_task"] = task
+    save_target_registry()
 
     await update.message.reply_text(
         f"🎯 *Target activé — {label}*\n"
@@ -2895,6 +2933,7 @@ async def cmd_target_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stopped.append(f"🛑 {label} `{addr[:16]}...`")
         logger.info(f"Target arrêté: {addr[:12]}")
 
+    save_target_registry()
     await update.message.reply_text(
         f"*Targets arrêtés:*\n" + "\n".join(stopped) + "\n\n"
         f"_Positions ouvertes conservées — gère-les manuellement._",
@@ -2957,6 +2996,34 @@ import urllib.request
 # ============================================================
 # MAIN
 # ============================================================
+async def restore_targets_post_init(app) -> None:
+    """
+    Appelée par python-telegram-bot après initialisation complète.
+    Recharge les targets sauvegardés et relance leurs WebSockets.
+    """
+    saved = getattr(app, "_saved_registry", {})
+    if not saved:
+        return
+    for address, info in saved.items():
+        try:
+            target_registry[address] = {
+                "active":     True,
+                "paused":     info.get("paused", False),
+                "label":      info.get("label", address[:16]),
+                "ratio":      info.get("ratio", 0),
+                "open_sizes": info.get("open_sizes", {}),
+                "ws_task":    None,
+            }
+            task = asyncio.create_task(target_watch_ws(address, app))
+            target_registry[address]["ws_task"] = task
+            logger.info(f"♻️ Target restauré: {info.get('label', address[:16])} {address[:12]}")
+        except Exception as e:
+            logger.error(f"restore_targets_post_init {address[:12]}: {e}")
+    if saved:
+        nb = len(saved)
+        logger.info(f"✅ {nb} target(s) restauré(s) depuis target_registry.json")
+
+
 def main():
     token = TELEGRAM_TOKEN
     base  = f"https://api.telegram.org/bot{token}"
@@ -2978,6 +3045,7 @@ def main():
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
+        .post_init(restore_targets_post_init)
         .build()
     )
 
@@ -3020,6 +3088,18 @@ def main():
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
     logger.info("🤖 SakaiBot v4.9 démarré — Maker orders (limit GTC + fallback market)")
+
+    # ── Restauration targets après redémarrage ──────────────
+    saved = load_target_registry()
+    if saved.get("registry"):
+        # Restaurer les positions d'abord
+        target_positions.update(saved.get("positions", {}))
+        # Relancer les WebSockets pour chaque target sauvegardé
+        # (on ne peut pas faire asyncio ici — on schedule via post_init)
+        app._saved_registry = saved["registry"]
+    else:
+        app._saved_registry = {}
+
     logger.info("⚙️ Activation DEX abstraction HIP-3...")
     try:
         loop = asyncio.get_event_loop()
