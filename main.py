@@ -198,6 +198,7 @@ AI_HIP3_ASSETS: dict = {}   # rempli dynamiquement par ai_discover_hip3_assets()
 # Cache global XYZ : évite de faire N appels API pour N assets
 # Format: {"universe": [...], "ctxs": [...], "ts": float}
 _xyz_meta_cache: dict = {"universe": [], "ctxs": [], "ts": 0.0}
+_ai_logged_missing: set = set()  # assets sans Yahoo déjà loggés (évite spam)
 _XYZ_CACHE_TTL = 30  # secondes
 
 AI_BOT_NAME        = "ORACLE"   # nom du module IA HIP-3
@@ -2687,41 +2688,68 @@ def ai_get_trail_pct(asset: str) -> float:
 
 
 async def ai_refresh_atr_cache() -> None:
-    """Calcule l'ATR 14j de chaque asset via yfinance, une fois par jour."""
+    """
+    Calcule l'ATR 14j via Yahoo Finance v8 (aiohttp — pas de dépendance yfinance).
+    Appelé une fois par jour au premier scan.
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if ai_state.get("atr_date") == today:
         return  # déjà calculé aujourd'hui
-    try:
-        import yfinance as yf
-        for ticker_full, cfg in AI_HIP3_ASSETS.items():
+
+    updated = 0
+    async with aiohttp.ClientSession() as session:
+        for ticker_full, cfg in list(AI_HIP3_ASSETS.items()):
             yahoo  = cfg.get("yahoo", "")
             ticker = ticker_full.split(":")[-1]
             if not yahoo:
                 continue
             try:
-                hist = yf.Ticker(yahoo).history(period="20d", interval="1d")
-                if hist.empty or len(hist) < 5:
+                url = (
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo}"
+                    f"?interval=1d&range=20d"
+                )
+                async with session.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as resp:
+                    data = await resp.json()
+
+                result = data.get("chart", {}).get("result", [])
+                if not result:
                     continue
-                high = hist["High"].values
-                low  = hist["Low"].values
-                close= hist["Close"].values
-                # ATR = moyenne des True Range sur 14j
+                quotes = result[0].get("indicators", {}).get("quote", [{}])[0]
+                highs  = [x for x in quotes.get("high",  []) if x is not None]
+                lows   = [x for x in quotes.get("low",   []) if x is not None]
+                closes = [x for x in quotes.get("close", []) if x is not None]
+
+                if len(closes) < 5:
+                    continue
+
+                # True Range sur 14j
                 tr_list = []
-                for i in range(1, len(high)):
-                    tr = max(high[i] - low[i],
-                             abs(high[i] - close[i-1]),
-                             abs(low[i]  - close[i-1]))
+                for i in range(1, min(len(highs), len(lows), len(closes))):
+                    tr = max(
+                        highs[i]  - lows[i],
+                        abs(highs[i]  - closes[i-1]),
+                        abs(lows[i]   - closes[i-1])
+                    )
                     tr_list.append(tr)
-                if tr_list and close[-1] > 0:
-                    atr_pct = (sum(tr_list[-14:]) / len(tr_list[-14:])) / close[-1]
+
+                if tr_list and closes[-1] > 0:
+                    window   = tr_list[-14:] if len(tr_list) >= 14 else tr_list
+                    atr_pct  = (sum(window) / len(window)) / closes[-1]
                     ai_state["atr_cache"][ticker] = round(atr_pct, 5)
+                    updated += 1
                     logger.debug(f"ATR {ticker}: {atr_pct*100:.2f}%")
+
+                await asyncio.sleep(0.2)  # petit délai pour ne pas spam Yahoo
+
             except Exception as e:
                 logger.debug(f"ATR {ticker}: {e}")
-        ai_state["atr_date"] = today
-        logger.info(f"🤖 ATR cache rafraîchi: {len(ai_state['atr_cache'])} assets")
-    except Exception as e:
-        logger.error(f"ai_refresh_atr_cache: {e}")
+
+    ai_state["atr_date"] = today
+    logger.info(f"🤖 ATR cache rafraîchi: {updated}/{len(AI_HIP3_ASSETS)} assets")
 
 
 def ai_compute_signal_score(asset: str, premium_pct: float,
@@ -3039,7 +3067,9 @@ async def ai_discover_hip3_assets() -> dict:
 
             yahoo    = YAHOO_SYMBOLS.get(ticker)
             if not yahoo:
-                logger.warning(f"IA: {ticker} dans whitelist mais sans mapping Yahoo — ignoré")
+                if ticker not in _ai_logged_missing:
+                    logger.info(f"IA: {ticker} ignoré (pas de mapping Yahoo Finance)")
+                    _ai_logged_missing.add(ticker)
                 continue
 
             vol24h  = float(ctx.get("dayNtlVlm", 0) or 0)  # volume notionnel 24h en $
