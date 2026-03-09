@@ -2254,9 +2254,15 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
         if not _HL_SDK_AVAILABLE:
             return {"error": "hyperliquid-python-sdk non installé"}
 
-        key      = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
-        wallet   = eth_account.Account.from_key(key)
-        exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+        key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+        wallet = eth_account.Account.from_key(key)
+        # HIP-3 assets nécessitent la meta xyz
+        if ":" in asset:
+            exchange = await _build_hip3_exchange()
+        else:
+            exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+        if exchange is None:
+            return {"error": "Exchange non initialisable"}
 
         slippage = 1.02 if is_buy else 0.98
         raw_px   = ref_price * slippage
@@ -2298,12 +2304,44 @@ async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
 
 
 async def _build_exchange() -> "Exchange | None":
-    """Helper — instancie Exchange une seule fois par appel."""
+    """Helper — instancie Exchange pour les assets mainnet (BTC, ETH, HYPE...)."""
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return None
     key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
     wallet = eth_account.Account.from_key(key)
     return Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+
+
+async def _build_hip3_exchange() -> "Exchange | None":
+    """
+    Exchange configuré pour les assets HIP-3 du DEX xyz.
+    Le SDK HL cherche les assets dans coin_to_asset — pour HIP-3 il faut
+    initialiser Exchange avec la meta du DEX xyz, pas la meta mainnet.
+    """
+    if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
+        return None
+    try:
+        key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+        wallet = eth_account.Account.from_key(key)
+        # Récupérer la meta du DEX xyz
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+        hip3_meta = {"universe": data[0].get("universe", [])} if isinstance(data, list) else {"universe": []}
+        logger.info(f"HIP-3 meta: {len(hip3_meta['universe'])} assets dans coin_to_asset")
+        return Exchange(
+            wallet,
+            hl_constants.MAINNET_API_URL,
+            account_address=COPY_BOT_ADDRESS,
+            meta=hip3_meta
+        )
+    except Exception as e:
+        logger.error(f"_build_hip3_exchange: {e}")
+        return None
 
 
 def _round_price(raw: float) -> float:
@@ -2368,7 +2406,12 @@ async def place_limit_gtc(
         logger.info(f"[LIMIT_GTC] force_market={asset} {sz} reason={reason}")
         return await place_market_order(asset, is_buy, sz, ref_price)
 
-    exchange = await _build_exchange()
+    # HIP-3 assets (xyz:TSLA, xyz:CL...) nécessitent un Exchange initialisé avec la meta xyz
+    is_hip3 = ":" in asset
+    if is_hip3:
+        exchange = await _build_hip3_exchange()
+    else:
+        exchange = await _build_exchange()
     if exchange is None:
         return {"error": "Exchange non initialisable"}
 
