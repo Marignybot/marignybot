@@ -2133,6 +2133,21 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 
 MAX_TARGETS = 3  # Nombre max de wallets cibles simultanés
 
+def parse_hip3_asset(coin: str):
+    """
+    Parse un ticker Hyperliquid.
+    - Perp standard :  "BTC"      → dex="",    ticker="BTC"
+    - HIP-3 perp    :  "xyz:CL"   → dex="xyz", ticker="CL"
+    - Spot (ignoré) :  "BTC/USDC" → None
+    Retourne (dex, ticker) ou None si c'est du spot (contient '/').
+    """
+    if "/" in coin:
+        return None          # spot pur → on ignore
+    if ":" in coin:
+        parts = coin.split(":", 1)
+        return (parts[0], parts[1])   # HIP-3 : (dex, ticker)
+    return ("", coin)                  # perp standard
+
 # target_registry : {address: {...}} — un dict par trader actif
 target_registry: dict = {}
 
@@ -2196,6 +2211,29 @@ async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
     if price <= 0:
         return {"error": f"Prix {asset} introuvable"}
     return await place_market_order(asset, is_buy, size, price)
+
+
+async def enable_hip3_abstraction() -> bool:
+    """
+    Active la DEX abstraction HIP-3 sur le compte.
+    Une fois activé, Hyperliquid transfère automatiquement la collateral
+    depuis le compte perp principal vers le DEX HIP-3 lors d'un ordre.
+    Appel unique au démarrage — idempotent (sans effet si déjà activé).
+    """
+    if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
+        return False
+    try:
+        key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+        wallet = eth_account.Account.from_key(key)
+        exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+        loop = asyncio.get_event_loop()
+        # user_dex_abstraction(True) = activer le transfert auto de collateral vers HIP-3 DEXs
+        result = await loop.run_in_executor(None, lambda: exchange.user_dex_abstraction(True))
+        logger.info(f"HIP-3 DEX abstraction activée: {result}")
+        return True
+    except Exception as e:
+        logger.warning(f"enable_hip3_abstraction: {e} — les ordres HIP-3 nécessitent collateral manuelle")
+        return False
 
 
 async def _build_exchange() -> "Exchange | None":
@@ -2487,6 +2525,11 @@ async def process_target_event(address: str, msg: dict, app) -> None:
         if size <= 0 or price <= 0 or not asset:
             continue
 
+        # Ignorer uniquement le spot pur (ex: "BTC/USDC") — les perps HIP-3 (ex: "xyz:CL") sont acceptés
+        if parse_hip3_asset(asset) is None:
+            logger.info(f"Target {address[:12]} → spot ignoré: {asset}")
+            continue
+
         is_opening = "Open"  in dir_fill
         is_closing = "Close" in dir_fill
         is_buy     = side == "B"
@@ -2656,6 +2699,12 @@ async def target_sync_positions(address: str, app) -> None:
             sz     = float(p.get("szi", 0) or 0)
             is_buy = sz > 0
             price  = float(mids.get(asset, 0))
+
+            # Ignorer uniquement le spot pur — HIP-3 perps (ex: "xyz:CL") sont copiés
+            if parse_hip3_asset(asset) is None:
+                results.append(f"⏭ {asset}: spot ignoré")
+                continue
+
             if price <= 0:
                 results.append(f"⚠️ {asset}: prix introuvable")
                 continue
@@ -2970,7 +3019,13 @@ def main():
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    logger.info("🤖 SakaiBot v4.8 démarré — Maker orders (limit GTC + fallback market)")
+    logger.info("🤖 SakaiBot v4.9 démarré — Maker orders (limit GTC + fallback market)")
+    logger.info("⚙️ Activation DEX abstraction HIP-3...")
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(enable_hip3_abstraction())
+    except Exception as e:
+        logger.warning(f"HIP-3 abstraction au démarrage: {e}")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
