@@ -3754,16 +3754,24 @@ async def cmd_ai_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     token = TELEGRAM_TOKEN
     base  = f"https://api.telegram.org/bot{token}"
-    for attempt in range(10):
+
+    # Attente initiale pour laisser mourir l'ancienne instance Railway (zero-downtime deploy)
+    logger.info("⏳ Attente 30s — libération du slot Telegram (Railway zero-downtime)...")
+    time_module.sleep(30)
+
+    # Nettoyage agressif : forcer la libération du polling
+    for attempt in range(15):
         try:
             urllib.request.urlopen(f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5)
-            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=1", timeout=5)
+            # getUpdates avec timeout=0 pour "voler" le slot à l'ancienne instance
+            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=0&limit=1", timeout=8)
+            logger.info(f"✅ Slot Telegram libéré (attempt {attempt+1})")
             break
         except Exception as e:
-            logger.warning(f"Init HTTP attempt {attempt+1}/10: {e}")
-            time_module.sleep(2)
+            logger.warning(f"Init HTTP attempt {attempt+1}/15: {e}")
+            time_module.sleep(3)
 
-    time_module.sleep(3)
+    time_module.sleep(5)
 
     app = (
         Application.builder()
@@ -3777,8 +3785,8 @@ def main():
 
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit résiduel — attente 20s...")
-            await asyncio.sleep(20)
+            logger.warning("⚠️ Conflit résiduel — attente 45s...")
+            await asyncio.sleep(45)
         else:
             logger.error(f"Erreur: {context.error}")
 
