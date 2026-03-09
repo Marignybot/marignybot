@@ -2340,11 +2340,12 @@ async def place_limit_gtc(
         return {"error": "hyperliquid-python-sdk non installé"}
 
     # Récupération du prix de référence
-    # Pour les assets HIP-3 (absents de allMids), on utilise ai_get_hl_price
+    # Pour les assets HIP-3 (absents de allMids), utiliser le cache hip3_prices
     mids = await get_all_mids_cached()
     ref_price = float(mids.get(asset, 0))
     if ref_price <= 0:
-        # Fallback HIP-3 : chercher via metaAndAssetCtxs
+        ref_price = ai_state["hip3_prices"].get(asset, 0)
+    if ref_price <= 0:
         cfg = AI_HIP3_ASSETS.get(asset, {})
         ref_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
     if ref_price <= 0:
