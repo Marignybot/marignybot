@@ -3224,7 +3224,9 @@ async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
     Appelle Claude Haiku pour décider long/short/close/wait.
     Retourne {"action": str, "confidence": int, "reason": str}
     """
-    if not ANTHROPIC_API_KEY:
+    # Lecture dynamique — Railway peut injecter les vars apres le demarrage
+    api_key = os.getenv("ANTHROPIC_API_KEY", "") or ANTHROPIC_API_KEY
+    if not api_key:
         return {"action": "wait", "confidence": 0, "reason": "ANTHROPIC_API_KEY manquante"}
 
     pos_context = "Aucune position ouverte."
@@ -3265,7 +3267,7 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
                 },
                 headers={
                     "Content-Type":      "application/json",
-                    "x-api-key":         ANTHROPIC_API_KEY,
+                    "x-api-key":         api_key,
                     "anthropic-version": "2023-06-01",
                 },
                 timeout=aiohttp.ClientTimeout(total=20)
@@ -3838,6 +3840,11 @@ def main():
     app.add_handler(CommandHandler("ai_history",  cmd_ai_history))
 
     logger.info("🤖 SakaiBot v4.9 démarré — Maker orders + Module IA HIP-3")
+    # Diagnostic variables d'environnement au démarrage
+    _ak = os.getenv("ANTHROPIC_API_KEY", "")
+    logger.info(f"🔑 ANTHROPIC_API_KEY: {'OK sk-ant-...'+ _ak[-6:] if _ak else 'MANQUANTE ❌'}")
+    _pk = os.getenv("HL_PRIVATE_KEY", "")
+    logger.info(f"🔑 HL_PRIVATE_KEY: {'OK ...'+ _pk[-4:] if _pk else 'MANQUANTE ❌'}")
     ai_load_state()
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
