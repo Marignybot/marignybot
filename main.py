@@ -143,6 +143,10 @@ TRADER_BLACKLIST = {
 # ============================================================
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 
+def get_anthropic_key() -> str:
+    """Lit la clé Anthropic dynamiquement — Railway injecte les vars après démarrage."""
+    return os.getenv("ANTHROPIC_API_KEY", "") or ANTHROPIC_API_KEY
+
 # Mapping ticker HIP-3 → symbole Yahoo Finance (pour comparaison prix TradFi)
 YAHOO_SYMBOLS = {
     "XYZ100":    "NQ=F",      # XYZ100 tracke le Nasdaq 100
@@ -3225,7 +3229,7 @@ async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
     Retourne {"action": str, "confidence": int, "reason": str}
     """
     # Lecture dynamique — Railway peut injecter les vars apres le demarrage
-    api_key = os.getenv("ANTHROPIC_API_KEY", "") or ANTHROPIC_API_KEY
+    api_key = get_anthropic_key()
     if not api_key:
         return {"action": "wait", "confidence": 0, "reason": "ANTHROPIC_API_KEY manquante"}
 
@@ -3611,7 +3615,7 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    if not ANTHROPIC_API_KEY:
+    if not get_anthropic_key():
         await update.message.reply_text(
             "❌ *ANTHROPIC\\_API\\_KEY manquante*\n\n"
             "Ajoute-la dans Railway → Variables :\n"
