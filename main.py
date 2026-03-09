@@ -2919,13 +2919,22 @@ async def ai_compute_budget() -> float:
 # Cache TradFi : {yahoo_symbol: {"price": float, "ts": float, "stale": bool}}
 _tradfi_cache: dict = {}
 _TRADFI_TTL = {
-    "commodities": 300,   # 5 min — CME quasi-24/5
+    "commodities": 300,   # 5 min cache — CME quasi-24/5
     "indices":     300,
     "stocks":      90,    # 1m30 — session active
     "etf":         90,
     "fx":          180,   # 3 min
 }
-_TRADFI_MAX_STALE = 600  # 10 min — au-delà, on considère le prix inutilisable
+# Yahoo Finance met à jour regularMarketTime toutes les ~15 min pour les futures CME
+# → seuil stale plus généreux pour les futures vs actions
+_TRADFI_MAX_STALE_BY_CAT = {
+    "commodities": 1200,  # 20 min — futures CME (Yahoo timestamp lent)
+    "indices":     1200,  # 20 min — NQ=F même comportement
+    "stocks":       600,  # 10 min — actions: timestamp plus fréquent
+    "etf":          600,
+    "fx":           600,
+}
+_TRADFI_MAX_STALE = 1200  # fallback global
 
 
 async def ai_get_tradfi_price(yahoo_symbol: str, asset: str = "") -> float | None:
@@ -2938,7 +2947,8 @@ async def ai_get_tradfi_price(yahoo_symbol: str, asset: str = "") -> float | Non
     import time
     now = time.time()
     cat = ai_get_asset_category(asset) if asset else "stocks"
-    ttl = _TRADFI_TTL.get(cat, 120)
+    ttl        = _TRADFI_TTL.get(cat, 120)
+    max_stale  = _TRADFI_MAX_STALE_BY_CAT.get(cat, _TRADFI_MAX_STALE)
 
     # ── Vérifier cache local ──
     cached = _tradfi_cache.get(yahoo_symbol)
@@ -2971,12 +2981,12 @@ async def ai_get_tradfi_price(yahoo_symbol: str, asset: str = "") -> float | Non
 
         # ── Vérification fraîcheur du prix ──
         price_age = now - mtime if mtime > 0 else 0
-        is_stale  = price_age > _TRADFI_MAX_STALE
+        is_stale  = price_age > max_stale
 
         if is_stale:
             logger.warning(
                 f"TradFi {yahoo_symbol}: prix stale de {price_age/60:.1f} min "
-                f"(max {_TRADFI_MAX_STALE//60} min) → ignoré"
+                f"(max {max_stale//60} min) → ignoré"
             )
             # On stocke quand même pour le fallback mais on marque stale
             _tradfi_cache[yahoo_symbol] = {"price": price, "ts": now, "stale": True}
@@ -2993,7 +3003,7 @@ async def ai_get_tradfi_price(yahoo_symbol: str, asset: str = "") -> float | Non
 def _tradfi_fallback(yahoo_symbol: str, now: float) -> float | None:
     """Retourne le dernier prix connu si < 10 min, sinon None."""
     cached = _tradfi_cache.get(yahoo_symbol)
-    if cached and (now - cached["ts"]) < _TRADFI_MAX_STALE:
+    if cached and (now - cached["ts"]) < _TRADFI_MAX_STALE:  # fallback: seuil global
         logger.info(f"TradFi {yahoo_symbol}: fallback cache ({(now-cached['ts'])/60:.1f} min)")
         return cached["price"]
     return None
