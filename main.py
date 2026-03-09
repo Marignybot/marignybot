@@ -1531,9 +1531,11 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         wallet   = eth_account.Account.from_key(key)
         exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
 
-        # [OPT] Cache prix au lieu d'un appel HTTP systématique
+        # [OPT] Cache prix — allMids pour crypto, hip3_prices pour HIP-3
         mids  = await get_all_mids_cached()
         price = float(mids.get(asset, 0))
+        if price <= 0:
+            price = ai_state["hip3_prices"].get(asset, 0)
         if price <= 0:
             return {"error": f"Prix {asset} introuvable"}
 
@@ -3233,11 +3235,11 @@ Premium HL vs TradFi:    {premium_pct:+.2f}%
 Funding rate (par heure): {funding*100:.4f}%
 {pos_context}
 
-STRATÉGIE:
-- Premium > +{AI_MIN_PREMIUM*100:.1f}% ET funding positif → SHORT (HL surcoté, traders longs paient)
-- Premium < -{AI_MIN_PREMIUM*100:.1f}% ET funding négatif → LONG (HL sous-coté, traders shorts paient)
+STRATÉGIE (assets HIP-3 — funding toujours ~0, ignorer cette condition):
+- Premium < -{AI_MIN_PREMIUM*100:.1f}% → LONG (HL sous-coté vs TradFi, convergence attendue)
+- Premium > +{AI_MIN_PREMIUM*100:.1f}% → SHORT (HL surcoté vs TradFi, convergence attendue)
 - Si position ouverte et signal inversé ou PnL proche stop → CLOSE
-- Sinon → WAIT
+- Si premium proche de 0 ou données suspectes (premium > ±20%) → WAIT
 
 Réponds UNIQUEMENT en JSON valide, sans markdown:
 {{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "explication courte"}}"""
