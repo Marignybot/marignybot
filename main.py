@@ -3033,6 +3033,39 @@ async def ai_get_tradfi_price(yahoo_symbol: str) -> float | None:
         return None
 
 
+async def ai_get_hl_price(coin: str, dex: str = "") -> float:
+    """
+    Récupère le mark price HL pour un asset HIP-3 via metaAndAssetCtxs.
+    Fallback sur allMids pour les assets standard.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {"type": "metaAndAssetCtxs"}
+            if dex:
+                payload["dex"] = dex
+            async with session.post(
+                HYPERLIQUID_API,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                data = await resp.json()
+
+        universe = data[0].get("universe", []) if isinstance(data, list) else []
+        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
+
+        search_coin = coin.split(":")[-1] if ":" in coin else coin
+
+        for i, asset in enumerate(universe):
+            if asset.get("name", "") == search_coin and i < len(ctxs):
+                mark_px = float(ctxs[i].get("markPx", 0) or 0)
+                if mark_px > 0:
+                    return mark_px
+        return 0.0
+    except Exception as e:
+        logger.warning(f"ai_get_hl_price {coin}: {e}")
+        return 0.0
+
+
 async def ai_get_funding_rate(coin: str, dex: str = "") -> float | None:
     """
     Récupère le funding rate HL pour un asset.
@@ -3228,10 +3261,10 @@ async def ai_check_stop_losses(app) -> None:
     """
     if not ai_state["positions"]:
         return
-    mids = await get_all_mids_cached()
 
     for asset, pos in list(ai_state["positions"].items()):
-        price = float(mids.get(asset, 0))
+        cfg   = AI_HIP3_ASSETS.get(asset, {})
+        price = await ai_get_hl_price(asset, cfg.get("dex", ""))
         if price <= 0:
             continue
 
@@ -3371,7 +3404,7 @@ async def ai_scan_loop(app) -> None:
                 if not ai_state["active"]:
                     break
 
-                hl_price = float(mids.get(asset, 0))
+                hl_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
                 if hl_price <= 0:
                     logger.warning(f"IA: prix HL introuvable pour {asset}")
                     continue
@@ -3510,7 +3543,6 @@ async def cmd_ai_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_emoji = "🟢 ACTIF" if ai_state["active"] else "⏸ INACTIF"
     budget       = await ai_compute_budget()
-    mids         = await get_all_mids_cached()
 
     lines = [
         f"🤖 *Module IA HIP-3 — {status_emoji}*",
@@ -3522,7 +3554,10 @@ async def cmd_ai_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ai_state["positions"]:
         lines.append("📊 *Positions ouvertes:*")
         for asset, pos in ai_state["positions"].items():
-            price   = float(mids.get(asset, pos["entry"]))
+            cfg   = AI_HIP3_ASSETS.get(asset, {})
+            price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+            if price <= 0:
+                price = pos["entry"]
             pnl_pct = ((price - pos["entry"]) / pos["entry"] * 100) if pos["side"] == "long" \
                       else ((pos["entry"] - price) / pos["entry"] * 100)
             pnl_usd = pos["usd"] * (pnl_pct / 100)
@@ -3550,10 +3585,10 @@ async def cmd_ai_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("🔄 Fermeture de toutes les positions IA...")
-    mids = await get_all_mids_cached()
 
     for asset in list(ai_state["positions"].keys()):
-        price = float(mids.get(asset, 0))
+        cfg   = AI_HIP3_ASSETS.get(asset, {})
+        price = await ai_get_hl_price(asset, cfg.get("dex", ""))
         if price <= 0:
             price = ai_state["positions"][asset]["entry"]
         await ai_close_position(asset, price, "CLOSE_ALL manuel", context.application)
