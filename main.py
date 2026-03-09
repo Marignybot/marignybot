@@ -1550,14 +1550,17 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         if sz * price < 10:
             sz = max(round(11.0 / price, rules["decimals"]), rules["min"])
 
-        logger.info(f"Ordre {asset} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
+        # SDK HL utilise le ticker brut sans préfixe (ex: "TSLA" pas "xyz:TSLA")
+        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+
+        logger.info(f"Ordre {sdk_coin} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
 
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
+            lambda: exchange.order(sdk_coin, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
         )
-        logger.info(f"Ordre {asset} {'BUY' if is_buy else 'SELL'} {sz} → {result}")
+        logger.info(f"Ordre {sdk_coin} {'BUY' if is_buy else 'SELL'} {sz} → {result}")
         return result
 
     except Exception as e:
@@ -2263,14 +2266,17 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
         if sz * ref_price < 10:
             sz = max(round(11.0 / ref_price, rules["decimals"]), rules["min"])
 
-        logger.info(f"Market {asset} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*ref_price:.0f}")
+        # SDK HL utilise le ticker brut sans préfixe (ex: "TSLA" pas "xyz:TSLA")
+        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+
+        logger.info(f"Market {sdk_coin} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*ref_price:.0f}")
 
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: exchange.order(asset, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
+            lambda: exchange.order(sdk_coin, is_buy, sz, limit_px, {"limit": {"tif": "Ioc"}})
         )
-        logger.info(f"Market {asset} résultat: {result}")
+        logger.info(f"Market {sdk_coin} résultat: {result}")
         return result
 
     except Exception as e:
@@ -2383,11 +2389,14 @@ async def place_limit_gtc(
             f"{asset} {'BUY' if is_buy else 'SELL'} sz={sz} limit={limit_px} reason={reason}"
         )
 
+        # SDK HL utilise le ticker brut sans préfixe (ex: "TSLA" pas "xyz:TSLA")
+        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+
         try:
             result = await loop.run_in_executor(
                 None,
                 lambda lp=limit_px: exchange.order(
-                    asset, is_buy, sz, lp,
+                    sdk_coin, is_buy, sz, lp,
                     {"limit": {"tif": "Gtc"}}
                 )
             )
@@ -2434,7 +2443,7 @@ async def place_limit_gtc(
                 try:
                     await loop.run_in_executor(
                         None,
-                        lambda o=oid: exchange.cancel(asset, o)
+                        lambda o=oid: exchange.cancel(sdk_coin, o)
                     )
                     logger.info(f"[LIMIT_GTC] Annulé oid={oid}, nouvelle tentative")
                 except Exception as ce:
@@ -2444,7 +2453,7 @@ async def place_limit_gtc(
                 try:
                     await loop.run_in_executor(
                         None,
-                        lambda o=oid: exchange.cancel(asset, o)
+                        lambda o=oid: exchange.cancel(sdk_coin, o)
                     )
                 except Exception:
                     pass
