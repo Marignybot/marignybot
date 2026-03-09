@@ -144,12 +144,25 @@ TRADER_BLACKLIST = {
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 
 AI_HIP3_ASSETS = {
-    "xyz:CL": {"name": "WTI Crude Oil", "yahoo": "CL=F",  "dex": "xyz", "ticker": "CL"},
-    "GOLD":   {"name": "Gold",          "yahoo": "GC=F",  "dex": "",    "ticker": "GOLD"},
-    "SILVER": {"name": "Silver",        "yahoo": "SI=F",  "dex": "",    "ticker": "SILVER"},
+    # ── Énergie ─────────────────────────────────────────────────────────
+    "xyz:CL":  {"name": "WTI Crude Oil",       "yahoo": "CL=F",    "dex": "xyz", "ticker": "CL"},
+    "xyz:NG":  {"name": "Natural Gas",          "yahoo": "NG=F",    "dex": "xyz", "ticker": "NG"},
+    # ── Métaux précieux ──────────────────────────────────────────────────
+    "GOLD":    {"name": "Gold",                 "yahoo": "GC=F",    "dex": "",    "ticker": "GOLD"},
+    "SILVER":  {"name": "Silver",               "yahoo": "SI=F",    "dex": "",    "ticker": "SILVER"},
+    "xyz:HG":  {"name": "Copper",               "yahoo": "HG=F",    "dex": "xyz", "ticker": "HG"},
+    # ── Indices actions ──────────────────────────────────────────────────
+    "xyz:ES":  {"name": "S&P 500 Futures",      "yahoo": "ES=F",    "dex": "xyz", "ticker": "ES"},
+    "xyz:NQ":  {"name": "Nasdaq 100 Futures",   "yahoo": "NQ=F",    "dex": "xyz", "ticker": "NQ"},
+    "xyz:YM":  {"name": "Dow Jones Futures",    "yahoo": "YM=F",    "dex": "xyz", "ticker": "YM"},
+    # ── Forex ────────────────────────────────────────────────────────────
+    "xyz:6E":  {"name": "EUR/USD Futures",      "yahoo": "EURUSD=X","dex": "xyz", "ticker": "6E"},
+    "xyz:6J":  {"name": "JPY/USD Futures",      "yahoo": "JPY=X",   "dex": "xyz", "ticker": "6J"},
+    "xyz:6B":  {"name": "GBP/USD Futures",      "yahoo": "GBPUSD=X","dex": "xyz", "ticker": "6B"},
 }
 
-AI_MAX_POSITIONS   = 2        # max positions IA simultanées
+AI_BOT_NAME        = "ORACLE"   # nom du module IA HIP-3
+AI_MAX_POSITIONS   = 4        # max positions IA simultanées (élargi pour 11 assets)
 AI_LEVERAGE        = 3        # levier isolated margin HIP-3
 AI_STOP_LOSS_PCT   = 0.15     # -15% stop dur (filet de sécurité)
 AI_TRAIL_PCT       = 0.07     # 7% trailing stop (suit le peak)
@@ -2018,7 +2031,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /target\\_sync 0x... — Copier positions existantes\n"
         "   /target\\_stop 0x... — Stopper un target\n"
         "   /target\\_status — État de tous les targets\n\n"
-        "🤖 *Module IA HIP-3*\n"
+        "🔮 *ORACLE — Module IA HIP-3*\n"
         "   /ai\\_start — Démarrer l'IA (CL • GOLD • SILVER)\n"
         "   /ai\\_stop — Arrêter l'IA\n"
         "   /ai\\_status — Positions + PnL en temps réel\n"
@@ -2295,8 +2308,14 @@ async def place_limit_gtc(
     if not _HL_SDK_AVAILABLE:
         return {"error": "hyperliquid-python-sdk non installé"}
 
+    # Récupération du prix de référence
+    # Pour les assets HIP-3 (absents de allMids), on utilise ai_get_hl_price
     mids = await get_all_mids_cached()
     ref_price = float(mids.get(asset, 0))
+    if ref_price <= 0:
+        # Fallback HIP-3 : chercher via metaAndAssetCtxs
+        cfg = AI_HIP3_ASSETS.get(asset, {})
+        ref_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
     if ref_price <= 0:
         return {"error": f"Prix {asset} introuvable"}
 
@@ -2316,7 +2335,12 @@ async def place_limit_gtc(
     for attempt in range(1, LIMIT_MAX_RETRIES + 1):
         # Recalcul du prix à chaque retry (mid peut avoir bougé)
         mids      = await get_all_mids_cached()
-        ref_price = float(mids.get(asset, ref_price))
+        new_price = float(mids.get(asset, 0))
+        if new_price <= 0:
+            cfg = AI_HIP3_ASSETS.get(asset, {})
+            new_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+        if new_price > 0:
+            ref_price = new_price
         # BUY : on poste légèrement SOUS le mid → maker (on attend que le marché descende)
         # SELL : on poste légèrement AU-DESSUS du mid → maker
         offset_factor = (1 - LIMIT_MAKER_OFFSET) if is_buy else (1 + LIMIT_MAKER_OFFSET)
@@ -3196,7 +3220,7 @@ async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
     ai_save_state()
 
     await send_copy_notification(app,
-        f"🤖 *IA — Position ouverte*\n"
+        f"🔮 *ORACLE — Position ouverte*\n"
         f"Asset:   *{asset}*\n"
         f"Side:    {'📈 LONG' if is_buy else '📉 SHORT'}\n"
         f"Taille:  {my_size} (~${budget_usd:.0f})\n"
@@ -3502,7 +3526,7 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assets_str = " • ".join(AI_HIP3_ASSETS.keys())
 
     await update.message.reply_text(
-        f"🤖 *Module IA HIP-3 démarré*\n\n"
+        f"🔮 *ORACLE démarré*\n\n"
         f"Assets: {assets_str}\n"
         f"Budget/trade estimé: ~${budget:.0f}\n"
         f"Max positions: {AI_MAX_POSITIONS}\n"
@@ -3542,7 +3566,7 @@ async def cmd_ai_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     budget       = await ai_compute_budget()
 
     lines = [
-        f"🤖 *Module IA HIP-3 — {status_emoji}*",
+        f"🔮 *ORACLE — {status_emoji}*",
         f"Budget dispo/trade: ~${budget:.0f}",
         f"Positions: {len(ai_state['positions'])}/{AI_MAX_POSITIONS}",
         "",
