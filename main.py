@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-SakaiBot v4.8 — Bot Telegram Hyperliquid
+SakaiBot v4.9 — Bot Telegram Hyperliquid
+  v4.9:
+  - [FIX CRITIQUE] Slot Telegram stealing : getUpdates timeout=30 (au lieu de 0)
+    pour bloquer l'ancienne instance 30s → évite le ping-pong 409
+  - [FIX] error_handler : vol actif du slot via thread au lieu de simple sleep
   v4.6:
   - [OPT] MAKER orders partout (place_limit_gtc) : ouverture, renfort, allègement, clôture normale
   - [OPT] LIMIT_MAKER_OFFSET=0.03% du mid-price → statut maker, fees ~0 voire rebate -0.01%
@@ -30,6 +34,7 @@ import json
 import logging
 import re
 import time as time_module
+import threading
 import websockets
 import eth_account
 from datetime import datetime, time
@@ -945,8 +950,6 @@ async def fetch_top_traders_hl() -> list:
                         return None
 
                     # ── AllTime — défini EN PREMIER pour usage dans le reste ──
-                    # [FIX CRITIQUE] at_data et at_pnl_raw définis ici,
-                    # avant tout usage de n_trades_at ou âge du compte
                     at_data    = windows.get("perpAllTime") or windows.get("allTime", {})
                     at_pnl_raw = [p for p in at_data.get("pnlHistory", [])
                                   if isinstance(p, list) and len(p) == 2]
@@ -1001,13 +1004,10 @@ async def fetch_top_traders_hl() -> list:
                         pass  # Fallback proxy pnlHistory
 
                     # ── MDD — calculé sur perpMonth uniquement ─────────
-                    # allTime contient des 0.0 lors des périodes inactives
-                    # ce qui faussait le MDD à 100% artificiellement
                     m30_for_mdd = windows.get("perpMonth") or windows.get("month", {})
                     acv_m30 = [float(p[1]) for p in m30_for_mdd.get("accountValueHistory", [])
                                if isinstance(p, list) and len(p) == 2 and float(p[1]) > 0]
                     worst_mdd = calc_mdd(acv_m30) if acv_m30 else calc_mdd(acv_h7)
-                    # MDD affiché mais non filtré — le scoring pénalise implicitement
                     logger.info(f"MDD {address[:12]}: {worst_mdd:.0f}%")
 
                     # ── Données 30j ─────────────────────────────────────
@@ -1046,8 +1046,6 @@ async def fetch_top_traders_hl() -> list:
                         logger.info(f"Exclu {address[:12]}: {n_trades_at} trades allTime < 20")
                         return None
 
-                    # Filtre dur scalper — incopiable si > 500 trades/semaine (limit absolue)
-                    # Entre 250 et 500 → pénalité progressive dans le scoring v6
                     if n_trades_7j > 500:
                         logger.info(
                             f"Exclu {address[:12]}: scalper extrême {n_trades_7j} trades/semaine "
@@ -1055,14 +1053,11 @@ async def fetch_top_traders_hl() -> list:
                         )
                         return None
 
-                    # Filtre dur WinRate < 45% — incopiable
                     if winrate_7j < 45.0:
                         logger.info(
                             f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 45% — incopiable"
                         )
                         return None
-
-                    # [v4.5] Filtre n_trades/pnl_mdd_ratio supprime — log1p(n) gere nativement
 
                     logger.info(
                         f"✅ Qualifié {address[:12]}: trades_at={n_trades_at} "
@@ -1083,7 +1078,7 @@ async def fetch_top_traders_hl() -> list:
                         "n_trades_at":  n_trades_at,
                         "roi_30j":      round(roi_30j, 1),
                         "capital":      round(cap_30, 0),
-                        "age_days":     round(age_days, 0),   # [v5.0] ancienneté pour PnL annualisé
+                        "age_days":     round(age_days, 0),
                     }
 
                 except Exception as e:
@@ -1108,17 +1103,6 @@ async def fetch_top_traders_hl() -> list:
 
 
 def rank_and_score_traders(traders: list) -> list:
-    """
-    Scoring v6 — PnL annualisé × Régularité × WinRate × MDD × Anti-scalper × Marge.
-
-    Filtres durs (avant scoring) :
-      - MDD <= TRADEBOT_MAX_DRAWDOWN (65%)
-      - WinRate >= 45%
-      - PnL all-time > 0
-
-    Score v6 = annualized_factor × momentum × consistency × wr_factor
-               × mdd_factor × scalper_factor × margin_factor
-    """
     if not traders:
         return []
 
@@ -1148,9 +1132,8 @@ def rank_and_score_traders(traders: list) -> list:
         age_days    = max(t.get("age_days", 365), 1)
         margin_used = t.get("margin_ratio", 0.0)
 
-        # ── 1. PnL annualisé (avec temporisation < 90j) ──────────────
         annualized_roi = (pnl_at / capital) * (365.0 / age_days) * 100
-        seuil_annuel   = 50.0 * min(age_days / 90.0, 1.0)  # temporisation
+        seuil_annuel   = 50.0 * min(age_days / 90.0, 1.0)
 
         if annualized_roi <= 0:
             return 0.0
@@ -1161,7 +1144,6 @@ def rank_and_score_traders(traders: list) -> list:
         else:
             annualized_factor = max(0.1, 0.3 * (annualized_roi / max(seuil_annuel, 1)))
 
-        # ── 2. Momentum 7j ────────────────────────────────────────────
         if pnl_30j <= 0:
             momentum_factor = 0.5
         else:
@@ -1175,14 +1157,12 @@ def rank_and_score_traders(traders: list) -> list:
             else:
                 momentum_factor = 0.5
 
-        # ── 3. Régularité 30j ─────────────────────────────────────────
         if pnl_7j > 0 and pnl_30j > 0:
             ratio       = pnl_30j / max(pnl_7j, 1)
             consistency = min(ratio / 4.0, 1.0)
         else:
             consistency = 0.5
 
-        # ── 4. WinRate ────────────────────────────────────────────────
         best_wr = max(winrate, winrate_30) / 100.0
         if best_wr >= 0.65:
             wr_factor = min(best_wr * 1.25, 1.0)
@@ -1193,11 +1173,8 @@ def rank_and_score_traders(traders: list) -> list:
         else:
             wr_factor = best_wr ** 2
 
-        # ── 5. MDD ────────────────────────────────────────────────────
         mdd_factor = max(0.02, 1.0 - (mdd / 85.0) ** 1.8)
 
-        # ── 6. Anti-scalper (seuil 250 trades/semaine) ────────────────
-        # ≤ 250/semaine → neutre | 250-500 → pénalité progressive | >500 → forte
         if n_trades_7j <= 250:
             scalper_factor = 1.0
         elif n_trades_7j <= 500:
@@ -1205,7 +1182,6 @@ def rank_and_score_traders(traders: list) -> list:
         else:
             scalper_factor = max(0.05, 0.2 * (250.0 / n_trades_7j))
 
-        # ── 7. Marge utilisée > 60% ───────────────────────────────────
         if margin_used <= 0.60:
             margin_factor = 1.0
         elif margin_used <= 0.80:
@@ -1228,7 +1204,7 @@ def rank_and_score_traders(traders: list) -> list:
     ]
     return sorted(scored, key=lambda x: x["score"], reverse=True)
 
-# [OPT] apply_exclusion_filters conservée pour compatibilité mais redirige vers rank_and_score_traders
+
 def apply_exclusion_filters(traders: list) -> list:
     filtered = [
         t for t in traders
@@ -1250,7 +1226,6 @@ def build_top5_report(top5: list) -> str:
     for i, t in enumerate(top5, 1):
         trades_per_day = t.get("n_trades_7j", 0) / 7.0
 
-        # Badges
         badges = []
         if t.get("winrate", 0) >= 65:
             badges.append("🎯 WR>65%")
@@ -1519,10 +1494,6 @@ async def send_copy_notification(app, message: str):
 
 
 async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", leverage: int = 1) -> dict:
-    """
-    [FIX] leverage param désormais honoré via COPY_LEVERAGE si non fourni.
-    [OPT] Utilise le cache prix allMids.
-    """
     try:
         if not HL_PRIVATE_KEY:
             logger.error("HL_PRIVATE_KEY non définie")
@@ -1535,7 +1506,6 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         wallet   = eth_account.Account.from_key(key)
         exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
 
-        # [OPT] Cache prix — allMids pour crypto, hip3_prices pour HIP-3
         mids  = await get_all_mids_cached()
         price = float(mids.get(asset, 0))
         if price <= 0:
@@ -1554,7 +1524,6 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         if sz * price < 10:
             sz = max(round(11.0 / price, rules["decimals"]), rules["min"])
 
-        # SDK HL utilise le ticker brut sans préfixe (ex: "TSLA" pas "xyz:TSLA")
         sdk_coin = asset.split(":")[-1] if ":" in asset else asset
 
         logger.info(f"Ordre {sdk_coin} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
@@ -1623,10 +1592,6 @@ async def check_margin_ok() -> bool:
 
 async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: float,
                                 current_price: float) -> tuple:
-    """
-    [FIX] Applique COPY_LEVERAGE[asset] comme levier de base si le trader
-    n'a pas de levier récupérable, au lieu de defaulter à 1.
-    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1641,7 +1606,6 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
         if trader_capital <= 0:
             trader_capital = float(trader_state.get("crossAccountValue", 0) or 1)
 
-        # [FIX] Priorité: levier du trader → COPY_LEVERAGE → 1
         leverage = COPY_LEVERAGE.get(asset, 1)
         for pos in trader_state.get("assetPositions", []):
             p = pos.get("position", {})
@@ -1671,7 +1635,7 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
     except Exception as e:
         logger.warning(f"get_proportional_size erreur: {e}")
         rules         = SIZE_RULES.get(asset, SIZE_RULES["_default"])
-        leverage      = COPY_LEVERAGE.get(asset, 1)  # [FIX] fallback COPY_LEVERAGE
+        leverage      = COPY_LEVERAGE.get(asset, 1)
         fallback_size = max(round(50.0 / max(current_price, 0.01), rules["decimals"]), rules["min"])
         return fallback_size, leverage, 50.0
 
@@ -1680,7 +1644,6 @@ async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: 
 # COPY TRADING — START / STOP / WATCH
 # ============================================================
 async def start_copy_trading(top_traders: list, app) -> None:
-    # Stopper les anciens WS
     for addr, task in list(copy_state["ws_tasks"].items()):
         task.cancel()
         logger.info(f"WebSocket {addr[:12]} arrêté (relance)")
@@ -2005,7 +1968,6 @@ async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    # [FIX] Aide mise à jour pour refléter le scoring v4.1
     msg = (
         "🤖 *SakaiBot — Module Copy Trading v4.1*\n\n"
         "Sélectionne les *5 meilleurs traders globaux* (top 740 Hyperliquid)\n"
@@ -2047,7 +2009,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "👋 *Bienvenue sur SakaiBot v4.4! 🤖*\n\n"
+        "👋 *Bienvenue sur SakaiBot v4.9! 🤖*\n\n"
         "📊 *Marché & Analyse*\n"
         "   /prix — Prix en temps réel\n"
         "   /setup — Analyse technique complète\n"
@@ -2216,38 +2178,17 @@ async def cmd_desactiver_alertes(update: Update, context: ContextTypes.DEFAULT_T
 
 # ============================================================
 # MODULE TARGET WALLET MANUEL v4.4
-# Logique :
-#   /target 0x...        → surveillance + réplication auto (ratio calculé au démarrage)
-#   /target_sync         → ouvre les positions déjà ouvertes du trader (optionnel)
-#   /target_stop 0x...   → stoppe un trader spécifique (ou tous si pas d'adresse)
-#   /target_status       → état de tous les traders surveillés
-#
-# Multi-target :
-#   Jusqu'à MAX_TARGETS traders simultanés.
-#   Conflit asset : premier arrivé premier servi — signal suivant ignoré + notif.
 # ============================================================
 
-MAX_TARGETS = 3  # Nombre max de wallets cibles simultanés
+MAX_TARGETS = 3
 
-# target_registry : {address: {...}} — un dict par trader actif
 target_registry: dict = {}
-
-# Positions consolidées : {asset: {"side","size","entry","trader_addr"}}
-# Premier arrivé premier servi — un seul trader par asset
 target_positions: dict = {}
-
-# Log global
 target_trades_log: list = []
 
 
-# ── Helpers ordres ──────────────────────────────────────────
-
 async def place_market_order(asset: str, is_buy: bool, size: float,
                              ref_price: float) -> dict:
-    """
-    Ordre MARKET — IOC avec slippage 2% pour garantir le fill.
-    Utilisé pour ouvertures, renforts, allègements et fermetures.
-    """
     try:
         if not HL_PRIVATE_KEY:
             return {"error": "HL_PRIVATE_KEY manquante"}
@@ -2256,7 +2197,6 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
 
         key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
         wallet = eth_account.Account.from_key(key)
-        # HIP-3 assets nécessitent la meta xyz
         if ":" in asset:
             exchange = await _build_hip3_exchange()
         else:
@@ -2276,7 +2216,6 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
         if sz * ref_price < 10:
             sz = max(round(11.0 / ref_price, rules["decimals"]), rules["min"])
 
-        # SDK HL utilise le ticker brut sans préfixe (ex: "TSLA" pas "xyz:TSLA")
         sdk_coin = asset.split(":")[-1] if ":" in asset else asset
 
         logger.info(f"Market {sdk_coin} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*ref_price:.0f}")
@@ -2295,7 +2234,6 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
 
 
 async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
-    """Alias vers place_market_order pour les fermetures."""
     mids  = await get_all_mids_cached()
     price = float(mids.get(asset, 0))
     if price <= 0:
@@ -2304,7 +2242,6 @@ async def place_market_close(asset: str, is_buy: bool, size: float) -> dict:
 
 
 async def _build_exchange() -> "Exchange | None":
-    """Helper — instancie Exchange pour les assets mainnet (BTC, ETH, HYPE...)."""
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return None
     key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
@@ -2313,17 +2250,11 @@ async def _build_exchange() -> "Exchange | None":
 
 
 async def _build_hip3_exchange() -> "Exchange | None":
-    """
-    Exchange configuré pour les assets HIP-3 du DEX xyz.
-    Le SDK HL cherche les assets dans coin_to_asset — pour HIP-3 il faut
-    initialiser Exchange avec la meta du DEX xyz, pas la meta mainnet.
-    """
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return None
     try:
         key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
         wallet = eth_account.Account.from_key(key)
-        # Récupérer la meta du DEX xyz
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 HYPERLIQUID_API,
@@ -2345,14 +2276,12 @@ async def _build_hip3_exchange() -> "Exchange | None":
 
 
 def _round_price(raw: float) -> float:
-    """Arrondit le prix selon la magnitude (règle HL 5 chiffres sig.)."""
     magnitude = len(str(int(raw)))
     decimals  = max(0, 5 - magnitude)
     return float(round(raw, decimals))
 
 
 def _round_size(asset: str, size: float, ref_price: float) -> float:
-    """Arrondit la taille et applique le minimum HL."""
     rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
     sz    = round(size, rules["decimals"])
     sz    = max(sz, rules["min"])
@@ -2368,27 +2297,11 @@ async def place_limit_gtc(
     reason: str = "",
     force_market: bool = False,
 ) -> dict:
-    """
-    Ordre MAKER (GTC) avec retry + fallback market — v4.6.
-
-    Logique :
-      1. Poster un limit GTC à LIMIT_MAKER_OFFSET du mid-price
-         (légèrement sous le marché pour un BUY, légèrement au-dessus pour un SELL)
-         → statut maker = fees ~0 voire rebate -0.01%
-      2. Attendre LIMIT_RETRY_WAIT secondes → vérifier le fill via clearinghouseState
-      3. Si non rempli après LIMIT_MAX_RETRIES → annuler + fallback market IOC (taker)
-      4. Si force_market=True (stop-loss urgence) → saute directement au market
-
-    Utilisé pour : ouverture, renfort, allègement, clôture normale.
-    place_market_order reste pour les stop-loss d'urgence uniquement.
-    """
     if not HL_PRIVATE_KEY:
         return {"error": "HL_PRIVATE_KEY manquante"}
     if not _HL_SDK_AVAILABLE:
         return {"error": "hyperliquid-python-sdk non installé"}
 
-    # Récupération du prix de référence
-    # Pour les assets HIP-3 (absents de allMids), utiliser le cache hip3_prices
     mids = await get_all_mids_cached()
     ref_price = float(mids.get(asset, 0))
     if ref_price <= 0:
@@ -2401,12 +2314,10 @@ async def place_limit_gtc(
 
     sz = _round_size(asset, size, ref_price)
 
-    # ── Urgence / force market ───────────────────────────────
     if force_market:
         logger.info(f"[LIMIT_GTC] force_market={asset} {sz} reason={reason}")
         return await place_market_order(asset, is_buy, sz, ref_price)
 
-    # HIP-3 assets (xyz:TSLA, xyz:CL...) nécessitent un Exchange initialisé avec la meta xyz
     is_hip3 = ":" in asset
     if is_hip3:
         exchange = await _build_hip3_exchange()
@@ -2418,7 +2329,6 @@ async def place_limit_gtc(
     loop = asyncio.get_event_loop()
 
     for attempt in range(1, LIMIT_MAX_RETRIES + 1):
-        # Recalcul du prix à chaque retry (mid peut avoir bougé)
         mids      = await get_all_mids_cached()
         new_price = float(mids.get(asset, 0))
         if new_price <= 0:
@@ -2426,8 +2336,6 @@ async def place_limit_gtc(
             new_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
         if new_price > 0:
             ref_price = new_price
-        # BUY : on poste légèrement SOUS le mid → maker (on attend que le marché descende)
-        # SELL : on poste légèrement AU-DESSUS du mid → maker
         offset_factor = (1 - LIMIT_MAKER_OFFSET) if is_buy else (1 + LIMIT_MAKER_OFFSET)
         limit_px = _round_price(ref_price * offset_factor)
 
@@ -2436,7 +2344,6 @@ async def place_limit_gtc(
             f"{asset} {'BUY' if is_buy else 'SELL'} sz={sz} limit={limit_px} reason={reason}"
         )
 
-        # SDK HL utilise le ticker brut sans préfixe (ex: "TSLA" pas "xyz:TSLA")
         sdk_coin = asset.split(":")[-1] if ":" in asset else asset
 
         try:
@@ -2451,11 +2358,9 @@ async def place_limit_gtc(
             logger.error(f"[LIMIT_GTC] place error attempt={attempt}: {e}")
             result = {"error": str(e)}
 
-        # Vérifier si la réponse indique un fill immédiat
         status = ""
         oid    = None
         try:
-            # SDK retourne {"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}
             statuses = result.get("response", {}).get("data", {}).get("statuses", [])
             if statuses:
                 st = statuses[0]
@@ -2472,20 +2377,16 @@ async def place_limit_gtc(
             pass
 
         if status == "resting" and oid:
-            # Attente avant de vérifier le fill
             await asyncio.sleep(LIMIT_RETRY_WAIT)
 
-            # Vérifier si l'ordre est toujours ouvert
             try:
                 positions = await get_my_positions()
-                # Si l'asset est maintenant en position → ordre rempli
                 if asset in positions:
                     logger.info(f"[LIMIT_GTC] Fill confirmé {asset} après {attempt * LIMIT_RETRY_WAIT}s")
                     return result
             except Exception:
                 pass
 
-            # Ordre toujours resting → annuler et retenter (ou fallback)
             if attempt < LIMIT_MAX_RETRIES:
                 try:
                     await loop.run_in_executor(
@@ -2496,7 +2397,6 @@ async def place_limit_gtc(
                 except Exception as ce:
                     logger.warning(f"[LIMIT_GTC] Cancel failed oid={oid}: {ce}")
             else:
-                # Dernière tentative échouée → annuler + fallback market
                 try:
                     await loop.run_in_executor(
                         None,
@@ -2511,21 +2411,17 @@ async def place_limit_gtc(
                 return await place_market_order(asset, is_buy, sz, ref_price)
 
         elif status == "error":
-            # Erreur applicative → fallback immédiat
             logger.warning(f"[LIMIT_GTC] Erreur statut → fallback market {asset}")
             return await place_market_order(asset, is_buy, sz, ref_price)
 
         else:
-            # Résultat inattendu → fallback market
             logger.warning(f"[LIMIT_GTC] Résultat inattendu {result} → fallback market")
             return await place_market_order(asset, is_buy, sz, ref_price)
 
-    # Ne devrait pas arriver
     return await place_market_order(asset, is_buy, sz, ref_price)
 
 
 async def compute_target_ratio(trader_address: str) -> float | None:
-    """Ratio bot_capital / trader_capital — calculé une fois au démarrage."""
     try:
         _, bot_balance    = await get_wallet_data(COPY_BOT_ADDRESS)
         _, trader_balance = await get_wallet_data(trader_address)
@@ -2543,7 +2439,6 @@ async def compute_target_ratio(trader_address: str) -> float | None:
 
 def compute_my_size(asset: str, trader_size: float, trader_price: float,
                     ratio: float) -> float:
-    """Taille bot = trader_size × ratio, arrondie aux règles de l'asset."""
     rules    = SIZE_RULES.get(asset, SIZE_RULES["_default"])
     raw_size = trader_size * ratio
     sz       = max(round(raw_size, rules["decimals"]), rules["min"])
@@ -2552,10 +2447,7 @@ def compute_my_size(asset: str, trader_size: float, trader_price: float,
     return sz
 
 
-# ── WebSocket par trader ────────────────────────────────────
-
 async def target_watch_ws(address: str, app) -> None:
-    """Un WebSocket indépendant par trader cible."""
     logger.info(f"Target WS démarré → {address[:12]}")
     first_connect = True
     reconnect_count = 0
@@ -2567,8 +2459,8 @@ async def target_watch_ws(address: str, app) -> None:
         try:
             async with websockets.connect(
                 HYPERLIQUID_WS,
-                ping_interval=10,   # ping toutes les 10s pour maintenir la connexion
-                ping_timeout=30,    # timeout généreux
+                ping_interval=10,
+                ping_timeout=30,
                 close_timeout=5,
             ) as ws:
                 await ws.send(json.dumps({
@@ -2577,7 +2469,6 @@ async def target_watch_ws(address: str, app) -> None:
                 }))
                 logger.info(f"✅ Target WS connecté → {address[:12]} (reconnexions: {reconnect_count})")
 
-                # Notif Telegram uniquement au premier démarrage
                 if first_connect:
                     ratio = target_registry[address].get("ratio", 0)
                     await send_copy_notification(app,
@@ -2588,10 +2479,9 @@ async def target_watch_ws(address: str, app) -> None:
                     )
                     first_connect = False
                 else:
-                    # Reconnexion silencieuse — log seulement
                     logger.info(f"Target WS reconnecté silencieusement → {address[:12]}")
 
-                reconnect_count = 0  # Reset compteur sur connexion réussie
+                reconnect_count = 0
 
                 async for raw_msg in ws:
                     if address not in target_registry or not target_registry[address]["active"]:
@@ -2608,7 +2498,7 @@ async def target_watch_ws(address: str, app) -> None:
             if address not in target_registry or not target_registry[address]["active"]:
                 break
             reconnect_count += 1
-            wait = min(5 * reconnect_count, 30)  # backoff progressif: 5s, 10s, 15s... max 30s
+            wait = min(5 * reconnect_count, 30)
             logger.warning(f"Target WS {address[:12]} déconnecté (#{reconnect_count}): {e} — reconnexion {wait}s")
             await asyncio.sleep(wait)
 
@@ -2616,12 +2506,6 @@ async def target_watch_ws(address: str, app) -> None:
 
 
 async def process_target_event(address: str, msg: dict, app) -> None:
-    """
-    Traite un fill du trader cible.
-    Ouverture/Renfort → MARKET IOC
-    Fermeture partielle ou totale → MARKET, proportionnelle au ratio de fermeture
-    Conflit asset → ignoré, premier arrivé premier servi
-    """
     data  = msg.get("data", {})
     if not data:
         return
@@ -2652,10 +2536,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
 
         result = {}
 
-        # ── OUVERTURE ou RENFORT ────────────────────────────
         if is_opening:
-
-            # Conflit : un autre trader a déjà une position sur cet asset ?
             existing_pos = target_positions.get(asset)
             if existing_pos and existing_pos["trader_addr"] != address:
                 owner_rank = target_registry.get(existing_pos["trader_addr"], {}).get("label", existing_pos["trader_addr"][:10])
@@ -2667,7 +2548,6 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                 )
                 continue
 
-            # Vérifier marge
             if not await check_margin_ok():
                 await send_copy_notification(app,
                     f"⚠️ *Marge insuffisante*\nAsset: {asset} | {dir_fill}\nOrdre annulé."
@@ -2677,7 +2557,6 @@ async def process_target_event(address: str, msg: dict, app) -> None:
             my_size = compute_my_size(asset, size, price, ratio)
             result  = await place_limit_gtc(asset, is_buy, my_size, dir_fill)
 
-            # Mémoriser ou cumuler (renfort)
             is_reinforce = asset in target_positions and target_positions[asset]["trader_addr"] == address
             if is_reinforce:
                 pos = target_positions[asset]
@@ -2705,23 +2584,18 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                 + (f"\n⚠️ {result['error']}" if "error" in result else "")
             )
 
-        # ── FERMETURE PARTIELLE OU TOTALE ──────────────────
         elif is_closing:
-
             my_pos = target_positions.get(asset)
             if not my_pos or my_pos["trader_addr"] != address:
                 logger.info(f"Target: pas de position bot sur {asset} (ignoré)")
                 continue
 
-            # Calculer le ratio de fermeture du trader
-            # On approche via le fill : size = ce que le trader ferme
-            # On récupère la taille totale du trader pour calculer le %
             trader_pos_size = trader_info.get("open_sizes", {}).get(asset, size)
             close_ratio     = min(size / max(trader_pos_size, 0.0001), 1.0)
             my_close_size   = round(my_pos["size"] * close_ratio, SIZE_RULES.get(asset, SIZE_RULES["_default"])["decimals"])
             my_close_size   = max(my_close_size, SIZE_RULES.get(asset, SIZE_RULES["_default"])["min"])
 
-            is_close_buy = my_pos["side"] == "short"  # inverse pour clôturer
+            is_close_buy = my_pos["side"] == "short"
             result       = await place_limit_gtc(asset, is_close_buy, my_close_size, dir_fill)
 
             is_full_close = close_ratio >= 0.99
@@ -2744,7 +2618,6 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                 + (f"\n⚠️ {result['error']}" if "error" in result else "")
             )
 
-        # Mettre à jour open_sizes du trader (tracking taille trader)
         if is_opening:
             sizes = trader_info.setdefault("open_sizes", {})
             sizes[asset] = sizes.get(asset, 0) + size
@@ -2756,7 +2629,6 @@ async def process_target_event(address: str, msg: dict, app) -> None:
             else:
                 sizes[asset] = remaining
 
-        # Log
         log = {
             "time":    datetime.now().strftime("%d/%m %H:%M"),
             "asset":   asset,
@@ -2771,14 +2643,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
             target_trades_log[:] = target_trades_log[-200:]
 
 
-# ── Sync positions existantes (optionnel) ───────────────────
-
 async def target_sync_positions(address: str, app) -> None:
-    """
-    /target_sync — Ouvre les positions DÉJÀ ouvertes du trader au MARKET.
-    Optionnel — à appeler manuellement après /target si tu veux entrer sur
-    les positions en cours.
-    """
     trader_info = target_registry.get(address)
     if not trader_info:
         return
@@ -2817,7 +2682,6 @@ async def target_sync_positions(address: str, app) -> None:
                 results.append(f"⚠️ {asset}: prix introuvable")
                 continue
 
-            # Conflit ?
             existing = target_positions.get(asset)
             if existing and existing["trader_addr"] != address:
                 results.append(f"⚠️ {asset}: conflit avec `{existing['trader_addr'][:10]}`")
@@ -2847,14 +2711,7 @@ async def target_sync_positions(address: str, app) -> None:
         await send_copy_notification(app, f"❌ Sync erreur: `{str(e)[:100]}`")
 
 
-# ── Commandes Telegram ──────────────────────────────────────
-
 async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /target 0xADRESSE [label]
-    Lance surveillance + réplication immédiate.
-    Optionnel: label court pour identifier le trader (ex: /target 0xABC... Scalper1)
-    """
     if not is_authorized(update):
         return
     if not context.args:
@@ -2872,7 +2729,6 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     label = " ".join(context.args[1:]) if len(context.args) > 1 else address[:16] + "..."
 
-    # Déjà en surveillance ?
     if address in target_registry and target_registry[address]["active"]:
         await update.message.reply_text(
             f"ℹ️ `{address[:20]}...` déjà en surveillance.",
@@ -2880,7 +2736,6 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Limite MAX_TARGETS
     active_count = sum(1 for t in target_registry.values() if t["active"])
     if active_count >= MAX_TARGETS:
         await update.message.reply_text(
@@ -2933,14 +2788,9 @@ async def cmd_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_target_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /target_sync 0xADRESSE
-    Ouvre les positions déjà ouvertes du trader au MARKET.
-    """
     if not is_authorized(update):
         return
     if not context.args:
-        # Si un seul target actif, on prend celui-là
         active = [a for a, t in target_registry.items() if t["active"]]
         if len(active) == 1:
             address = active[0]
@@ -2968,10 +2818,6 @@ async def cmd_target_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_target_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /target_stop 0xADRESSE  → stoppe un trader spécifique
-    /target_stop             → stoppe TOUS les traders
-    """
     if not is_authorized(update):
         return
 
@@ -2995,7 +2841,6 @@ async def cmd_target_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if task and not task.done():
             task.cancel()
         target_registry.pop(addr, None)
-        # Libérer les positions associées
         for asset, pos in list(target_positions.items()):
             if pos["trader_addr"] == addr:
                 target_positions.pop(asset, None)
@@ -3011,7 +2856,6 @@ async def cmd_target_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche l'état de tous les traders en surveillance."""
     if not is_authorized(update):
         return
 
@@ -3043,7 +2887,6 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append("  _aucune position_")
 
-    # Vue consolidée seulement si plusieurs traders ont des positions
     if len(target_positions) > 1:
         lines.append(f"\n━━━━━━━━━━━━━━━━━━━━")
         lines.append(f"📊 *{len(target_positions)} positions ouvertes*")
@@ -3058,8 +2901,6 @@ async def cmd_target_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-
-
 import urllib.request
 
 # ============================================================
@@ -3067,7 +2908,6 @@ import urllib.request
 # ============================================================
 
 def ai_save_state() -> None:
-    """Sauvegarde l'état IA sur disque."""
     try:
         data = {
             "active":    ai_state["active"],
@@ -3081,7 +2921,6 @@ def ai_save_state() -> None:
 
 
 def ai_load_state() -> None:
-    """Recharge l'état IA depuis disque."""
     try:
         if not os.path.exists(AI_STATE_FILE):
             return
@@ -3095,10 +2934,6 @@ def ai_load_state() -> None:
 
 
 async def ai_compute_budget() -> float:
-    """
-    Budget dispo par trade =
-    (wallet - wallet×SAFETY_BUFFER - margin_copy×COPY_RESERVE) / slots_restants
-    """
     try:
         _, bot_bal = await get_wallet_data(COPY_BOT_ADDRESS)
         wallet     = bot_bal.get("accountValue", 0)
@@ -3107,9 +2942,6 @@ async def ai_compute_budget() -> float:
         if wallet < AI_MIN_WALLET:
             return 0.0
 
-        # Budget ORACLE = min(budget_fixe, budget_dispo_réel) / slots_restants
-        # Budget fixe : $300 réservés à ORACLE indépendamment du copy
-        # Budget réel : wallet × (1 - 15%) - marge_copy × 1.2
         copy_margin = margin - sum(
             pos.get("usd", 0) / AI_LEVERAGE
             for pos in ai_state["positions"].values()
@@ -3129,7 +2961,6 @@ async def ai_compute_budget() -> float:
 
 
 async def ai_get_tradfi_price(yahoo_symbol: str) -> float | None:
-    """Prix TradFi depuis Yahoo Finance (gratuit, sans clé API)."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1m&range=1d"
         async with aiohttp.ClientSession() as session:
@@ -3147,11 +2978,6 @@ async def ai_get_tradfi_price(yahoo_symbol: str) -> float | None:
 
 
 async def ai_discover_hip3_assets() -> dict:
-    """
-    Interroge l'API HL pour lister tous les assets HIP-3 disponibles sur le DEX 'xyz'.
-    Retourne un dict {ticker: markPx} des assets actifs (markPx > 0).
-    Remplace entièrement AI_HIP3_ASSETS avec les assets découverts.
-    """
     global AI_HIP3_ASSETS
     discovered = {}
     try:
@@ -3168,29 +2994,26 @@ async def ai_discover_hip3_assets() -> dict:
 
         new_assets = {}
         for i, asset in enumerate(universe):
-            raw_name = asset.get("name", "")   # ex: "TSLA" ou "xyz:TSLA" selon l'API
+            raw_name = asset.get("name", "")
             if not raw_name or i >= len(ctxs):
                 continue
             mark_px = float(ctxs[i].get("markPx", 0) or 0)
             if mark_px <= 0:
                 continue
 
-            # Le nom dans universe est le ticker brut (ex: "TSLA")
-            # Le nom complet pour trader est "xyz:TSLA"
-            ticker    = raw_name.split(":")[-1]  # strip tout préfixe éventuel
+            ticker    = raw_name.split(":")[-1]
             full_name = f"xyz:{ticker}"
 
             discovered[full_name] = mark_px
             new_assets[full_name] = {
                 "name":   ticker,
-                "yahoo":  YAHOO_SYMBOLS.get(ticker),  # référence TradFi si connue
+                "yahoo":  YAHOO_SYMBOLS.get(ticker),
                 "dex":    "xyz",
                 "ticker": ticker,
             }
 
-        # Remplace entièrement la liste d'assets et les prix en cache
         AI_HIP3_ASSETS = new_assets
-        ai_state["hip3_prices"] = discovered   # cache des prix pour le scan loop
+        ai_state["hip3_prices"] = discovered
         logger.info(f"🔮 ORACLE — {len(discovered)} assets HIP-3 actifs: {list(discovered.keys())}")
 
     except Exception as e:
@@ -3199,10 +3022,6 @@ async def ai_discover_hip3_assets() -> dict:
 
 
 async def ai_get_hl_price(coin: str, dex: str = "") -> float:
-    """
-    Récupère le mark price HL pour un asset HIP-3 via metaAndAssetCtxs.
-    Fallback sur allMids pour les assets standard.
-    """
     try:
         async with aiohttp.ClientSession() as session:
             payload = {"type": "metaAndAssetCtxs"}
@@ -3232,10 +3051,6 @@ async def ai_get_hl_price(coin: str, dex: str = "") -> float:
 
 
 async def ai_get_funding_rate(coin: str, dex: str = "") -> float | None:
-    """
-    Récupère le funding rate HL pour un asset.
-    Pour HIP-3 (dex != ""), utilise le paramètre dex dans metaAndAssetCtxs.
-    """
     try:
         async with aiohttp.ClientSession() as session:
             payload = {"type": "metaAndAssetCtxs"}
@@ -3251,7 +3066,6 @@ async def ai_get_funding_rate(coin: str, dex: str = "") -> float | None:
         universe = data[0].get("universe", []) if isinstance(data, list) else []
         ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
 
-        # Pour HIP-3, le ticker dans universe est sans le préfixe "xyz:"
         search_coin = coin.split(":")[-1] if ":" in coin else coin
 
         for i, asset in enumerate(universe):
@@ -3267,11 +3081,6 @@ async def ai_get_funding_rate(coin: str, dex: str = "") -> float | None:
 async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
                          funding: float, premium_pct: float,
                          existing_pos: dict | None) -> dict:
-    """
-    Appelle Claude Haiku pour décider long/short/close/wait.
-    Retourne {"action": str, "confidence": int, "reason": str}
-    """
-    # Lecture dynamique — Railway peut injecter les vars apres le demarrage
     api_key = get_anthropic_key()
     if not api_key:
         return {"action": "wait", "confidence": 0, "reason": "ANTHROPIC_API_KEY manquante"}
@@ -3336,7 +3145,6 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
 
 async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
                            current_price: float, reason: str, app) -> bool:
-    """Ouvre une position IA et enregistre le stop-loss."""
     rules    = SIZE_RULES.get(asset, SIZE_RULES["_default"])
     my_size  = max(round(budget_usd / current_price, rules["decimals"]), rules["min"])
 
@@ -3356,11 +3164,11 @@ async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
         "side":         side,
         "size":         my_size,
         "entry":        current_price,
-        "peak":         current_price,   # trailing stop peak
+        "peak":         current_price,
         "stop":         round(stop_price, 4),
         "usd":          budget_usd,
         "time":         datetime.now().strftime("%d/%m %H:%M"),
-        "tp_levels_hit": [],              # paliers partiels déjà encaissés
+        "tp_levels_hit": [],
     }
     ai_save_state()
 
@@ -3377,7 +3185,6 @@ async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
 
 
 async def ai_close_position(asset: str, current_price: float, reason: str, app) -> bool:
-    """Ferme une position IA et log le PnL."""
     pos = ai_state["positions"].get(asset)
     if not pos:
         return False
@@ -3418,13 +3225,6 @@ async def ai_close_position(asset: str, current_price: float, reason: str, app) 
 
 
 async def ai_check_stop_losses(app) -> None:
-    """
-    Vérifie à chaque scan :
-    1. Mise à jour du peak (trailing)
-    2. Calcul du trailing stop = peak × (1 ± TRAIL_PCT)
-    3. Stop dur à -AI_STOP_LOSS_PCT depuis l'entrée (filet de sécurité)
-    4. Fermeture si l'un des deux est touché
-    """
     if not ai_state["positions"]:
         return
 
@@ -3440,12 +3240,10 @@ async def ai_check_stop_losses(app) -> None:
         entry = pos["entry"]
         peak  = pos.get("peak", entry)
 
-        # ── Mise à jour du peak ──────────────────────────────
         if side == "long":
             if price > peak:
                 pos["peak"] = price
                 peak = price
-                # Recalcul trailing stop
                 pos["stop"] = round(peak * (1 - AI_TRAIL_PCT), 4)
                 logger.info(f"IA trailing {asset}: nouveau peak ${peak:.4f} → stop ${pos['stop']:.4f}")
 
@@ -3456,7 +3254,6 @@ async def ai_check_stop_losses(app) -> None:
                 pos["stop"] = round(peak * (1 + AI_TRAIL_PCT), 4)
                 logger.info(f"IA trailing {asset}: nouveau peak ${peak:.4f} → stop ${pos['stop']:.4f}")
 
-        # ── Stop dur depuis l'entrée ─────────────────────────
         hard_stop_long  = entry * (1 - AI_STOP_LOSS_PCT)
         hard_stop_short = entry * (1 + AI_STOP_LOSS_PCT)
 
@@ -3465,7 +3262,6 @@ async def ai_check_stop_losses(app) -> None:
         hit_hard     = (side == "long"  and price <= hard_stop_long) or \
                        (side == "short" and price >= hard_stop_short)
 
-        # ── Take-profits partiels progressifs ───────────────
         pnl_pct_now = ((price - entry) / entry * 100) if side == "long" \
                       else ((entry - price) / entry * 100)
 
@@ -3473,16 +3269,14 @@ async def ai_check_stop_losses(app) -> None:
 
         for threshold, close_ratio in AI_PARTIAL_TP:
             if threshold in levels_hit:
-                continue  # palier déjà encaissé
+                continue
             if pnl_pct_now >= threshold * 100:
-                # Calculer la taille à fermer
                 rules         = SIZE_RULES.get(asset, SIZE_RULES["_default"])
                 close_size    = round(pos["size"] * close_ratio, rules["decimals"])
                 close_size    = max(close_size, rules["min"])
                 close_usd     = close_size * price
 
                 if close_size >= pos["size"]:
-                    # Sécurité : ne pas fermer plus que ce qu'on a
                     close_size = pos["size"]
 
                 is_close_buy = side == "short"
@@ -3510,17 +3304,14 @@ async def ai_check_stop_losses(app) -> None:
                     )
                     logger.info(f"IA PARTIAL TP {asset} +{threshold*100:.0f}%: fermé {close_size} reste {pos['size']}")
 
-                    # Si la position résiduelle est trop petite → fermer tout
                     if pos["size"] <= rules["min"]:
                         await ai_close_position(asset, price, f"POSITION RÉSIDUELLE TROP PETITE", app)
                         break
-                break  # un seul palier par scan
+                break
 
-        # Recalculer après potentielle fermeture partielle
         if asset not in ai_state["positions"]:
             continue
 
-        # ── Take-profit dur à +20% ───────────────────────────
         tp_long  = entry * (1 + AI_TAKE_PROFIT_PCT)
         tp_short = entry * (1 - AI_TAKE_PROFIT_PCT)
         hit_tp   = (side == "long"  and price >= tp_long) or \
@@ -3561,14 +3352,12 @@ async def ai_check_stop_losses(app) -> None:
 
 
 async def ai_scan_loop(app) -> None:
-    """Boucle principale IA — scan toutes les AI_SCAN_INTERVAL secondes."""
     logger.info("🤖 IA scan loop démarrée")
     scan_count = 0
     while ai_state["active"]:
         try:
             await ai_check_stop_losses(app)
 
-            # Redécouverte des assets HIP-3 toutes les 6 itérations (~30 min)
             if scan_count % 6 == 0:
                 await ai_discover_hip3_assets()
             scan_count += 1
@@ -3577,10 +3366,8 @@ async def ai_scan_loop(app) -> None:
                 if not ai_state["active"]:
                     break
 
-                # Utiliser le prix du cache (mis à jour par ai_discover_hip3_assets)
                 hl_price = ai_state["hip3_prices"].get(asset, 0)
                 if hl_price <= 0:
-                    # Fallback : appel direct
                     hl_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
                 if hl_price <= 0:
                     logger.debug(f"IA: prix HL introuvable pour {asset}")
@@ -3603,7 +3390,6 @@ async def ai_scan_loop(app) -> None:
 
                 existing_pos = ai_state["positions"].get(asset)
 
-                # Décision Claude
                 decision = await ai_call_claude(
                     cfg["name"], hl_price, tradfi_price,
                     funding, premium_pct, existing_pos
@@ -3643,7 +3429,6 @@ async def ai_scan_loop(app) -> None:
         except Exception as e:
             logger.error(f"ai_scan_loop erreur: {e}")
 
-        # Attente avant prochain scan
         for _ in range(AI_SCAN_INTERVAL):
             if not ai_state["active"]:
                 break
@@ -3678,12 +3463,10 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ai_state["scan_task"].cancel()
     ai_state["scan_task"] = asyncio.create_task(ai_scan_loop(context.application))
 
-    # Découverte automatique des assets HIP-3 disponibles
     await update.message.reply_text("🔍 Découverte des assets HIP-3...", parse_mode="Markdown")
     discovered = await ai_discover_hip3_assets()
 
     budget     = await ai_compute_budget()
-    assets_str = " • ".join(AI_HIP3_ASSETS.keys())
     active_str = " • ".join(f"{k} (${v:.2f})" for k, v in discovered.items()) if discovered else "aucun trouvé"
 
     await update.message.reply_text(
@@ -3813,23 +3596,31 @@ def main():
     token = TELEGRAM_TOKEN
     base  = f"https://api.telegram.org/bot{token}"
 
-    # Attente initiale pour laisser mourir l'ancienne instance Railway (zero-downtime deploy)
+    # ── Attente initiale Railway zero-downtime ────────────────
     logger.info("⏳ Attente 30s — libération du slot Telegram (Railway zero-downtime)...")
     time_module.sleep(30)
 
-    # Nettoyage agressif : forcer la libération du polling
-    for attempt in range(15):
+    # ── [FIX v4.9] Slot stealing agressif ────────────────────
+    # timeout=30 : on TIENT le slot 30 secondes via long-poll
+    # → l'ancienne instance reçoit un 409, cesse de poller, meurt proprement
+    # timeout=0 (ancienne valeur) retournait immédiatement → l'ancienne instance
+    # reprenait le slot dans la foulée → ping-pong 409 infini
+    for attempt in range(20):
         try:
-            urllib.request.urlopen(f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5)
-            # getUpdates avec timeout=0 pour "voler" le slot à l'ancienne instance
-            urllib.request.urlopen(f"{base}/getUpdates?offset=-1&timeout=0&limit=1", timeout=8)
+            urllib.request.urlopen(
+                f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5
+            )
+            # Long-poll timeout=30 → bloque l'ancienne instance pendant 30s
+            urllib.request.urlopen(
+                f"{base}/getUpdates?offset=-1&timeout=30&limit=1", timeout=35
+            )
             logger.info(f"✅ Slot Telegram libéré (attempt {attempt+1})")
             break
         except Exception as e:
-            logger.warning(f"Init HTTP attempt {attempt+1}/15: {e}")
-            time_module.sleep(3)
+            logger.warning(f"Init HTTP attempt {attempt+1}/20: {e}")
+            time_module.sleep(5)
 
-    time_module.sleep(5)
+    time_module.sleep(5)  # laisser le slot "refroidir"
 
     app = (
         Application.builder()
@@ -3841,10 +3632,28 @@ def main():
         .build()
     )
 
+    # ── [FIX v4.9] Error handler — vol actif du slot ─────────
+    # Au lieu de juste dormir 45s (l'ancienne instance reprenait le slot),
+    # on lance un thread qui fait getUpdates timeout=30 → bloque l'ancien
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit résiduel — attente 45s...")
-            await asyncio.sleep(45)
+            logger.warning("⚠️ Conflit — vol du slot Telegram en cours...")
+
+            def _steal_slot():
+                for i in range(5):
+                    try:
+                        urllib.request.urlopen(
+                            f"{base}/getUpdates?offset=-1&timeout=30&limit=1",
+                            timeout=35
+                        )
+                        logger.info(f"✅ Slot volé (error_handler tentative {i+1})")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Vol slot tentative {i+1}/5: {e}")
+                        time_module.sleep(3)
+
+            threading.Thread(target=_steal_slot, daemon=True).start()
+            await asyncio.sleep(35)
         else:
             logger.error(f"Erreur: {context.error}")
 
@@ -3880,14 +3689,13 @@ def main():
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
     # Module IA HIP-3
-    app.add_handler(CommandHandler("ai_start",    cmd_ai_start))
-    app.add_handler(CommandHandler("ai_stop",     cmd_ai_stop))
-    app.add_handler(CommandHandler("ai_status",   cmd_ai_status))
-    app.add_handler(CommandHandler("ai_close_all",cmd_ai_close_all))
-    app.add_handler(CommandHandler("ai_history",  cmd_ai_history))
+    app.add_handler(CommandHandler("ai_start",     cmd_ai_start))
+    app.add_handler(CommandHandler("ai_stop",      cmd_ai_stop))
+    app.add_handler(CommandHandler("ai_status",    cmd_ai_status))
+    app.add_handler(CommandHandler("ai_close_all", cmd_ai_close_all))
+    app.add_handler(CommandHandler("ai_history",   cmd_ai_history))
 
     logger.info("🤖 SakaiBot v4.9 démarré — Maker orders + Module IA HIP-3")
-    # Diagnostic variables d'environnement au démarrage
     _ak = os.getenv("ANTHROPIC_API_KEY", "")
     logger.info(f"🔑 ANTHROPIC_API_KEY: {'OK sk-ant-...'+ _ak[-6:] if _ak else 'MANQUANTE ❌'}")
     _pk = os.getenv("HL_PRIVATE_KEY", "")
