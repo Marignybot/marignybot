@@ -215,10 +215,11 @@ AI_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_sta
 
 # État runtime du module IA
 ai_state = {
-    "active":    False,
-    "positions": {},    # {asset: {"side","size","entry","stop","usd"}}
-    "history":   [],    # 10 derniers trades
-    "scan_task": None,
+    "active":      False,
+    "positions":   {},    # {asset: {"side","size","entry","stop","usd"}}
+    "history":     [],    # 10 derniers trades
+    "scan_task":   None,
+    "hip3_prices": {},    # {asset: markPx} — mis à jour par ai_discover_hip3_assets()
 }
 
 # [OPT] Semaphore pour limiter les appels API parallèles
@@ -3128,8 +3129,9 @@ async def ai_discover_hip3_assets() -> dict:
                 "ticker": ticker,
             }
 
-        # Remplace entièrement la liste d'assets
+        # Remplace entièrement la liste d'assets et les prix en cache
         AI_HIP3_ASSETS = new_assets
+        ai_state["hip3_prices"] = discovered   # cache des prix pour le scan loop
         logger.info(f"🔮 ORACLE — {len(discovered)} assets HIP-3 actifs: {list(discovered.keys())}")
 
     except Exception as e:
@@ -3368,7 +3370,9 @@ async def ai_check_stop_losses(app) -> None:
 
     for asset, pos in list(ai_state["positions"].items()):
         cfg   = AI_HIP3_ASSETS.get(asset, {})
-        price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+        price = ai_state["hip3_prices"].get(asset, 0)
+        if price <= 0:
+            price = await ai_get_hl_price(asset, cfg.get("dex", ""))
         if price <= 0:
             continue
 
@@ -3513,9 +3517,13 @@ async def ai_scan_loop(app) -> None:
                 if not ai_state["active"]:
                     break
 
-                hl_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+                # Utiliser le prix du cache (mis à jour par ai_discover_hip3_assets)
+                hl_price = ai_state["hip3_prices"].get(asset, 0)
                 if hl_price <= 0:
-                    logger.warning(f"IA: prix HL introuvable pour {asset}")
+                    # Fallback : appel direct
+                    hl_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+                if hl_price <= 0:
+                    logger.debug(f"IA: prix HL introuvable pour {asset}")
                     continue
 
                 tradfi_price = await ai_get_tradfi_price(cfg["yahoo"])
@@ -3670,7 +3678,9 @@ async def cmd_ai_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("📊 *Positions ouvertes:*")
         for asset, pos in ai_state["positions"].items():
             cfg   = AI_HIP3_ASSETS.get(asset, {})
-            price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+            price = ai_state["hip3_prices"].get(asset, 0)
+            if price <= 0:
+                price = await ai_get_hl_price(asset, cfg.get("dex", ""))
             if price <= 0:
                 price = pos["entry"]
             pnl_pct = ((price - pos["entry"]) / pos["entry"] * 100) if pos["side"] == "long" \
