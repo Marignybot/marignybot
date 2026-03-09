@@ -3059,6 +3059,49 @@ async def ai_get_tradfi_price(yahoo_symbol: str) -> float | None:
         return None
 
 
+async def ai_discover_hip3_assets() -> dict:
+    """
+    Interroge l'API HL pour lister tous les assets HIP-3 disponibles sur le DEX 'xyz'.
+    Retourne un dict {ticker: markPx} des assets actifs (markPx > 0).
+    Met à jour AI_HIP3_ASSETS avec les assets découverts.
+    """
+    global AI_HIP3_ASSETS
+    discovered = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                HYPERLIQUID_API,
+                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+
+        universe = data[0].get("universe", []) if isinstance(data, list) else []
+        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
+
+        for i, asset in enumerate(universe):
+            name    = asset.get("name", "")
+            if i >= len(ctxs):
+                continue
+            mark_px = float(ctxs[i].get("markPx", 0) or 0)
+            if mark_px > 0 and name:
+                full_name = f"xyz:{name}"
+                discovered[full_name] = mark_px
+                # Ajouter si pas encore dans AI_HIP3_ASSETS
+                if full_name not in AI_HIP3_ASSETS:
+                    AI_HIP3_ASSETS[full_name] = {
+                        "name":   name,
+                        "yahoo":  None,   # pas de référence TradFi connue
+                        "dex":    "xyz",
+                        "ticker": name,
+                    }
+
+        logger.info(f"🔮 ORACLE — {len(discovered)} assets HIP-3 découverts sur DEX xyz: {list(discovered.keys())}")
+    except Exception as e:
+        logger.warning(f"ai_discover_hip3_assets: {e}")
+    return discovered
+
+
 async def ai_get_hl_price(coin: str, dex: str = "") -> float:
     """
     Récupère le mark price HL pour un asset HIP-3 via metaAndAssetCtxs.
@@ -3421,12 +3464,17 @@ async def ai_check_stop_losses(app) -> None:
 async def ai_scan_loop(app) -> None:
     """Boucle principale IA — scan toutes les AI_SCAN_INTERVAL secondes."""
     logger.info("🤖 IA scan loop démarrée")
+    scan_count = 0
     while ai_state["active"]:
         try:
             await ai_check_stop_losses(app)
-            mids = await get_all_mids_cached()
 
-            for asset, cfg in AI_HIP3_ASSETS.items():
+            # Redécouverte des assets HIP-3 toutes les 6 itérations (~30 min)
+            if scan_count % 6 == 0:
+                await ai_discover_hip3_assets()
+            scan_count += 1
+
+            for asset, cfg in list(AI_HIP3_ASSETS.items()):
                 if not ai_state["active"]:
                     break
 
@@ -3527,15 +3575,21 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ai_state["scan_task"].cancel()
     ai_state["scan_task"] = asyncio.create_task(ai_scan_loop(context.application))
 
-    budget = await ai_compute_budget()
+    # Découverte automatique des assets HIP-3 disponibles
+    await update.message.reply_text("🔍 Découverte des assets HIP-3...", parse_mode="Markdown")
+    discovered = await ai_discover_hip3_assets()
+
+    budget     = await ai_compute_budget()
     assets_str = " • ".join(AI_HIP3_ASSETS.keys())
+    active_str = " • ".join(f"{k} (${v:.2f})" for k, v in discovered.items()) if discovered else "aucun trouvé"
 
     await update.message.reply_text(
         f"🔮 *ORACLE démarré*\n\n"
-        f"Assets: {assets_str}\n"
+        f"Assets actifs: {active_str}\n"
         f"Budget/trade estimé: ~${budget:.0f}\n"
         f"Max positions: {AI_MAX_POSITIONS}\n"
         f"Stop-loss: {AI_STOP_LOSS_PCT*100:.0f}%\n"
+        f"Trailing stop: {AI_TRAIL_PCT*100:.0f}%\n"
         f"Scan: toutes les {AI_SCAN_INTERVAL//60} min\n\n"
         f"_Claude Haiku analyse premium TradFi/HL + funding rate_",
         parse_mode="Markdown"
