@@ -129,7 +129,7 @@ EVENING_MIN_UTC           = 0
 # SCORING v4
 # ============================================================
 TRADEBOT_MIN_TRADES      = 1     # [v4.5] log(n) gere nativement score=0 pour 0 trade
-TRADEBOT_MAX_TRADES_DAY  = 10    # filtre dur scalper: > 10 trades/jour = exclu (pas de scalper en copy)
+TRADEBOT_MAX_TRADES_DAY  = 36   # [v6.0] filtre dur scalper: > 250 trades/semaine (≈36/j) → pénalité score
 TRADEBOT_MAX_DRAWDOWN    = 65.0   # filtre dur MDD (v4.8: pénalisé fortement par mdd_factor au-dessus de 40%)
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
@@ -1000,12 +1000,12 @@ async def fetch_top_traders_hl() -> list:
                         logger.info(f"Exclu {address[:12]}: {n_trades_at} trades allTime < 20")
                         return None
 
-                    # Filtre dur scalper — incopiable si > 30 trades/jour
-                    trades_per_day = n_trades_7j / 7.0
-                    if trades_per_day > TRADEBOT_MAX_TRADES_DAY:
+                    # Filtre dur scalper — incopiable si > 500 trades/semaine (limit absolue)
+                    # Entre 250 et 500 → pénalité progressive dans le scoring v6
+                    if n_trades_7j > 500:
                         logger.info(
-                            f"Exclu {address[:12]}: scalper {trades_per_day:.0f} trades/j "
-                            f"(max {TRADEBOT_MAX_TRADES_DAY}) — incopiable"
+                            f"Exclu {address[:12]}: scalper extrême {n_trades_7j} trades/semaine "
+                            f"(max 500) — incopiable"
                         )
                         return None
 
@@ -1037,6 +1037,7 @@ async def fetch_top_traders_hl() -> list:
                         "n_trades_at":  n_trades_at,
                         "roi_30j":      round(roi_30j, 1),
                         "capital":      round(cap_30, 0),
+                        "age_days":     round(age_days, 0),   # [v5.0] ancienneté pour PnL annualisé
                     }
 
                 except Exception as e:
@@ -1062,22 +1063,15 @@ async def fetch_top_traders_hl() -> list:
 
 def rank_and_score_traders(traders: list) -> list:
     """
-    Scoring v5 — ROI 7j × Consistance 30j/7j × WinRate × MDD × Anti-scalper.
+    Scoring v6 — PnL annualisé × Régularité × WinRate × MDD × Anti-scalper × Marge.
 
     Filtres durs (avant scoring) :
       - MDD <= TRADEBOT_MAX_DRAWDOWN (65%)
-      - WinRate >= 50%
-      - Trades/j <= 10 (TRADEBOT_MAX_TRADES_DAY) — pas de scalper en copy
-      - PnL 7j > 0
-      - PnL 30j > 0
-      - PnL allTime > 0
+      - WinRate >= 45%
+      - PnL all-time > 0
 
-    Score v5 = roi_7j × consistency × wr_factor × mdd_factor × scalper_factor
-      - roi_7j      : ROI% 7j normalisé par capital (performance récente)
-      - consistency : pnl_30j/(pnl_7j×4) — régularité vraie semaine/mois
-      - wr_factor   : WinRate max(7j,30j) — poids fort ≥65%, pénalité <50%
-      - mdd_factor  : pénalité MDD exposant 1.8 — forte pour MDD>40%
-      - scalper_f   : dégradation progressive dès 5 trades/j (idéal ≤ 5/j)
+    Score v6 = annualized_factor × momentum × consistency × wr_factor
+               × mdd_factor × scalper_factor × margin_factor
     """
     if not traders:
         return []
@@ -1085,95 +1079,99 @@ def rank_and_score_traders(traders: list) -> list:
     avant = len(traders)
 
     traders = [t for t in traders if t.get("mdd", 999) <= TRADEBOT_MAX_DRAWDOWN]
-    traders = [t for t in traders if t.get("winrate", 0) >= 50]
-    traders = [t for t in traders if t.get("n_trades_7j", 0) / 7.0 <= TRADEBOT_MAX_TRADES_DAY]  # [v4.8] 10/j
-    traders = [t for t in traders if t.get("pnl_7j", 0) > 0]
-    traders = [t for t in traders if t.get("pnl", 0) > 0]
+    traders = [t for t in traders if t.get("winrate", 0) >= 45]
     traders = [t for t in traders if t.get("pnl_at", 0) > 0]
 
-    # [v4.9] Filtre one-week wonder : PnL 7j ne doit pas dépasser PnL 30j
-    # Si pnl_7j > pnl_30j → le trader a perdu les 3 autres semaines du mois
     avant_oww = len(traders)
-    traders = [t for t in traders if t.get("pnl_7j", 0) <= t.get("pnl", 0)]
+    traders = [t for t in traders if t.get("pnl_7j", 0) <= t.get("pnl", 1e9)]
     logger.info(f"Filtre one-week-wonder: {avant_oww - len(traders)} exclus")
 
-    # [v4.9] Filtre chute libre : PnL 7j doit représenter >= 10% du PnL 30j
-    # Si pnl_7j << pnl_30j → le trader est en train de tout perdre cette semaine
-    avant_chute = len(traders)
-    traders = [t for t in traders if t.get("pnl_7j", 0) >= t.get("pnl", 0) * 0.10]
-    logger.info(f"Filtre chute-libre: {avant_chute - len(traders)} exclus")
-
-    logger.info(f"Filtres v5: {len(traders)}/{avant} traders retenus")
+    logger.info(f"Filtres v6: {len(traders)}/{avant} traders retenus")
     if not traders:
         return []
 
-    def compute_score_v5(t):
-        """
-        Scoring v5 — 3 axes : Performance récente × Régularité × Qualité
+    def compute_score_v6(t):
+        pnl_7j      = t.get("pnl_7j", 0)
+        pnl_30j     = t.get("pnl", 0)
+        pnl_at      = t.get("pnl_at", 0)
+        capital     = max(t.get("capital", 1), 1)
+        mdd         = t.get("mdd", 100)
+        winrate     = t.get("winrate", 0)
+        winrate_30  = t.get("winrate_30j", 0)
+        n_trades_7j = t.get("n_trades_7j", 0)
+        age_days    = max(t.get("age_days", 365), 1)
+        margin_used = t.get("margin_ratio", 0.0)
 
-        Différences vs v4 :
-          - WinRate INTÉGRÉ au score (n'était que filtre dur)
-          - Consistance = pnl_30j / (pnl_7j×4) — régularité vraie,
-            corrige l'ancienne formule pnl_30j/pnl_at qui pénalisait
-            injustement les bons traders sur HL (plateforme jeune)
-          - MDD factor renforcé : exposant 1.8 (vs 1.5)
-            MDD 40% → ×0.65 | MDD 60% → ×0.31 | MDD 80% → ×0.05
-          - Anti-scalper : filtre dur 10/j, pénalité score dès 5/j
-          - Bonus WinRate ≥ 65% : ×1.25 (vs 1.15)
-        """
-        pnl_7j     = t.get("pnl_7j", 0)
-        pnl_30j    = t.get("pnl", 0)
-        capital    = max(t.get("capital", 1), 1)
-        mdd        = t.get("mdd", 100)
-        winrate    = t.get("winrate", 0)        # WinRate 7j (fills réels)
-        winrate_30 = t.get("winrate_30j", 0)   # WinRate 30j (proxy pnlHistory)
-        n_trades   = t.get("n_trades_7j", 0)
+        # ── 1. PnL annualisé (avec temporisation < 90j) ──────────────
+        annualized_roi = (pnl_at / capital) * (365.0 / age_days) * 100
+        seuil_annuel   = 50.0 * min(age_days / 90.0, 1.0)  # temporisation
 
-        # ── ROI 30j — ancre principale du score ─────────────────────
-        # Base : performance durable sur un mois complet, pas un coup de chance
-        roi_30j = (pnl_30j / capital) * 100
-        if roi_30j <= 0:
+        if annualized_roi <= 0:
             return 0.0
-
-        # ── Momentum 7j — signal de forme actuelle (25% du score) ───
-        # La semaine en cours confirme ou infirme le mois.
-        # one-week-wonder et chute libre déjà éliminés par filtres durs.
-        # Idéal : pnl_7j ≈ 25% du pnl_30j (1 semaine sur 4 régulière)
-        semaine_ratio = t.get("pnl_7j", 0) / max(pnl_30j, 1)
-        if semaine_ratio >= 0.25:
-            momentum_factor = 1.0          # semaine égale ou supérieure à la moyenne
-        elif semaine_ratio >= 0.10:
-            momentum_factor = 0.75 + semaine_ratio  # entre 0.85 et 1.0
+        elif annualized_roi >= seuil_annuel * 2:
+            annualized_factor = 1.0
+        elif annualized_roi >= seuil_annuel:
+            annualized_factor = 0.6 + 0.4 * (annualized_roi / (seuil_annuel * 2))
         else:
-            momentum_factor = 0.75         # semaine calme (plancher)
+            annualized_factor = max(0.1, 0.3 * (annualized_roi / max(seuil_annuel, 1)))
 
-        # ── Régularité 30j — cœur du scoring ─────────────────────────
-        # pnl_30j / (pnl_7j × 4) : idéal = toutes les semaines pareilles
-        ratio       = pnl_30j / max(t.get("pnl_7j", 1), 1)
-        consistency = min(ratio / 4.0, 1.0)
+        # ── 2. Momentum 7j ────────────────────────────────────────────
+        if pnl_30j <= 0:
+            momentum_factor = 0.5
+        else:
+            semaine_ratio = pnl_7j / max(pnl_30j, 1)
+            if semaine_ratio >= 0.25:
+                momentum_factor = 1.0
+            elif semaine_ratio >= 0.10:
+                momentum_factor = 0.75 + semaine_ratio
+            elif semaine_ratio >= 0:
+                momentum_factor = 0.75
+            else:
+                momentum_factor = 0.5
 
-        # ── WinRate — le meilleur des deux périodes ───────────────────
+        # ── 3. Régularité 30j ─────────────────────────────────────────
+        if pnl_7j > 0 and pnl_30j > 0:
+            ratio       = pnl_30j / max(pnl_7j, 1)
+            consistency = min(ratio / 4.0, 1.0)
+        else:
+            consistency = 0.5
+
+        # ── 4. WinRate ────────────────────────────────────────────────
         best_wr = max(winrate, winrate_30) / 100.0
-        if best_wr < 0.50:
-            wr_factor = best_wr ** 2
-        elif best_wr >= 0.65:
+        if best_wr >= 0.65:
             wr_factor = min(best_wr * 1.25, 1.0)
-        else:
+        elif best_wr >= 0.50:
             wr_factor = best_wr
+        elif best_wr >= 0.45:
+            wr_factor = best_wr ** 1.5
+        else:
+            wr_factor = best_wr ** 2
 
-        # ── MDD — pénalité forte et progressive ──────────────────────
-        # MDD 20% → ×0.91 | 40% → ×0.65 | 60% → ×0.31 | 80% → ×0.05
+        # ── 5. MDD ────────────────────────────────────────────────────
         mdd_factor = max(0.02, 1.0 - (mdd / 85.0) ** 1.8)
 
-        # ── Anti-scalper — pénalité dès 5 trades/j ───────────────────
-        trades_per_day = n_trades / 7.0
-        scalper_factor = min(1.0, 5.0 / max(trades_per_day, 0.1))
+        # ── 6. Anti-scalper (seuil 250 trades/semaine) ────────────────
+        # ≤ 250/semaine → neutre | 250-500 → pénalité progressive | >500 → forte
+        if n_trades_7j <= 250:
+            scalper_factor = 1.0
+        elif n_trades_7j <= 500:
+            scalper_factor = 1.0 - 0.8 * ((n_trades_7j - 250) / 250.0)
+        else:
+            scalper_factor = max(0.05, 0.2 * (250.0 / n_trades_7j))
 
-        # Score final : ROI 30j × momentum × régularité × WR × MDD × anti-scalper
-        score = roi_30j * momentum_factor * consistency * wr_factor * mdd_factor * scalper_factor
+        # ── 7. Marge utilisée > 60% ───────────────────────────────────
+        if margin_used <= 0.60:
+            margin_factor = 1.0
+        elif margin_used <= 0.80:
+            margin_factor = 1.0 - 0.5 * ((margin_used - 0.60) / 0.20)
+        else:
+            margin_factor = max(0.2, 0.5 - 1.5 * (margin_used - 0.80))
+
+        score = (annualized_factor * momentum_factor * consistency
+                 * wr_factor * mdd_factor * scalper_factor * margin_factor)
         return max(score, 0.0)
 
-    raw_scores = [compute_score_v5(t) for t in traders]
+    raw_scores = [compute_score_v6(t) for t in traders]
     max_raw = max(raw_scores) if raw_scores else 1.0
     if max_raw <= 0:
         max_raw = 1.0
@@ -1183,7 +1181,6 @@ def rank_and_score_traders(traders: list) -> list:
         for t, r in zip(traders, raw_scores)
     ]
     return sorted(scored, key=lambda x: x["score"], reverse=True)
-
 
 # [OPT] apply_exclusion_filters conservée pour compatibilité mais redirige vers rank_and_score_traders
 def apply_exclusion_filters(traders: list) -> list:
@@ -1201,7 +1198,7 @@ def build_top5_report(top5: list) -> str:
         "🏆 *SakaiBot — Top 5 Traders*",
         f"📅 {now}",
         "━━━━━━━━━━━━━━━━━━━━",
-        "*📊 Score v5: ROI 7j × Régularité × WinRate × MDD | Filtres: MDD<65% | WR≥50% | ≤25/j*",
+        "*📊 Score v6: PnL annualisé × Régularité × WinRate × MDD × Anti-scalper × Marge*",
         "",
     ]
     for i, t in enumerate(top5, 1):
@@ -1261,8 +1258,8 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔍 *TradeBot — Analyse en cours (scoring v5)...*\n\n"
         "• Récupération leaderboard Hyperliquid (top 740)\n"
-        "• Filtres durs: MDD<65% | WR≥50% | ≤10 trades/j | actif 15j | 60j ancienneté\n"
-        "• Score v5: ROI 7j × Régularité × WinRate × MDD × Anti-scalper\n"
+        "• Filtres durs: MDD<65% | WR≥45% | <500 trades/semaine | ancienneté 60j\n"
+        "• Score v6: PnL annualisé × Régularité × WinRate × MDD × Anti-scalper × Marge\n"
         "• Sélection Top 5 traders réguliers et copiables\n\n"
         "_Patiente quelques secondes..._",
         parse_mode="Markdown"
