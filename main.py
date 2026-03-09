@@ -37,7 +37,7 @@ import time as time_module
 import threading
 import websockets
 import eth_account
-from datetime import datetime, time
+from datetime import datetime, time, timezone, timedelta
 from functools import lru_cache
 
 import aiohttp
@@ -100,21 +100,8 @@ SIZE_RULES = {
     "_default": {"min": 0.001, "decimals": 3, "min_usd": 11.0},
 }
 
-copy_deployed = {asset: 0.0 for asset in COPY_ASSETS}
-
-# ============================================================
-# COPY STATE v4
-# ============================================================
-copy_state = {
-    "active":      False,
-    "traders":     {},   # {address: {"rank": int, "score": float, "assets_seen": set()}}
-    "positions":   {},   # {asset: {"side", "size", "entry", "trader_addr"}}
-    "ws_tasks":    {},   # {address: asyncio.Task}
-    "last_update": {},
-    "total_pnl":   0.0,
-    "trades_log":  [],
-    "last_ranked": [],
-}
+# last_ranked conservé pour /toptraders → /target workflow
+copy_last_ranked: list = []
 
 # ============================================================
 # CONSTANTES API
@@ -202,40 +189,122 @@ YAHOO_SYMBOLS = {
     # HYUNDAI: 005380.KS (Hyundai Motor)
 }
 
+# Tous les assets XYZ avec un mapping Yahoo Finance sont éligibles.
+# Pour restreindre à un sous-ensemble, remplir ce set (vide = tout accepter).
+AI_ORACLE_WHITELIST: set = set()  # vide = pas de filtre
+
 AI_HIP3_ASSETS: dict = {}   # rempli dynamiquement par ai_discover_hip3_assets()
 
+# Cache global XYZ : évite de faire N appels API pour N assets
+# Format: {"universe": [...], "ctxs": [...], "ts": float}
+_xyz_meta_cache: dict = {"universe": [], "ctxs": [], "ts": 0.0}
+_XYZ_CACHE_TTL = 30  # secondes
+
 AI_BOT_NAME        = "ORACLE"   # nom du module IA HIP-3
-AI_MAX_POSITIONS   = 2        # 2 positions max → ~$150/trade
-AI_LEVERAGE        = 3        # levier isolated margin HIP-3
-AI_STOP_LOSS_PCT   = 0.15     # -15% stop dur (filet de sécurité)
-AI_TRAIL_PCT       = 0.07     # 7% trailing stop (suit le peak)
-AI_TAKE_PROFIT_PCT = 0.20     # +20% take-profit dur (sortie immédiate)
+AI_MAX_POSITIONS   = 3        # 3 positions max simultanées
+AI_STOP_LOSS_PCT   = 0.04     # -4% stop dur (x10 levier → -40% marge max)
+AI_TAKE_PROFIT_PCT = 0.04     # +4% TP dur (si trailing pas déclenché)
+AI_TRAIL_PCT_MIN   = 0.015    # trailing min 1.5% (cohérent avec stop/TP 4%)
+AI_TRAIL_PCT_MAX   = 0.07     # trailing max 7%
 
-# Paliers de prise de bénéfice partielle
-# (seuil_pnl, % de la position à fermer)
+# Leviers par catégorie d'asset
+AI_LEVERAGE_MAP = {
+    "commodities": 10,  # GOLD, SILVER, CL, BRENTOIL, NATGAS, COPPER, PLATINUM, PALLADIUM
+    "indices":     10,  # XYZ100
+    "stocks":      10,  # TSLA, AAPL, NVDA, MSFT, etc.
+    "etf":         10,  # URNM, EWY, EWJ
+    "fx":          10,  # JPY, EUR
+}
+AI_LEVERAGE = 10  # fallback
+
+# Paliers TP partiel (seuil_pnl_fraction, % position à fermer)
 AI_PARTIAL_TP = [
-    (0.20, 0.30),   # +20% → ferme 30%
-    (0.30, 0.30),   # +30% → ferme encore 30% du solde
-    (0.40, 0.20),   # +40% → ferme encore 20% du solde
-    # Le reste (~20%) est géré par le trailing stop 7%
+    (0.015, 0.30),  # +1.5% → ferme 30% (sécuriser une partie rapidement)
+    (0.025, 0.30),  # +2.5% → ferme encore 30%
+    # Le reste (~40%) est géré par trailing stop ATR jusqu'au TP dur +4%
 ]
-AI_FIXED_BUDGET    = 300.0    # budget fixe réservé à ORACLE ($)
-AI_SAFETY_BUFFER   = 0.15     # 15% du wallet intouchable (réserve)
-AI_COPY_RESERVE    = 1.2      # facteur sécurité marge copy
-AI_MIN_WALLET      = 300.0    # pause si wallet < $300
-AI_MIN_PREMIUM     = 0.015    # signal min 1.5% premium/discount
-AI_SCAN_INTERVAL   = 300      # scan toutes les 5 min
-AI_FUNDING_SIGNAL  = 0.0003   # seuil funding 0.03%/h
 
+# Seuils de premium par catégorie (session normale / pre-post market)
+# Avec x10 levier : un premium de 1.5% = potentiel +15% sur marge si convergence
+# Un premium qui se creuse à 2x avant convergence = -15% sur marge → acceptable
+AI_PREMIUM_THRESHOLD = {
+    "commodities": (0.015, 0.030),  # normal 1.5%, pre/post 3.0% (relevé pour x10)
+    "indices":     (0.020, 0.040),  # normal 2.0%, pre/post 4.0%
+    "stocks":      (0.025, 0.050),  # normal 2.5%, pre/post 5.0%
+    "etf":         (0.025, 0.050),
+    "fx":          (0.010, 0.020),  # FX moins volatil → seuil légèrement relevé
+}
+
+# Budget dynamique selon score composite (score → budget notionnel $)
+# Avec x10 levier : marge réelle = budget / 10
+# Max par position = $100 → max 3 positions simultanées = $300 notionnel
+AI_BUDGET_BY_SCORE = [
+    (95, 100.0),   # score >= 95 → $100 notionnel (marge $10)
+    (85,  80.0),   # score >= 85 → $80  notionnel (marge $8)
+    (75,  60.0),   # score >= 75 → $60  notionnel (trade auto)
+    (50,  40.0),   # score >= 50 → $40  notionnel (avec validation Claude)
+]
+AI_SCORE_AUTO_TRADE  = 75   # score min pour trade sans Claude
+AI_SCORE_CLAUDE_MIN  = 50   # score min pour appeler Claude
+AI_SCORE_WAIT        = 49   # score max → WAIT sans appel
+
+AI_FIXED_BUDGET    = 300.0    # budget notionnel total réservé à ORACLE ($)
+AI_SAFETY_BUFFER   = 0.15     # 15% du wallet intouchable
+AI_COPY_RESERVE    = 1.2      # facteur sécurité marge
+AI_MIN_WALLET      = 300.0    # pause si wallet < $300
+AI_SCAN_INTERVAL   = 60       # scan toutes les 60s en session / 300s hors session
+AI_COOLDOWN_MIN    = 30       # 30 min cooldown post-trade même asset
+AI_MAX_HOLD_HOURS  = 48       # fermeture forcée si position > 48h
+AI_DAILY_LOSS_MAX  = 0.05     # 5% du budget = $15/jour max de pertes
+AI_WEEKLY_LOSS_MAX = 0.15     # 15% du budget = $45/semaine max de pertes
+
+# Catégories d'assets → session TradFi
+# Heures en UTC (France = UTC+1 hiver, UTC+2 été)
+ASSET_CATEGORIES = {
+    # Commodités CME : session ouverte presque 24/5
+    "GOLD":      "commodities",
+    "SILVER":    "commodities",
+    "CL":        "commodities",
+    "BRENTOIL":  "commodities",
+    "NATGAS":    "commodities",
+    "COPPER":    "commodities",
+    "PLATINUM":  "commodities",
+    "PALLADIUM": "commodities",
+    # Indices CME
+    "XYZ100":    "indices",
+    # Actions US
+    "TSLA": "stocks", "AAPL": "stocks", "NVDA": "stocks", "MSFT": "stocks",
+    "GOOGL": "stocks", "AMZN": "stocks", "META": "stocks", "COIN": "stocks",
+    "AMD": "stocks", "INTC": "stocks", "PLTR": "stocks", "HOOD": "stocks",
+    "MSTR": "stocks", "NFLX": "stocks", "TSM": "stocks", "BABA": "stocks",
+    "MU": "stocks", "RIVN": "stocks", "ORCL": "stocks", "CRCL": "stocks",
+    "SNDK": "stocks", "USAR": "stocks",
+    # ETFs
+    "URNM": "etf", "EWY": "etf", "EWJ": "etf",
+    # FX
+    "JPY": "fx", "EUR": "fx",
+}
+
+# Fenêtres de session en UTC (weekday 0=lun, 6=dim)
+# (heure_debut_utc, heure_fin_utc, allow_prepost)
 AI_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_state.json")
 
 # État runtime du module IA
 ai_state = {
     "active":      False,
-    "positions":   {},    # {asset: {"side","size","entry","stop","usd"}}
-    "history":     [],    # 10 derniers trades
+    "positions":   {},    # {asset: {"side","size","entry","stop","usd","entry_time","trail_pct"}}
+    "history":     [],    # 20 derniers trades
     "scan_task":   None,
-    "hip3_prices": {},    # {asset: markPx} — mis à jour par ai_discover_hip3_assets()
+    "hip3_prices": {},    # {asset: markPx}
+    "persistence": {},    # {asset: {"count": int, "direction": "long"|"short"}}
+    "cooldown":    {},    # {asset: datetime ISO} — cooldown post-trade
+    "prev_prices": {},    # {asset: float} — prix Yahoo précédent (momentum)
+    "atr_cache":   {},    # {asset: float} — ATR calculé quotidiennement
+    "atr_date":    "",    # date du dernier calcul ATR
+    "daily_loss":  0.0,   # pertes du jour en $
+    "weekly_loss": 0.0,   # pertes de la semaine en $
+    "loss_reset_date": "", # date du dernier reset daily
+    "loss_reset_week": "", # date du dernier reset weekly
 }
 
 # [OPT] Semaphore pour limiter les appels API parallèles
@@ -798,7 +867,6 @@ async def analyze_setup(prices: dict, trending: list) -> str:
 # ============================================================
 # MODULE TRADEBOT
 # ============================================================
-tradebot_history = []
 
 
 
@@ -1258,24 +1326,6 @@ def build_top5_report(top5: list) -> str:
     return "\n".join(lines)
 
 
-def build_history_report() -> str:
-    if not tradebot_history:
-        return (
-            "📚 *Historique TradeBot*\n\n"
-            "_Aucune selection anterieure enregistree._\n"
-            "Lance /toptraders pour demarrer ta premiere analyse."
-        )
-    lines = ["📚 *Historique des Selections TradeBot*\n"]
-    for session_data in tradebot_history[-5:]:
-        lines.append(f"📅 *{session_data['date']}* — Score moyen: {session_data['avg_score']}/100")
-        for t in session_data["traders"]:
-            addr = t["address"][:6] + "..." + t["address"][-4:]
-            lines.append(f"   #{t['rank']} `{addr}` — {t['score']}/100")
-        lines.append("")
-    lines.append(f"_Total sessions: {len(tradebot_history)}_")
-    return "\n".join(lines)
-
-
 # ============================================================
 # COMMANDE TOPTRADERS
 # ============================================================
@@ -1310,20 +1360,12 @@ async def cmd_toptraders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     top5 = ranked[:5]
-    session_data = {
-        "date":      datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "avg_score": round(sum(t["score"] for t in top5) / len(top5), 1),
-        "traders":   [{"rank": i+1, "address": t["address"], "score": t["score"]} for i, t in enumerate(top5)],
-    }
-    tradebot_history.append(session_data)
-    if len(tradebot_history) > 30:
-        tradebot_history.pop(0)
-
-    copy_state["last_ranked"] = ranked
+    copy_last_ranked.clear()
+    copy_last_ranked.extend(ranked)
 
     await update.message.reply_text(build_top5_report(top5), parse_mode="Markdown")
     await update.message.reply_text(
-        "💡 *Tip:* Lance `/copy_start` pour copier ces 5 traders sur tous leurs assets.",
+        "💡 *Tip:* Lance `/target 0xADRESSE` pour copier un trader.",
         parse_mode="Markdown"
     )
 
@@ -1597,389 +1639,14 @@ async def check_margin_ok() -> bool:
         return False
 
 
-async def get_proportional_size(asset: str, trader_addr: str, trader_pos_value: float,
-                                current_price: float) -> tuple:
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                HYPERLIQUID_API,
-                json={"type": "clearinghouseState", "user": trader_addr},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                trader_state = await resp.json()
-
-        margin         = trader_state.get("crossMarginSummary") or trader_state.get("marginSummary") or {}
-        trader_capital = float(margin.get("accountValue", 0) or 0)
-        if trader_capital <= 0:
-            trader_capital = float(trader_state.get("crossAccountValue", 0) or 1)
-
-        leverage = COPY_LEVERAGE.get(asset, 1)
-        for pos in trader_state.get("assetPositions", []):
-            p = pos.get("position", {})
-            if p.get("coin") == asset:
-                trader_lev = int(p.get("leverage", {}).get("value", 0) or 0)
-                if trader_lev > 0:
-                    leverage = trader_lev
-                break
-
-        _, bot_balance = await get_wallet_data(COPY_BOT_ADDRESS)
-        my_capital     = bot_balance.get("accountValue", 0) or 1000.0
-
-        ratio        = trader_pos_value / max(trader_capital, 1)
-        my_usd_value = (ratio / 5) * my_capital
-
-        rules        = SIZE_RULES.get(asset, SIZE_RULES["_default"])
-        my_usd_value = max(my_usd_value, rules["min_usd"])
-        my_size      = max(round(my_usd_value / current_price, rules["decimals"]), rules["min"])
-
-        logger.info(
-            f"Proportionnel {asset}: trader_cap=${trader_capital:.0f} "
-            f"pos=${trader_pos_value:.0f} ratio={ratio*100:.1f}% "
-            f"mon_cap=${my_capital:.0f} → ${my_usd_value:.0f} sz={my_size} x{leverage}"
-        )
-        return my_size, leverage, my_usd_value
-
-    except Exception as e:
-        logger.warning(f"get_proportional_size erreur: {e}")
-        rules         = SIZE_RULES.get(asset, SIZE_RULES["_default"])
-        leverage      = COPY_LEVERAGE.get(asset, 1)
-        fallback_size = max(round(50.0 / max(current_price, 0.01), rules["decimals"]), rules["min"])
-        return fallback_size, leverage, 50.0
-
-
-# ============================================================
-# COPY TRADING — START / STOP / WATCH
-# ============================================================
-async def start_copy_trading(top_traders: list, app) -> None:
-    for addr, task in list(copy_state["ws_tasks"].items()):
-        task.cancel()
-        logger.info(f"WebSocket {addr[:12]} arrêté (relance)")
-    copy_state["ws_tasks"] = {}
-    copy_state["traders"]  = {}
-    copy_state["active"]   = True
-
-    active_addrs = []
-    notif_lines  = ["🤖 *SakaiBot — Copy Trading v4.2*", "_Top 5 multi-asset_", ""]
-
-    for rank, trader in enumerate(top_traders[:5], 1):
-        addr = trader["address"]
-        task = asyncio.create_task(watch_trader_multiasset(addr, app))
-        copy_state["ws_tasks"][addr] = task
-        copy_state["traders"][addr]  = {
-            "rank":        rank,
-            "score":       trader.get("score", 0),
-            "assets_seen": set(),
-        }
-        active_addrs.append(addr)
-        logger.info(f"WebSocket lancé: Trader #{rank} {addr[:12]} (score {trader.get('score',0)})")
-        bonus = " ✨" if trader.get("roi_30j", 0) >= 20 and trader.get("pnl", 0) > 0 else ""
-        notif_lines.append(
-            f"#{rank} `{addr[:16]}...`{bonus}\n"
-            f"   Score: {trader.get('score',0)}/100 | PnL 7j: ${trader.get('pnl_7j',0):+,.0f}\n"
-            f"   WR 7j: {trader.get('winrate',0):.0f}% | Trades 7j: {trader.get('n_trades_7j',0)} | MDD: {trader.get('mdd',0):.0f}%"
-        )
-
-    if not active_addrs:
-        copy_state["active"] = False
-        await send_copy_notification(app, "❌ *Copy Trading annulé*\nAucun trader qualifié.")
-        return
-
-    notif_lines += [
-        "",
-        f"📡 {len(active_addrs)} traders | tous assets | taille proportionnelle",
-        "_Scoring: (PnL\\_7j/MDD) × WR × log(trades) × bonus30j_",
-    ]
-    await send_copy_notification(app, "\n".join(notif_lines))
-    logger.info(f"✅ Copy trading actif — {len(active_addrs)} traders")
-
-
-async def stop_copy_trading() -> None:
-    copy_state["active"] = False
-    for addr, task in list(copy_state["ws_tasks"].items()):
-        task.cancel()
-        logger.info(f"WebSocket {addr[:12]} annulé")
-    copy_state["ws_tasks"] = {}
-    copy_state["traders"]  = {}
-    logger.info("Copy trading arrêté")
-
-
-async def watch_trader_multiasset(trader_address: str, app) -> None:
-    logger.info(f"WebSocket multi-asset → {trader_address[:12]}...")
-
-    while copy_state["active"]:
-        try:
-            async with websockets.connect(HYPERLIQUID_WS, ping_interval=20, ping_timeout=10) as ws:
-                await ws.send(json.dumps({
-                    "method": "subscribe",
-                    "subscription": {"type": "userEvents", "user": trader_address}
-                }))
-                logger.info(f"✅ WebSocket connecté → {trader_address[:12]}")
-
-                async for raw_msg in ws:
-                    if not copy_state["active"]:
-                        break
-                    try:
-                        msg = json.loads(raw_msg)
-                        await process_multiasset_event(trader_address, msg, app)
-                    except Exception as e:
-                        logger.warning(f"WS {trader_address[:12]} parse erreur: {e}")
-
-        except Exception as e:
-            if not copy_state["active"]:
-                break
-            logger.warning(f"WS {trader_address[:12]} déconnecté: {e} — reconnexion 5s")
-            await asyncio.sleep(5)
-
-    logger.info(f"WebSocket {trader_address[:12]} arrêté")
-
-
-async def process_multiasset_event(trader_address: str, msg: dict, app) -> None:
-    data  = msg.get("data", {})
-    if not data:
-        return
-    fills = data.get("fills", [])
-
-    for fill in fills:
-        asset    = fill.get("coin", "")
-        side     = fill.get("side", "")
-        size     = float(fill.get("sz", 0) or 0)
-        price    = float(fill.get("px", 0) or 0)
-        dir_fill = fill.get("dir", "")
-
-        if size <= 0 or price <= 0 or not asset:
-            continue
-
-        is_opening = "Open" in dir_fill
-        is_closing = "Close" in dir_fill
-        is_buy     = side == "B"
-
-        logger.info(f"Trader {trader_address[:12]} → {dir_fill} {asset} sz:{size} px:{price}")
-
-        if trader_info := copy_state["traders"].get(trader_address):
-            trader_info["assets_seen"].add(asset)
-
-        my_size = leverage = 0
-        my_usd  = 0.0
-
-        if is_opening:
-            existing = copy_state["positions"].get(asset)
-            if existing and existing.get("trader_addr") != trader_address:
-                rank = copy_state["traders"].get(trader_address, {}).get("rank", "?")
-                existing_rank = copy_state["traders"].get(existing["trader_addr"], {}).get("rank", "?")
-                logger.info(f"Conflit {asset}: signal #{rank} ignoré (déjà ouvert par #{existing_rank})")
-                await send_copy_notification(app,
-                    f"ℹ️ *Signal ignoré — conflit*\n"
-                    f"Asset: `{asset}` | Trader #{rank}\n"
-                    f"Déjà une position ouverte (Trader #{existing_rank})."
-                )
-                continue
-
-            if not await check_margin_ok():
-                await send_copy_notification(app,
-                    f"⚠️ *Marge insuffisante*\nAsset: {asset} | Action: {dir_fill}\nOrdre annulé."
-                )
-                continue
-
-            pos_value             = size * price
-            my_size, leverage, my_usd = await get_proportional_size(asset, trader_address, pos_value, price)
-            result                = await place_limit_gtc(asset, is_buy, my_size, dir_fill)
-
-            if "error" not in result:
-                copy_state["positions"][asset] = {
-                    "side":        "long" if is_buy else "short",
-                    "size":        my_size,
-                    "entry":       price,
-                    "trader_addr": trader_address,
-                }
-                copy_deployed[asset] = copy_deployed.get(asset, 0.0) + my_usd
-
-        elif is_closing:
-            my_positions = await get_my_positions()
-            my_pos       = my_positions.get(asset)
-            if not my_pos:
-                logger.info(f"Pas de position sur {asset} — fermeture ignorée")
-                continue
-
-            tracked = copy_state["positions"].get(asset, {})
-            if tracked.get("trader_addr") and tracked["trader_addr"] != trader_address:
-                logger.info(f"Fermeture {asset} ignorée — signal d'un autre trader")
-                continue
-
-            my_size = my_pos["size"]
-            is_buy  = my_pos["side"] == "short"
-            result  = await place_limit_gtc(asset, is_buy, my_size, dir_fill)
-
-            copy_state["positions"].pop(asset, None)
-            copy_deployed[asset] = 0.0
-        else:
-            continue
-
-        trade_log = {
-            "time":     datetime.now().strftime("%d/%m %H:%M"),
-            "asset":    asset,
-            "dir":      dir_fill,
-            "size":     my_size,
-            "price":    price,
-            "leverage": leverage,
-            "trader":   trader_address[:12],
-            "result":   "ok" if "error" not in result else "erreur",
-        }
-        copy_state["trades_log"].append(trade_log)
-        if len(copy_state["trades_log"]) > 100:
-            copy_state["trades_log"] = copy_state["trades_log"][-100:]
-
-        emoji  = "📈" if is_buy else "📉"
-        status = "✅" if "error" not in result else "❌"
-        rank   = copy_state["traders"].get(trader_address, {}).get("rank", "?")
-        notif  = (
-            f"{status} *Copy Trade {emoji}*\n"
-            f"Asset:   *{asset}*\n"
-            f"Action:  {dir_fill}\n"
-            f"Taille:  {my_size} (~${my_usd:.0f})\n"
-            f"Levier:  x{leverage}\n"
-            f"Prix:    ${price:,.2f}\n"
-            f"Trader:  #{rank} `{trader_address[:16]}...`"
-        )
-        if "error" in result:
-            notif += f"\n⚠️ Erreur: {result['error']}"
-        await send_copy_notification(app, notif)
-
-
-# ============================================================
-# COMMANDES TELEGRAM — Copy Trading
-# ============================================================
-async def cmd_copy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
-    if not copy_state.get("last_ranked"):
-        await update.message.reply_text(
-            "🔍 Aucune analyse récente — lancement automatique...\n"
-            "_Score: (PnL\\_7j/MDD) × WR\\_7j × log(trades) + bonus 30j_",
-            parse_mode="Markdown"
-        )
-        raw_traders = await fetch_top_traders_hl()
-        if not raw_traders:
-            await update.message.reply_text("❌ Impossible de récupérer les traders.", parse_mode="Markdown")
-            return
-        ranked = rank_and_score_traders(raw_traders)
-        if not ranked:
-            await update.message.reply_text("⚠️ Aucun trader ne passe les filtres.", parse_mode="Markdown")
-            return
-        copy_state["last_ranked"] = ranked
-        await update.message.reply_text(build_top5_report(ranked[:5]), parse_mode="Markdown")
-
-    top5 = copy_state["last_ranked"][:5]
-    if not top5:
-        await update.message.reply_text("⚠️ Aucun trader disponible.", parse_mode="Markdown")
-        return
-
-    await start_copy_trading(top5, context.application)
-
-
-async def cmd_copy_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    if not copy_state["active"]:
-        await update.message.reply_text("⏸ Copy trading déjà inactif.")
-        return
-    await stop_copy_trading()
-    await update.message.reply_text(
-        "🛑 *Copy Trading arrêté*\n"
-        "Tes positions ouvertes restent actives — gère-les manuellement.",
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_copy_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-
-    if not copy_state["active"]:
-        await update.message.reply_text(
-            "⏸ *Copy Trading inactif*\n"
-            "Lance `/toptraders` puis `/copy_start` pour démarrer.",
-            parse_mode="Markdown"
-        )
-        return
-
-    positions = await get_my_positions()
-    lines     = [
-        "🤖 *COPY TRADING — Statut*",
-        f"🟢 ACTIF — {len(copy_state['ws_tasks'])} traders surveillés",
-        "",
-        "👥 *Traders:*",
-    ]
-
-    for addr, info in copy_state["traders"].items():
-        assets_seen = ", ".join(sorted(info["assets_seen"])) if info["assets_seen"] else "en attente"
-        lines.append(
-            f"#{info['rank']} `{addr[:16]}...` — {info['score']}/100\n"
-            f"   Assets tradés: {assets_seen}"
-        )
-
-    if positions:
-        lines.append("")
-        lines.append("📊 *Positions ouvertes:*")
-        for asset, pos in positions.items():
-            tracked     = copy_state["positions"].get(asset, {})
-            trader_addr = tracked.get("trader_addr", "")
-            trader_rank = copy_state["traders"].get(trader_addr, {}).get("rank", "?")
-            emoji       = "📈" if pos["side"] == "long" else "📉"
-            lines.append(
-                f"{emoji} *{asset}* {pos['side'].upper()} sz:{pos['size']} "
-                f"| PnL: ${pos['upnl']:+,.0f} | Trader #{trader_rank}"
-            )
-    else:
-        lines.append("")
-        lines.append("📊 *Aucune position ouverte*")
-
-    if copy_state["trades_log"]:
-        lines.append("")
-        lines.append(f"📋 *Derniers trades ({min(3, len(copy_state['trades_log']))}):*")
-        for t in copy_state["trades_log"][-3:]:
-            status = "✅" if t["result"] == "ok" else "❌"
-            lines.append(f"{status} {t['time']} | {t['asset']} {t['dir']} @ ${t['price']:,.0f} — {t['trader'][:8]}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-async def cmd_copy_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    await update.message.reply_text("🔄 Fermeture de toutes les positions en cours...")
-    positions = await get_my_positions()
-    if not positions:
-        await update.message.reply_text("✅ Aucune position ouverte.")
-        return
-    results = []
-    for asset, pos in positions.items():
-        is_buy = pos["side"] == "short"
-        result = await place_limit_gtc(asset, is_buy, pos["size"], "Close All", force_market=True)
-        status = "✅" if "error" not in result else "❌"
-        results.append(f"{status} {asset} fermé")
-        copy_state["positions"].pop(asset, None)
-        copy_deployed[asset] = 0.0
-    await update.message.reply_text(
-        "🏁 *Fermeture terminée*\n" + "\n".join(results),
-        parse_mode="Markdown"
-    )
-
-
-async def cmd_tb_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    await update.message.reply_text(build_history_report(), parse_mode="Markdown")
-
-
 async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "🤖 *SakaiBot — Module Copy Trading v4.1*\n\n"
-        "Sélectionne les *5 meilleurs traders globaux* (top 740 Hyperliquid)\n"
-        "et copie TOUS leurs trades, sur TOUS leurs assets.\n\n"
-        "📐 *Scoring v4.1:*\n"
+        "🔍 *SakaiBot — Module TradeBot (Analyse)*\n\n"
+        "Analyse les meilleurs traders Hyperliquid pour t'aider\n"
+        "à sélectionner un wallet à copier via /target.\n\n"
+        "📐 *Scoring:*\n"
         "   Score = (PnL\\_7j / MDD) × WR\\_7j × log(trades\\_7j)\n"
         "   Bonus ×1.2 si PnL\\_30j > 0 ET ROI\\_30j ≥ 20%\n\n"
         "🚫 *Filtres d'exclusion:*\n"
@@ -1989,22 +1656,11 @@ async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   • PnL 30j perte > 15%\n"
         "   • Ancienneté < 3 mois\n"
         "   • < 20 trades allTime\n\n"
-        "⚙️ *Leviers (COPY\\_LEVERAGE):*\n"
-        "   BTC x5 | ETH x4 | SOL x5 | HYPE x3 | TAO x3\n\n"
-        "⚡ *Logique de copie:*\n"
-        "   • 1 WebSocket par trader (5 total)\n"
-        "   • Tous assets copiés sans filtre\n"
-        "   • Taille proportionnelle à ton capital\n"
-        "   • Conflit: 2ème signal ignoré (premier arrivé)\n\n"
         "📋 *Commandes:*\n"
-        "   /toptraders — Analyser + sélectionner le Top 5\n"
-        "   /copy\\_start — Démarrer la copie\n"
-        "   /copy\\_stop — Arrêter la copie\n"
-        "   /copy\\_status — Statut en temps réel\n"
-        "   /copy\\_close — Fermer toutes les positions\n"
+        "   /toptraders — Analyser + afficher le Top 5\n"
         "   /inspector — Analyser un wallet manuellement\n"
-        "   /tb\\_historique — Sélections passées\n\n"
-        "_v4.1 — Multi-asset, Top 5 global, COPY\\_LEVERAGE actif_"
+        "   /target 0xADRESSE — Copier un wallet via WebSocket\n\n"
+        "_Module analyse uniquement — copie via /target_"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -2917,9 +2573,15 @@ import urllib.request
 def ai_save_state() -> None:
     try:
         data = {
-            "active":    ai_state["active"],
-            "positions": ai_state["positions"],
-            "history":   ai_state["history"][-20:],
+            "active":       ai_state["active"],
+            "positions":    ai_state["positions"],
+            "history":      ai_state["history"][-20:],
+            "cooldown":     ai_state["cooldown"],
+            "daily_loss":   ai_state["daily_loss"],
+            "weekly_loss":  ai_state["weekly_loss"],
+            "loss_reset_date": ai_state["loss_reset_date"],
+            "loss_reset_week": ai_state["loss_reset_week"],
+            "persistence":  ai_state["persistence"],
         }
         with open(AI_STATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -2933,11 +2595,302 @@ def ai_load_state() -> None:
             return
         with open(AI_STATE_FILE) as f:
             data = json.load(f)
-        ai_state["positions"] = data.get("positions", {})
-        ai_state["history"]   = data.get("history", [])
-        logger.info(f"🤖 AI state chargé: {len(ai_state['positions'])} positions")
+        ai_state["positions"]        = data.get("positions", {})
+        ai_state["history"]          = data.get("history", [])
+        ai_state["cooldown"]         = data.get("cooldown", {})
+        ai_state["daily_loss"]       = data.get("daily_loss", 0.0)
+        ai_state["weekly_loss"]      = data.get("weekly_loss", 0.0)
+        ai_state["loss_reset_date"]  = data.get("loss_reset_date", "")
+        ai_state["loss_reset_week"]  = data.get("loss_reset_week", "")
+        ai_state["persistence"]      = data.get("persistence", {})
+        logger.info(
+            f"🤖 AI state chargé: {len(ai_state['positions'])} positions | "
+            f"perte jour ${ai_state['daily_loss']:.1f} | "
+            f"cooldowns: {len(ai_state['cooldown'])}"
+        )
     except Exception as e:
         logger.error(f"ai_load_state: {e}")
+
+
+
+def ai_get_asset_category(asset: str) -> str:
+    """Retourne la catégorie d'un asset (commodities/stocks/etf/fx/indices)."""
+    ticker = asset.split(":")[-1]
+    return ASSET_CATEGORIES.get(ticker, "stocks")
+
+
+def ai_get_leverage(asset: str) -> int:
+    """Retourne le levier adapté à la catégorie de l'asset."""
+    cat = ai_get_asset_category(asset)
+    return AI_LEVERAGE_MAP.get(cat, AI_LEVERAGE)
+
+
+def ai_is_session_open(asset: str) -> tuple[bool, bool]:
+    """
+    Retourne (is_open, is_prepost).
+    is_open    → session principale ouverte (seuil normal)
+    is_prepost → session pre/post market (seuil doublé, taille ÷2)
+    """
+    cat = ai_get_asset_category(asset)
+    now_utc = datetime.now(timezone.utc)
+    weekday = now_utc.weekday()  # 0=lun, 6=dim
+    hour    = now_utc.hour
+
+    # Weekend : HL ferme ven 22h UTC → dim 23h UTC
+    if weekday == 5:  # samedi
+        return False, False
+    if weekday == 6 and hour < 23:  # dimanche avant 23h
+        return False, False
+
+    if cat == "fx":
+        # FX quasi-24/5 sauf weekend
+        return True, False
+
+    if cat in ("commodities", "indices"):
+        # CME : ouvre dim 23h UTC, pause 22h-23h chaque jour
+        if weekday == 4 and hour >= 22:  # vendredi après 22h
+            return False, False
+        if hour == 22:  # pause quotidienne
+            return False, False
+        return True, False
+
+    if cat in ("stocks", "etf"):
+        # Session officielle : 14h30-21h00 UTC (9h30-16h ET)
+        is_main = (hour == 14 and now_utc.minute >= 30) or (15 <= hour <= 20) or (hour == 21 and now_utc.minute == 0)
+        # Pre/post market : 13h-00h UTC (8h-19h ET) — Q1: Option B
+        is_pre  = 13 <= hour < 14
+        is_post = 21 <= hour <= 23
+        if is_main:
+            return True, False
+        if is_pre or is_post:
+            return True, True   # pre/post : is_prepost=True → seuil ×2, taille ÷2
+        return False, False
+
+    return True, False
+
+
+def ai_get_premium_threshold(asset: str, is_prepost: bool) -> float:
+    """Retourne le seuil de premium selon catégorie et session."""
+    cat = ai_get_asset_category(asset)
+    thresholds = AI_PREMIUM_THRESHOLD.get(cat, (0.020, 0.040))
+    return thresholds[1] if is_prepost else thresholds[0]
+
+
+def ai_get_trail_pct(asset: str) -> float:
+    """Retourne le trailing stop % basé sur l'ATR de l'asset."""
+    ticker = asset.split(":")[-1]
+    atr    = ai_state["atr_cache"].get(ticker, 0.0)
+    if atr <= 0:
+        return AI_TRAIL_PCT_MAX
+    trail = atr * 1.5
+    return round(max(AI_TRAIL_PCT_MIN, min(AI_TRAIL_PCT_MAX, trail)), 4)
+
+
+async def ai_refresh_atr_cache() -> None:
+    """Calcule l'ATR 14j de chaque asset via yfinance, une fois par jour."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if ai_state.get("atr_date") == today:
+        return  # déjà calculé aujourd'hui
+    try:
+        import yfinance as yf
+        for ticker_full, cfg in AI_HIP3_ASSETS.items():
+            yahoo  = cfg.get("yahoo", "")
+            ticker = ticker_full.split(":")[-1]
+            if not yahoo:
+                continue
+            try:
+                hist = yf.Ticker(yahoo).history(period="20d", interval="1d")
+                if hist.empty or len(hist) < 5:
+                    continue
+                high = hist["High"].values
+                low  = hist["Low"].values
+                close= hist["Close"].values
+                # ATR = moyenne des True Range sur 14j
+                tr_list = []
+                for i in range(1, len(high)):
+                    tr = max(high[i] - low[i],
+                             abs(high[i] - close[i-1]),
+                             abs(low[i]  - close[i-1]))
+                    tr_list.append(tr)
+                if tr_list and close[-1] > 0:
+                    atr_pct = (sum(tr_list[-14:]) / len(tr_list[-14:])) / close[-1]
+                    ai_state["atr_cache"][ticker] = round(atr_pct, 5)
+                    logger.debug(f"ATR {ticker}: {atr_pct*100:.2f}%")
+            except Exception as e:
+                logger.debug(f"ATR {ticker}: {e}")
+        ai_state["atr_date"] = today
+        logger.info(f"🤖 ATR cache rafraîchi: {len(ai_state['atr_cache'])} assets")
+    except Exception as e:
+        logger.error(f"ai_refresh_atr_cache: {e}")
+
+
+def ai_compute_signal_score(asset: str, premium_pct: float,
+                             hl_volume_24h: float, direction: str,
+                             tradfi_price: float = 0.0) -> int:
+    """
+    Score composite 0-100 basé sur 4 facteurs.
+    direction: "long" (premium négatif) ou "short" (premium positif)
+    tradfi_price: prix TradFi courant pour le calcul du momentum
+    """
+    cat       = ai_get_asset_category(asset)
+    threshold = AI_PREMIUM_THRESHOLD.get(cat, (0.020, 0.040))[0]
+    abs_prem  = abs(premium_pct / 100)
+
+    # ── Facteur 1 : magnitude du premium (40%) ──
+    # 0 au seuil minimum, 100 au double du seuil
+    prem_score = min(100, int((abs_prem - threshold) / threshold * 100))
+    prem_score = max(0, prem_score)
+
+    # ── Facteur 2 : persistance (25%) ──
+    persist = ai_state["persistence"].get(asset, {})
+    if persist.get("direction") == direction:
+        count = persist.get("count", 0)
+        persist_score = min(100, count * 25)  # 100% après 4 scans
+    else:
+        persist_score = 0
+
+    # ── Facteur 3 : volume HL 24h vs norme (20%) ──
+    # On compare à une valeur de référence approximative
+    VOLUME_REFS = {
+        "commodities": 50_000_000, "indices": 100_000_000,
+        "stocks": 20_000_000, "etf": 5_000_000, "fx": 10_000_000,
+    }
+    ref_vol = VOLUME_REFS.get(cat, 20_000_000)
+    if hl_volume_24h > 0:
+        vol_ratio   = hl_volume_24h / ref_vol
+        vol_score   = min(100, int(vol_ratio * 50))  # 100% = double volume normal
+    else:
+        vol_score = 30  # neutre si pas de données
+
+    # ── Facteur 4 : momentum TradFi (10%) ──
+    # Compare le prix TradFi actuel au précédent scan (stocké dans prev_prices)
+    prev = ai_state["prev_prices"].get(asset, 0)
+    curr = tradfi_price if tradfi_price > 0 else 0
+    if prev > 0 and curr > 0:
+        momentum = (curr - prev) / prev
+        # Long : on veut que TradFi monte (convergence vers le haut)
+        # Short : on veut que TradFi descende (convergence vers le bas)
+        if direction == "long":
+            mom_score = max(0, min(100, int(50 + momentum * 2000)))
+        else:
+            mom_score = max(0, min(100, int(50 - momentum * 2000)))
+    else:
+        mom_score = 50  # neutre — pas encore de prix précédent
+
+    # Poids : premium 40% | persistance 35% | volume 10% | momentum 10% | total 95% → rescale
+    # (volume discrimine peu sur ces assets très liquides → réduit au profit de la persistance)
+    score = int(prem_score * 0.40 + persist_score * 0.35 + vol_score * 0.10 + mom_score * 0.10)
+    score = min(score, 100)
+    logger.debug(
+        f"Score {asset} {direction}: prem={prem_score} persist={persist_score} "
+        f"vol={vol_score} mom={mom_score} → total={score}"
+    )
+    return score
+
+
+def ai_budget_from_score(score: int) -> float:
+    """Retourne le budget $ selon le score composite."""
+    for min_score, budget in AI_BUDGET_BY_SCORE:
+        if score >= min_score:
+            return budget
+    return 0.0
+
+
+def ai_is_cooldown(asset: str) -> bool:
+    """Retourne True si l'asset est en cooldown post-trade."""
+    deadline = ai_state["cooldown"].get(asset)
+    if not deadline:
+        return False
+    try:
+        dt = datetime.fromisoformat(deadline)
+        return datetime.now(timezone.utc) < dt
+    except Exception:
+        return False
+
+
+def ai_set_cooldown(asset: str) -> None:
+    """Démarre un cooldown de AI_COOLDOWN_MIN minutes sur l'asset."""
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=AI_COOLDOWN_MIN)
+    ai_state["cooldown"][asset] = deadline.isoformat()
+
+
+def ai_update_loss_trackers(pnl_usd: float) -> None:
+    """Met à jour les compteurs daily/weekly et vérifie les limites."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    week  = datetime.now(timezone.utc).strftime("%Y-W%W")
+
+    if ai_state.get("loss_reset_date") != today:
+        ai_state["daily_loss"]      = 0.0
+        ai_state["loss_reset_date"] = today
+    if ai_state.get("loss_reset_week") != week:
+        ai_state["weekly_loss"]      = 0.0
+        ai_state["loss_reset_week"]  = week
+
+    if pnl_usd < 0:
+        ai_state["daily_loss"]  += abs(pnl_usd)
+        ai_state["weekly_loss"] += abs(pnl_usd)
+
+
+def ai_loss_limit_reached() -> str | None:
+    """
+    Retourne un message si une limite est atteinte, None sinon.
+    """
+    daily_limit  = AI_FIXED_BUDGET * AI_DAILY_LOSS_MAX
+    weekly_limit = AI_FIXED_BUDGET * AI_WEEKLY_LOSS_MAX
+
+    if ai_state["daily_loss"] >= daily_limit:
+        return f"⛔ Limite perte journalière atteinte (${ai_state['daily_loss']:.1f} / ${daily_limit:.0f})"
+    if ai_state["weekly_loss"] >= weekly_limit:
+        return f"⛔ Limite perte hebdomadaire atteinte (${ai_state['weekly_loss']:.1f} / ${weekly_limit:.0f})"
+    return None
+
+
+async def ai_check_eod_close(app) -> None:
+    """
+    Q2 — Ferme les positions actions/ETF à 21h45 UTC (16h45 ET) si PnL > 0.
+    Si PnL < 0, resserre le trailing stop à 1.5%.
+    """
+    now_utc = datetime.now(timezone.utc)
+    # Cible : 21h45 UTC ±5 minutes
+    if not (now_utc.hour == 21 and 40 <= now_utc.minute <= 50):
+        return
+    # Uniquement lun-ven
+    if now_utc.weekday() >= 5:
+        return
+
+    for asset, pos in list(ai_state["positions"].items()):
+        cat = ai_get_asset_category(asset)
+        if cat not in ("stocks", "etf"):
+            continue
+
+        cfg   = AI_HIP3_ASSETS.get(asset, {})
+        price = ai_state["hip3_prices"].get(asset, 0)
+        if price <= 0:
+            price = await ai_get_hl_price(asset, cfg.get("dex", ""))
+        if price <= 0:
+            continue
+
+        entry   = pos["entry"]
+        side    = pos["side"]
+        pnl_pct = ((price - entry) / entry * 100) if side == "long" else ((entry - price) / entry * 100)
+
+        if pnl_pct > 0:
+            # PnL positif → fermer avant clôture
+            logger.info(f"EOD close {asset}: PnL={pnl_pct:+.2f}% → fermeture 21h45")
+            await send_copy_notification(app,
+                f"🌙 *IA — Fermeture EOD*\n"
+                f"Asset: *{asset}* {side.upper()}\n"
+                f"PnL: {pnl_pct:+.2f}% — fermeture avant clôture marché"
+            )
+            await ai_close_position(asset, price, "EOD_CLOSE_16H45ET", app)
+        else:
+            # PnL négatif → stop serré 1.5%
+            if side == "long":
+                new_stop = round(price * 0.985, 4)
+            else:
+                new_stop = round(price * 1.015, 4)
+            pos["stop"] = new_stop
+            logger.info(f"EOD resserrement stop {asset}: PnL={pnl_pct:+.2f}% → stop={new_stop:.4f}")
 
 
 async def ai_compute_budget() -> float:
@@ -2950,118 +2903,199 @@ async def ai_compute_budget() -> float:
             return 0.0
 
         copy_margin = margin - sum(
-            pos.get("usd", 0) / AI_LEVERAGE
-            for pos in ai_state["positions"].values()
+            pos.get("usd", 0) / ai_get_leverage(asset)
+            for asset, pos in ai_state["positions"].items()
         )
         copy_margin = max(copy_margin, 0)
 
-        slots_used = len(ai_state["positions"])
-        slots_free = max(AI_MAX_POSITIONS - slots_used, 1)
-
         budget_reel  = (wallet * (1 - AI_SAFETY_BUFFER) - copy_margin * AI_COPY_RESERVE)
         budget_total = min(AI_FIXED_BUDGET, max(budget_reel, 0))
-        budget       = budget_total / slots_free
-        return max(round(budget, 2), 0.0)
+        return max(round(budget_total, 2), 0.0)
     except Exception as e:
         logger.error(f"ai_compute_budget: {e}")
         return 0.0
 
 
-async def ai_get_tradfi_price(yahoo_symbol: str) -> float | None:
+# Cache TradFi : {yahoo_symbol: {"price": float, "ts": float, "stale": bool}}
+_tradfi_cache: dict = {}
+_TRADFI_TTL = {
+    "commodities": 300,   # 5 min — CME quasi-24/5
+    "indices":     300,
+    "stocks":      90,    # 1m30 — session active
+    "etf":         90,
+    "fx":          180,   # 3 min
+}
+_TRADFI_MAX_STALE = 600  # 10 min — au-delà, on considère le prix inutilisable
+
+
+async def ai_get_tradfi_price(yahoo_symbol: str, asset: str = "") -> float | None:
+    """
+    Récupère le prix TradFi avec :
+    - Vérification fraîcheur (timestamp Yahoo vs heure actuelle)
+    - Cache local avec TTL adaptatif par catégorie
+    - Fallback sur cache si Yahoo échoue (max 10 min)
+    """
+    import time
+    now = time.time()
+    cat = ai_get_asset_category(asset) if asset else "stocks"
+    ttl = _TRADFI_TTL.get(cat, 120)
+
+    # ── Vérifier cache local ──
+    cached = _tradfi_cache.get(yahoo_symbol)
+    if cached and (now - cached["ts"]) < ttl and not cached.get("stale"):
+        return cached["price"]
+
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval=1m&range=1d"
+        # Yahoo Finance v8 — retourne aussi regularMarketTime pour vérifier fraîcheur
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+            f"?interval=1m&range=1d&includeTimestamps=true"
+        )
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 url,
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as resp:
+                if resp.status == 429:
+                    logger.warning(f"Yahoo rate-limit sur {yahoo_symbol} — fallback cache")
+                    return _tradfi_fallback(yahoo_symbol, now)
                 data = await resp.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        return float(price)
+
+        meta  = data["chart"]["result"][0]["meta"]
+        price = float(meta.get("regularMarketPrice", 0) or 0)
+        mtime = float(meta.get("regularMarketTime", 0) or 0)  # Unix timestamp
+
+        if price <= 0:
+            return _tradfi_fallback(yahoo_symbol, now)
+
+        # ── Vérification fraîcheur du prix ──
+        price_age = now - mtime if mtime > 0 else 0
+        is_stale  = price_age > _TRADFI_MAX_STALE
+
+        if is_stale:
+            logger.warning(
+                f"TradFi {yahoo_symbol}: prix stale de {price_age/60:.1f} min "
+                f"(max {_TRADFI_MAX_STALE//60} min) → ignoré"
+            )
+            # On stocke quand même pour le fallback mais on marque stale
+            _tradfi_cache[yahoo_symbol] = {"price": price, "ts": now, "stale": True}
+            return None  # Signal ignoré — prix hors session ou données en retard
+
+        _tradfi_cache[yahoo_symbol] = {"price": price, "ts": now, "stale": False}
+        return price
+
     except Exception as e:
         logger.warning(f"ai_get_tradfi_price {yahoo_symbol}: {e}")
-        return None
+        return _tradfi_fallback(yahoo_symbol, now)
+
+
+def _tradfi_fallback(yahoo_symbol: str, now: float) -> float | None:
+    """Retourne le dernier prix connu si < 10 min, sinon None."""
+    cached = _tradfi_cache.get(yahoo_symbol)
+    if cached and (now - cached["ts"]) < _TRADFI_MAX_STALE:
+        logger.info(f"TradFi {yahoo_symbol}: fallback cache ({(now-cached['ts'])/60:.1f} min)")
+        return cached["price"]
+    return None
 
 
 async def ai_discover_hip3_assets() -> dict:
+    """
+    Charge les 4 assets de la whitelist depuis XYZ.
+    Stocke prix, volume 24h, funding dans AI_HIP3_ASSETS.
+    Utilise le cache global _get_xyz_meta pour éviter un appel dédié.
+    """
     global AI_HIP3_ASSETS
     discovered = {}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                HYPERLIQUID_API,
-                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                data = await resp.json()
-
-        universe = data[0].get("universe", []) if isinstance(data, list) else []
-        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
-
-        # Assets Corée exclus du module IA — pas de feed Yahoo Finance fiable
-        KOREAN_ASSETS = {"SKHX", "SMSN", "HYUNDAI"}
+        universe, ctxs = await _get_xyz_meta("xyz")
 
         new_assets = {}
-        for i, asset in enumerate(universe):
-            raw_name = asset.get("name", "")
+        for i, asset_meta in enumerate(universe):
+            raw_name = asset_meta.get("name", "")
             if not raw_name or i >= len(ctxs):
                 continue
-            mark_px = float(ctxs[i].get("markPx", 0) or 0)
+
+            ticker = raw_name.split(":")[-1]
+
+            # ── Filtre whitelist (vide = tout accepter) ──
+            if AI_ORACLE_WHITELIST and ticker not in AI_ORACLE_WHITELIST:
+                continue
+
+            ctx     = ctxs[i]
+            mark_px = float(ctx.get("markPx", 0) or 0)
             if mark_px <= 0:
                 continue
 
-            ticker    = raw_name.split(":")[-1]
-            full_name = f"xyz:{ticker}"
-
-            # Exclure les assets Corée (pas de price feed Yahoo)
-            if ticker in KOREAN_ASSETS:
-                logger.debug(f"IA: {ticker} exclu (asset Corée, pas de feed Yahoo)")
-                continue
-
-            # Exclure si pas de mapping Yahoo Finance (IA ne peut pas comparer TradFi/HL)
-            yahoo = YAHOO_SYMBOLS.get(ticker)
+            yahoo    = YAHOO_SYMBOLS.get(ticker)
             if not yahoo:
-                logger.debug(f"IA: {ticker} exclu (pas de mapping Yahoo Finance)")
+                logger.warning(f"IA: {ticker} dans whitelist mais sans mapping Yahoo — ignoré")
                 continue
+
+            vol24h  = float(ctx.get("dayNtlVlm", 0) or 0)  # volume notionnel 24h en $
+            funding = float(ctx.get("funding", 0) or 0)
+            full_name = f"xyz:{ticker}"
 
             discovered[full_name] = mark_px
             new_assets[full_name] = {
-                "name":   ticker,
-                "yahoo":  yahoo,
-                "dex":    "xyz",
-                "ticker": ticker,
+                "name":    ticker,
+                "yahoo":   yahoo,
+                "dex":     "xyz",
+                "ticker":  ticker,
+                "vol24h":  vol24h,
+                "funding": funding,
             }
 
         AI_HIP3_ASSETS = new_assets
         ai_state["hip3_prices"] = discovered
-        logger.info(f"🔮 ORACLE — {len(discovered)} assets HIP-3 actifs: {list(discovered.keys())}")
+
+        filter_label = f"/{len(AI_ORACLE_WHITELIST)} whitelist" if AI_ORACLE_WHITELIST else "/all"
+        missing   = (AI_ORACLE_WHITELIST - {k.split(":")[-1] for k in found}) if AI_ORACLE_WHITELIST else set()
+        if missing:
+            logger.warning(f"🔮 ORACLE — assets whitelist non trouvés sur XYZ: {missing}")
+        logger.info(
+            f"🔮 ORACLE — {len(discovered)}{filter_label} assets actifs: "
+            + ", ".join(f"{k.split(':')[-1]} ${v:.2f}" for k, v in discovered.items())
+        )
 
     except Exception as e:
         logger.warning(f"ai_discover_hip3_assets: {e}")
     return discovered
 
 
-async def ai_get_hl_price(coin: str, dex: str = "") -> float:
+async def _get_xyz_meta(dex: str = "xyz") -> tuple[list, list]:
+    """
+    Cache global XYZ metaAndAssetCtxs — TTL 30s.
+    Évite N appels API pour N assets au même scan.
+    """
+    import time
+    global _xyz_meta_cache
+    now = time.time()
+    if now - _xyz_meta_cache["ts"] < _XYZ_CACHE_TTL and _xyz_meta_cache["universe"]:
+        return _xyz_meta_cache["universe"], _xyz_meta_cache["ctxs"]
     try:
         async with aiohttp.ClientSession() as session:
-            payload = {"type": "metaAndAssetCtxs"}
-            if dex:
-                payload["dex"] = dex
             async with session.post(
                 HYPERLIQUID_API,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=8)
+                json={"type": "metaAndAssetCtxs", "dex": dex},
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 data = await resp.json()
-
         universe = data[0].get("universe", []) if isinstance(data, list) else []
         ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
+        _xyz_meta_cache = {"universe": universe, "ctxs": ctxs, "ts": now}
+        return universe, ctxs
+    except Exception as e:
+        logger.warning(f"_get_xyz_meta: {e}")
+        return _xyz_meta_cache["universe"], _xyz_meta_cache["ctxs"]
 
-        search_coin = coin.split(":")[-1] if ":" in coin else coin
 
+async def ai_get_hl_price(coin: str, dex: str = "xyz") -> float:
+    try:
+        universe, ctxs = await _get_xyz_meta(dex)
+        search = coin.split(":")[-1] if ":" in coin else coin
         for i, asset in enumerate(universe):
-            if asset.get("name", "") == search_coin and i < len(ctxs):
+            if asset.get("name", "") == search and i < len(ctxs):
                 mark_px = float(ctxs[i].get("markPx", 0) or 0)
                 if mark_px > 0:
                     return mark_px
@@ -3071,28 +3105,13 @@ async def ai_get_hl_price(coin: str, dex: str = "") -> float:
         return 0.0
 
 
-async def ai_get_funding_rate(coin: str, dex: str = "") -> float | None:
+async def ai_get_funding_rate(coin: str, dex: str = "xyz") -> float | None:
     try:
-        async with aiohttp.ClientSession() as session:
-            payload = {"type": "metaAndAssetCtxs"}
-            if dex:
-                payload["dex"] = dex
-            async with session.post(
-                HYPERLIQUID_API,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as resp:
-                data = await resp.json()
-
-        universe = data[0].get("universe", []) if isinstance(data, list) else []
-        ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
-
-        search_coin = coin.split(":")[-1] if ":" in coin else coin
-
+        universe, ctxs = await _get_xyz_meta(dex)
+        search = coin.split(":")[-1] if ":" in coin else coin
         for i, asset in enumerate(universe):
-            if asset.get("name", "") == search_coin and i < len(ctxs):
-                funding = float(ctxs[i].get("funding", 0) or 0)
-                return funding
+            if asset.get("name", "") == search and i < len(ctxs):
+                return float(ctxs[i].get("funding", 0) or 0)
         return None
     except Exception as e:
         logger.warning(f"ai_get_funding_rate {coin}: {e}")
@@ -3101,7 +3120,7 @@ async def ai_get_funding_rate(coin: str, dex: str = "") -> float | None:
 
 async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
                          funding: float, premium_pct: float,
-                         existing_pos: dict | None) -> dict:
+                         existing_pos: dict | None, score: int = 60) -> dict:
     api_key = get_anthropic_key()
     if not api_key:
         return {"action": "wait", "confidence": 0, "reason": "ANTHROPIC_API_KEY manquante"}
@@ -3115,23 +3134,42 @@ async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
             pnl_pct = -pnl_pct
         pos_context = f"Position {side.upper()} @ ${entry:.2f} | PnL actuel: {pnl_pct:+.2f}%"
 
-    prompt = f"""Tu es un trader quantitatif spécialisé en arbitrage TradFi/Crypto.
+    # Historique des 3 dernières décisions sur cet asset
+    history_ctx = ""
+    recent = [h for h in ai_state.get("history", [])[-20:] if h.get("asset") == asset_name][-3:]
+    if recent:
+        history_ctx = "\nHistorique récent:\n" + "\n".join(
+            f"  {h['time']} {h['action']} → {h.get('pnl_pct','?')}% ({h.get('reason','')})"
+            for h in recent
+        )
 
-ASSET: {asset_name}
-Prix Hyperliquid (perp): ${hl_price:.4f}
-Prix TradFi référence:   ${tradfi_price:.4f}
-Premium HL vs TradFi:    {premium_pct:+.2f}%
-Funding rate (par heure): {funding*100:.4f}%
-{pos_context}
+    cat      = ai_get_asset_category(f"xyz:{asset_name}")
+    thresh   = AI_PREMIUM_THRESHOLD.get(cat, (0.020, 0.040))
 
-STRATÉGIE (assets HIP-3 — funding toujours ~0, ignorer cette condition):
-- Premium < -{AI_MIN_PREMIUM*100:.1f}% → LONG (HL sous-coté vs TradFi, convergence attendue)
-- Premium > +{AI_MIN_PREMIUM*100:.1f}% → SHORT (HL surcoté vs TradFi, convergence attendue)
-- Si position ouverte et signal inversé ou PnL proche stop → CLOSE
-- Si premium proche de 0 ou données suspectes (premium > ±20%) → WAIT
+    prompt = f"""Tu es un arbitragiste spécialisé en convergence TradFi/DeFi (Hyperliquid HIP-3).
+
+ASSET: {asset_name} | Catégorie: {cat}
+Prix HL (perp):    ${hl_price:.4f}
+Prix TradFi ref:   ${tradfi_price:.4f}
+Premium HL/TradFi: {premium_pct:+.2f}%
+Funding (par heure): {funding*100:.4f}%
+Score composite:   {score}/100
+{pos_context}{history_ctx}
+
+CONTEXTE:
+- Seuil normal pour cet asset: ±{thresh[0]*100:.1f}%
+- Un score >= 75 déclenche un trade automatique. Tu interviens car le score est ambigu ({score}).
+- Arbitrage de convergence: le prix HL DOIT converger vers TradFi à moyen terme.
+- Ne PAS agir si: spread > ±15% (erreur data), signal < 2 scans consécutifs, marché TradFi fermé.
+
+QUESTION: Est-ce que ce signal de convergence est fiable? Probabilité de convergence dans 24-48h?
+- LONG si HL sous-coté (premium négatif) et convergence probable
+- SHORT si HL surcoté (premium positif) et convergence probable
+- CLOSE si position ouverte avec signal inversé
+- WAIT si données douteuses, signal trop récent, ou marché agité
 
 Réponds UNIQUEMENT en JSON valide, sans markdown:
-{{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "explication courte"}}"""
+{{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "< 80 chars"}}"""
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -3164,10 +3202,41 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
         return {"action": "wait", "confidence": 0, "reason": str(e)[:80]}
 
 
+async def ai_set_leverage_hl(asset: str, leverage: int) -> bool:
+    """
+    Appelle exchange.update_leverage() sur HL pour forcer le levier isolated
+    sur cet asset AVANT d'ouvrir une position. Sans cet appel, HL utilise
+    le levier par défaut du compte (souvent x1 ou x3).
+    """
+    if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
+        return False
+    try:
+        exchange = await _build_hip3_exchange()
+        if exchange is None:
+            return False
+        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: exchange.update_leverage(leverage, sdk_coin, False)  # False = isolated
+        )
+        logger.info(f"✅ Levier {sdk_coin} → x{leverage} isolated | {result}")
+        return True
+    except Exception as e:
+        logger.warning(f"ai_set_leverage_hl {asset} x{leverage}: {e}")
+        return False
+
+
 async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
                            current_price: float, reason: str, app) -> bool:
+    leverage = ai_get_leverage(asset)
     rules    = SIZE_RULES.get(asset, SIZE_RULES["_default"])
     my_size  = max(round(budget_usd / current_price, rules["decimals"]), rules["min"])
+
+    # ── Forcer le levier isolated AVANT l'ordre ──
+    lev_ok = await ai_set_leverage_hl(asset, leverage)
+    if not lev_ok:
+        logger.warning(f"ai_open_position: levier non confirmé pour {asset} — on tente quand même")
 
     result = await place_limit_gtc(asset, is_buy, my_size, f"AI:{reason}")
     if "error" in result:
@@ -3179,25 +3248,29 @@ async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
         return False
 
     side      = "long" if is_buy else "short"
+    leverage   = ai_get_leverage(asset)
     stop_price = current_price * (1 - AI_STOP_LOSS_PCT) if is_buy else current_price * (1 + AI_STOP_LOSS_PCT)
 
     ai_state["positions"][asset] = {
-        "side":         side,
-        "size":         my_size,
-        "entry":        current_price,
-        "peak":         current_price,
-        "stop":         round(stop_price, 4),
-        "usd":          budget_usd,
-        "time":         datetime.now().strftime("%d/%m %H:%M"),
+        "side":          side,
+        "size":          my_size,
+        "entry":         current_price,
+        "peak":          current_price,
+        "stop":          round(stop_price, 4),
+        "usd":           budget_usd,
+        "time":          datetime.now().strftime("%d/%m %H:%M"),
+        "entry_time":    datetime.now(timezone.utc).isoformat(),
+        "trail_pct":     ai_get_trail_pct(asset),
         "tp_levels_hit": [],
     }
     ai_save_state()
 
+    margin_used = round(budget_usd / leverage, 2)
     await send_copy_notification(app,
         f"🔮 *ORACLE — Position ouverte*\n"
-        f"Asset:   *{asset}*\n"
+        f"Asset:   *{asset.split(':')[-1]}* x{leverage} isolated\n"
         f"Side:    {'📈 LONG' if is_buy else '📉 SHORT'}\n"
-        f"Taille:  {my_size} (~${budget_usd:.0f})\n"
+        f"Notionnel: ${budget_usd:.0f} | Marge: ${margin_used:.1f}\n"
         f"Entrée:  ${current_price:.4f}\n"
         f"Stop:    ${stop_price:.4f} (-{AI_STOP_LOSS_PCT*100:.0f}%)\n"
         f"Raison:  _{reason}_"
@@ -3213,9 +3286,14 @@ async def ai_close_position(asset: str, current_price: float, reason: str, app) 
     is_close_buy = pos["side"] == "short"
     result = await place_limit_gtc(asset, is_close_buy, pos["size"], f"AI_CLOSE:{reason}", force_market=True)
 
-    entry   = pos["entry"]
-    pnl_pct = ((current_price - entry) / entry * 100) if pos["side"] == "long" else ((entry - current_price) / entry * 100)
-    pnl_usd = pos["usd"] * (pnl_pct / 100)
+    entry     = pos["entry"]
+    leverage  = ai_get_leverage(asset)
+    pnl_pct   = ((current_price - entry) / entry * 100) if pos["side"] == "long"                 else ((entry - current_price) / entry * 100)
+    # pos["usd"] = budget notionnel (ex: $60). PnL notionnel = $60 × pnl%
+    # Perte max notionnel : $60 × 4% = $2.40 | Perte marge réelle : $2.40 (marge=$6 → -40%)
+    # Le circuit-breaker utilise la perte marge pour rester pertinent à x10
+    pnl_usd        = pos["usd"] * (pnl_pct / 100)           # PnL notionnel $
+    pnl_margin_usd = pnl_usd  # avec isolated margin, perte max = marge engagée
 
     log = {
         "time":    datetime.now().strftime("%d/%m %H:%M"),
@@ -3231,6 +3309,8 @@ async def ai_close_position(asset: str, current_price: float, reason: str, app) 
     if len(ai_state["history"]) > 20:
         ai_state["history"] = ai_state["history"][-20:]
 
+    ai_update_loss_trackers(pnl_usd)
+    ai_set_cooldown(asset)
     ai_state["positions"].pop(asset, None)
     ai_save_state()
 
@@ -3261,19 +3341,39 @@ async def ai_check_stop_losses(app) -> None:
         entry = pos["entry"]
         peak  = pos.get("peak", entry)
 
+        trail_pct = pos.get("trail_pct", ai_get_trail_pct(asset))
+
+        # ── Timeout 48h (Q2 plan) ──
+        entry_time_str = pos.get("entry_time")
+        if entry_time_str:
+            try:
+                entry_dt = datetime.fromisoformat(entry_time_str)
+                if datetime.now(timezone.utc) - entry_dt > timedelta(hours=AI_MAX_HOLD_HOURS):
+                    pnl_pct = ((price - pos["entry"]) / pos["entry"] * 100) if side == "long" else ((pos["entry"] - price) / pos["entry"] * 100)
+                    logger.info(f"IA TIMEOUT 48h {asset}: PnL {pnl_pct:+.2f}%")
+                    await send_copy_notification(app,
+                        f"⏰ *IA — Timeout 48h*\n"
+                        f"Asset: *{asset.split(':')[-1]}* {side.upper()}\n"
+                        f"PnL: {pnl_pct:+.2f}% — convergence non réalisée → sortie"
+                    )
+                    await ai_close_position(asset, price, "TIMEOUT_48H", app)
+                    continue
+            except Exception:
+                pass
+
         if side == "long":
             if price > peak:
                 pos["peak"] = price
                 peak = price
-                pos["stop"] = round(peak * (1 - AI_TRAIL_PCT), 4)
-                logger.info(f"IA trailing {asset}: nouveau peak ${peak:.4f} → stop ${pos['stop']:.4f}")
+                pos["stop"] = round(peak * (1 - trail_pct), 4)
+                logger.info(f"IA trailing {asset}: peak ${peak:.4f} → stop ${pos['stop']:.4f} (trail {trail_pct*100:.1f}%)")
 
         elif side == "short":
             if price < peak:
                 pos["peak"] = price
                 peak = price
-                pos["stop"] = round(peak * (1 + AI_TRAIL_PCT), 4)
-                logger.info(f"IA trailing {asset}: nouveau peak ${peak:.4f} → stop ${pos['stop']:.4f}")
+                pos["stop"] = round(peak * (1 + trail_pct), 4)
+                logger.info(f"IA trailing {asset}: peak ${peak:.4f} → stop ${pos['stop']:.4f} (trail {trail_pct*100:.1f}%)")
 
         hard_stop_long  = entry * (1 - AI_STOP_LOSS_PCT)
         hard_stop_short = entry * (1 + AI_STOP_LOSS_PCT)
@@ -3342,7 +3442,7 @@ async def ai_check_stop_losses(app) -> None:
             pnl_pct = ((price - entry) / entry * 100) if side == "long" else ((entry - price) / entry * 100)
             logger.info(f"IA TAKE-PROFIT {asset} @ ${price:.4f} | PnL {pnl_pct:+.2f}%")
             await send_copy_notification(app,
-                f"💰 *IA — TAKE-PROFIT +20% déclenché*\n"
+                f"💰 *IA — TAKE-PROFIT +{AI_TAKE_PROFIT_PCT*100:.0f}% déclenché*\n"
                 f"Asset: *{asset}* {side.upper()}\n"
                 f"Prix: ${price:.4f} | Entrée: ${entry:.4f}\n"
                 f"PnL: {pnl_pct:+.2f}%"
@@ -3358,7 +3458,7 @@ async def ai_check_stop_losses(app) -> None:
                 f"Prix: ${price:.4f} | Entrée: ${entry:.4f}\n"
                 f"PnL: {pnl_pct:+.2f}%"
             )
-            await ai_close_position(asset, price, "STOP DUR -15%", app)
+            await ai_close_position(asset, price, "STOP DUR -8%", app)
 
         elif hit_trailing:
             pnl_pct = ((price - entry) / entry * 100) if side == "long" else ((entry - price) / entry * 100)
@@ -3373,89 +3473,181 @@ async def ai_check_stop_losses(app) -> None:
 
 
 async def ai_scan_loop(app) -> None:
-    logger.info("🤖 IA scan loop démarrée")
+    logger.info("🤖 IA scan loop v2 démarrée")
     scan_count = 0
+
     while ai_state["active"]:
         try:
+            # ── Vérifier stop-losses + EOD close ──
             await ai_check_stop_losses(app)
+            await ai_check_eod_close(app)
 
-            if scan_count % 6 == 0:
+            # ── Vérifier limites de pertes ──
+            loss_msg = ai_loss_limit_reached()
+            if loss_msg:
+                logger.warning(f"IA pausée: {loss_msg}")
+                await send_copy_notification(app, f"⛔ *ORACLE — Pause automatique*\n{loss_msg}")
+                for _ in range(300):
+                    if not ai_state["active"]: break
+                    await asyncio.sleep(1)
+                continue
+
+            # ── Refresh ATR (1x/jour) + assets (toutes les 30 min) ──
+            if scan_count == 0:
+                await ai_refresh_atr_cache()
+            if scan_count % 30 == 0:
                 await ai_discover_hip3_assets()
             scan_count += 1
 
+            # ── Scanner chaque asset ──
             for asset, cfg in list(AI_HIP3_ASSETS.items()):
                 if not ai_state["active"]:
                     break
 
+                ticker = asset.split(":")[-1]
+
+                # ── Filtre session TradFi ──
+                is_open, is_prepost = ai_is_session_open(asset)
+                if not is_open:
+                    logger.debug(f"IA: {ticker} hors session TradFi — ignoré")
+                    continue
+
+                # ── Cooldown post-trade ──
+                if ai_is_cooldown(asset):
+                    logger.debug(f"IA: {ticker} en cooldown")
+                    continue
+
+                # ── Prix HL ──
                 hl_price = ai_state["hip3_prices"].get(asset, 0)
                 if hl_price <= 0:
                     hl_price = await ai_get_hl_price(asset, cfg.get("dex", ""))
                 if hl_price <= 0:
-                    logger.debug(f"IA: prix HL introuvable pour {asset}")
+                    logger.debug(f"IA: prix HL introuvable pour {ticker}")
                     continue
 
-                tradfi_price = await ai_get_tradfi_price(cfg["yahoo"])
+                # ── Prix TradFi ──
+                tradfi_price = await ai_get_tradfi_price(cfg["yahoo"], asset)
                 if tradfi_price is None or tradfi_price <= 0:
-                    logger.warning(f"IA: prix TradFi introuvable pour {asset}")
+                    logger.debug(f"IA: prix TradFi introuvable pour {ticker}")
+                    continue
+
+                # Filtre cohérence prix (données aberrantes)
+                ratio = hl_price / tradfi_price
+                if ratio < 0.80 or ratio > 1.20:
+                    logger.warning(f"IA: {ticker} prix incohérents HL={hl_price:.4f} TradFi={tradfi_price:.4f}")
                     continue
 
                 premium_pct = (hl_price - tradfi_price) / tradfi_price * 100
-                funding     = await ai_get_funding_rate(asset, cfg.get("dex", ""))
-                if funding is None:
-                    funding = 0.0
+                # Funding déjà dans cfg, rafraîchi toutes les 30 scans
+                funding = float(cfg.get("funding", 0) or 0)
+
+                # ── Seuil de premium adaptatif ──
+                threshold   = ai_get_premium_threshold(asset, is_prepost)
+                abs_prem    = abs(premium_pct / 100)
+                direction   = "short" if premium_pct > 0 else "long"
 
                 logger.info(
-                    f"IA scan {asset}: HL=${hl_price:.4f} TradFi=${tradfi_price:.4f} "
-                    f"premium={premium_pct:+.2f}% funding={funding*100:.4f}%/h"
+                    f"IA {ticker}: HL={hl_price:.4f} TradFi={tradfi_price:.4f} "
+                    f"prem={premium_pct:+.2f}% (seuil {threshold*100:.1f}%) "
+                    f"{'PRE/POST' if is_prepost else 'SESSION'}"
                 )
 
                 existing_pos = ai_state["positions"].get(asset)
 
-                decision = await ai_call_claude(
-                    cfg["name"], hl_price, tradfi_price,
-                    funding, premium_pct, existing_pos
-                )
-                action     = decision.get("action", "wait")
-                confidence = decision.get("confidence", 0)
-                reason     = decision.get("reason", "")
+                # ── Mise à jour persistance ──
+                persist = ai_state["persistence"].setdefault(asset, {"count": 0, "direction": ""})
+                if abs_prem >= threshold:
+                    if persist["direction"] == direction:
+                        persist["count"] = min(persist["count"] + 1, 10)
+                    else:
+                        persist["direction"] = direction
+                        persist["count"] = 1
+                else:
+                    persist["count"] = 0
+                    persist["direction"] = ""
 
-                logger.info(f"IA decision {asset}: {action} confidence={confidence}% — {reason}")
+                # ── Position existante : vérifier signal inversé ──
+                if existing_pos:
+                    pos_dir = existing_pos["side"]
+                    # Signal inversé fort → fermeture
+                    if abs_prem >= threshold and direction != pos_dir:
+                        logger.info(f"IA {ticker}: signal inversé {pos_dir}→{direction} → fermeture")
+                        await ai_close_position(asset, hl_price, f"SIGNAL_INVERSÉ ({premium_pct:+.2f}%)", app)
+                    continue  # pas de nouvelle entrée si déjà en position
 
-                if confidence < 65:
+                # ── Pas assez de premium → skip ──
+                if abs_prem < threshold:
                     continue
 
-                if action == "long" and not existing_pos:
-                    slots_ok = len(ai_state["positions"]) < AI_MAX_POSITIONS
-                    if not slots_ok:
-                        continue
-                    budget = await ai_compute_budget()
-                    if budget < 20:
-                        logger.warning(f"IA: budget insuffisant ${budget:.0f}")
-                        continue
-                    await ai_open_position(asset, True, budget, hl_price, reason, app)
+                # ── Score composite ──
+                # Volume 24h déjà dans cfg (stocké par ai_discover_hip3_assets)
+                hl_vol = float(cfg.get("vol24h", 0))
 
-                elif action == "short" and not existing_pos:
-                    slots_ok = len(ai_state["positions"]) < AI_MAX_POSITIONS
-                    if not slots_ok:
-                        continue
-                    budget = await ai_compute_budget()
-                    if budget < 20:
-                        logger.warning(f"IA: budget insuffisant ${budget:.0f}")
-                        continue
-                    await ai_open_position(asset, False, budget, hl_price, reason, app)
+                score = ai_compute_signal_score(asset, premium_pct, hl_vol, direction, tradfi_price)
 
-                elif action == "close" and existing_pos:
-                    await ai_close_position(asset, hl_price, reason, app)
+                # ── Pré/post market : budget divisé par 2 ──
+                size_factor = 0.5 if is_prepost else 1.0
+
+                # ── Décision ──
+                action = "wait"
+                reason = ""
+                confidence = 0
+
+                if score >= AI_SCORE_AUTO_TRADE:
+                    # Trade automatique
+                    action     = direction
+                    confidence = score
+                    reason     = f"Score {score}/100 | premium {premium_pct:+.2f}% | persist {persist['count']}"
+                    logger.info(f"IA {ticker}: trade AUTO {action} score={score}")
+
+                elif score >= AI_SCORE_CLAUDE_MIN:
+                    # Cas ambigu → appel Claude
+                    decision   = await ai_call_claude(
+                        cfg["name"], hl_price, tradfi_price,
+                        funding, premium_pct, None, score
+                    )
+                    action     = decision.get("action", "wait")
+                    confidence = decision.get("confidence", 0)
+                    reason     = decision.get("reason", "")
+                    logger.info(f"IA {ticker}: Claude {action} conf={confidence}% score={score}")
+
+                    if confidence < 65:
+                        action = "wait"
+                else:
+                    logger.debug(f"IA {ticker}: score {score} trop bas → WAIT")
+
+                # ── Exécution ──
+                if action in ("long", "short"):
+                    if len(ai_state["positions"]) >= AI_MAX_POSITIONS:
+                        logger.info(f"IA {ticker}: slots pleins ({AI_MAX_POSITIONS})")
+                        continue
+
+                    total_budget = await ai_compute_budget()
+                    budget       = ai_budget_from_score(score) * size_factor
+                    budget       = min(budget, total_budget)
+
+                    if budget < 20:
+                        logger.warning(f"IA {ticker}: budget insuffisant ${budget:.0f}")
+                        continue
+
+                    is_buy = action == "long"
+                    await ai_open_position(asset, is_buy, budget, hl_price, reason, app)
+
+                # ── Mise à jour prix précédent (momentum) ──
+                ai_state["prev_prices"][asset] = tradfi_price
 
         except Exception as e:
             logger.error(f"ai_scan_loop erreur: {e}")
+            import traceback; logger.debug(traceback.format_exc())
 
-        for _ in range(AI_SCAN_INTERVAL):
+        # ── Attente adaptative : 60s en session, 300s hors session ──
+        interval = AI_SCAN_INTERVAL  # 60s
+        for _ in range(interval):
             if not ai_state["active"]:
                 break
             await asyncio.sleep(1)
 
-    logger.info("🤖 IA scan loop arrêtée")
+    logger.info("🤖 IA scan loop v2 arrêtée")
 
 
 # ── Commandes Telegram IA ───────────────────────────────────
@@ -3495,9 +3687,10 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Assets actifs: {active_str}\n"
         f"Budget/trade estimé: ~${budget:.0f}\n"
         f"Max positions: {AI_MAX_POSITIONS}\n"
-        f"Stop-loss: {AI_STOP_LOSS_PCT*100:.0f}%\n"
-        f"Trailing stop: {AI_TRAIL_PCT*100:.0f}%\n"
-        f"Scan: toutes les {AI_SCAN_INTERVAL//60} min\n\n"
+        f"Assets: {'whitelist: '+', '.join(sorted(AI_ORACLE_WHITELIST)) if AI_ORACLE_WHITELIST else 'tous assets XYZ (filtre Yahoo)'}\n"
+        f"Stop-loss: {AI_STOP_LOSS_PCT*100:.0f}% | Score auto: {AI_SCORE_AUTO_TRADE}/100\n"
+        f"Trailing stop: {AI_TRAIL_PCT_MIN*100:.0f}%-{AI_TRAIL_PCT_MAX*100:.0f}% (ATR)\n"
+        f"Scan: {AI_SCAN_INTERVAL}s en session | Budget dynamique par score\n\n"
         f"_Claude Haiku analyse premium TradFi/HL + funding rate_",
         parse_mode="Markdown"
     )
@@ -3534,7 +3727,9 @@ async def cmd_ai_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         f"🔮 *ORACLE — {status_emoji}*",
         f"Budget dispo/trade: ~${budget:.0f}",
-        f"Positions: {len(ai_state['positions'])}/{AI_MAX_POSITIONS}",
+        f"Positions: {len(ai_state['positions'])}/{AI_MAX_POSITIONS} | "
+        f"Perte jour: ${ai_state.get('daily_loss',0):.1f}/${AI_FIXED_BUDGET*AI_DAILY_LOSS_MAX:.0f} | "
+        f"Perte sem: ${ai_state.get('weekly_loss',0):.1f}/${AI_FIXED_BUDGET*AI_WEEKLY_LOSS_MAX:.0f}",
         "",
     ]
 
@@ -3583,6 +3778,125 @@ async def cmd_ai_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ai_close_position(asset, price, "CLOSE_ALL manuel", context.application)
 
     await update.message.reply_text("🏁 *Toutes les positions IA fermées.*", parse_mode="Markdown")
+
+
+async def cmd_oracle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """📊 /oracle_stats — Performance complète de l'ORACLE."""
+    if not is_authorized(update):
+        return
+
+    history = ai_state.get("history", [])
+
+    # ── Assets actifs + prix courants ──
+    asset_prices = []
+    for asset, cfg in AI_HIP3_ASSETS.items():
+        ticker = cfg.get("ticker", asset.split(":")[-1])
+        hl_px  = ai_state["hip3_prices"].get(asset, 0)
+        cached = _tradfi_cache.get(cfg.get("yahoo", ""), {})
+        tf_px  = cached.get("price", 0)
+        stale  = cached.get("stale", True)
+        if hl_px > 0 and tf_px > 0:
+            prem = (hl_px - tf_px) / tf_px * 100
+            cat  = ai_get_asset_category(asset)
+            thr  = AI_PREMIUM_THRESHOLD.get(cat, (0.02, 0.04))[0]
+            sig  = "🔴 SHORT" if prem > thr * 100 else ("🟢 LONG" if prem < -thr * 100 else "⚪ NEUTRE")
+            stale_tag = " ⚠️stale" if stale else ""
+            asset_prices.append(f"  *{ticker}*: HL ${hl_px:.2f} | TF ${tf_px:.2f} | {prem:+.2f}% {sig}{stale_tag}")
+        else:
+            asset_prices.append(f"  *{ticker}*: en attente de données...")
+
+    prices_str = "\n".join(asset_prices) if asset_prices else "  _aucun asset chargé_"
+
+    # ── Stats trades ──
+    if not history:
+        trades_str = "_Aucun trade fermé._"
+        total = wins = losses = 0
+        wr = pnl_sum = 0.0
+        best_str = worst_str = "—"
+    else:
+        total   = len(history)
+        wins    = sum(1 for h in history if h.get("pnl_pct", 0) > 0)
+        losses  = total - wins
+        wr      = wins / total * 100
+        pnl_sum = sum(h.get("pnl_usd", 0) for h in history)
+        best    = max(history, key=lambda h: h.get("pnl_pct", 0))
+        worst   = min(history, key=lambda h: h.get("pnl_pct", 0))
+        best_str  = f"{best.get('asset','?')} {best.get('pnl_pct',0):+.2f}% ({best.get('time','')})"
+        worst_str = f"{worst.get('asset','?')} {worst.get('pnl_pct',0):+.2f}% ({worst.get('time','')})"
+
+        by_asset: dict = {}
+        for h in history:
+            a = h.get("asset", "?")
+            by_asset.setdefault(a, []).append(h.get("pnl_pct", 0))
+        asset_lines = ""
+        for a, pnls in sorted(by_asset.items()):
+            wr_a = sum(1 for p in pnls if p > 0) / len(pnls) * 100
+            avg  = sum(pnls) / len(pnls)
+            asset_lines += f"  *{a}*: {len(pnls)} trades | WR {wr_a:.0f}% | moy {avg:+.2f}%\n"
+
+        trades_str = (
+            f"🎯 {total} trades ({wins}W/{losses}L) | WR {wr:.0f}%\n"
+            f"💰 PnL total: ${pnl_sum:+.2f}\n"
+            f"🏆 Meilleur: {best_str}\n"
+            f"🔻 Pire:     {worst_str}\n\n"
+            f"📈 *Par asset:*\n{asset_lines}"
+        )
+
+    # ── Score persistance actuel ──
+    persist_lines = []
+    for asset, p in ai_state.get("persistence", {}).items():
+        if p.get("count", 0) > 0:
+            ticker = asset.split(":")[-1]
+            persist_lines.append(f"  *{ticker}*: {p['direction']} × {p['count']} scans")
+    persist_str = "\n".join(persist_lines) if persist_lines else "  _aucun signal persistant_"
+
+    # ── Cooldowns actifs ──
+    now = datetime.now(timezone.utc)
+    cool_lines = []
+    for asset, deadline in ai_state.get("cooldown", {}).items():
+        ticker = asset.split(":")[-1]
+        try:
+            dt      = datetime.fromisoformat(deadline)
+            remains = max(0, int((dt - now).total_seconds() / 60))
+            if remains > 0:
+                cool_lines.append(f"  *{ticker}*: encore {remains} min")
+        except Exception:
+            pass
+    cool_str = "\n".join(cool_lines) if cool_lines else "  _aucun_"
+
+    # ── Limites pertes ──
+    daily_limit  = AI_FIXED_BUDGET * AI_DAILY_LOSS_MAX
+    weekly_limit = AI_FIXED_BUDGET * AI_WEEKLY_LOSS_MAX
+    daily_loss   = ai_state.get("daily_loss", 0)
+    weekly_loss  = ai_state.get("weekly_loss", 0)
+    d_bar = "🟥" if daily_loss >= daily_limit * 0.8 else "🟨" if daily_loss >= daily_limit * 0.5 else "🟩"
+    w_bar = "🟥" if weekly_loss >= weekly_limit * 0.8 else "🟨" if weekly_loss >= weekly_limit * 0.5 else "🟩"
+
+    msg = (
+        f"📊 *ORACLE — Stats complètes*\n\n"
+        f"*Assets actifs ({len(AI_HIP3_ASSETS)}/4):*\n{prices_str}\n\n"
+        f"*Signaux en cours:*\n{persist_str}\n\n"
+        f"*Positions ouvertes: {len(ai_state['positions'])}/{AI_MAX_POSITIONS}*\n"
+    )
+
+    if ai_state["positions"]:
+        for asset, pos in ai_state["positions"].items():
+            ticker  = asset.split(":")[-1]
+            hl_px   = ai_state["hip3_prices"].get(asset, pos["entry"])
+            pnl_pct = ((hl_px - pos["entry"]) / pos["entry"] * 100) if pos["side"] == "long" \
+                      else ((pos["entry"] - hl_px) / pos["entry"] * 100)
+            em = "🟢" if pnl_pct >= 0 else "🔴"
+            msg += f"  {em} *{ticker}* {pos['side'].upper()} @ ${pos['entry']:.2f} | {pnl_pct:+.2f}%\n"
+
+    msg += (
+        f"\n*Performance:*\n{trades_str}\n"
+        f"*Cooldowns:*\n{cool_str}\n\n"
+        f"*Circuit-breaker:*\n"
+        f"  {d_bar} Jour: ${daily_loss:.1f} / ${daily_limit:.0f}\n"
+        f"  {w_bar} Semaine: ${weekly_loss:.1f} / ${weekly_limit:.0f}\n\n"
+        f"_/oracle\\_stats — ORACLE v2_"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_ai_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3693,15 +4007,10 @@ def main():
 
     # TradeBot
     app.add_handler(CommandHandler("toptraders",    cmd_toptraders))
-    app.add_handler(CommandHandler("tb_historique", cmd_tb_historique))
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
 
     # Copy Trading v4.1
-    app.add_handler(CommandHandler("copy_start",  cmd_copy_start))
-    app.add_handler(CommandHandler("copy_stop",   cmd_copy_stop))
-    app.add_handler(CommandHandler("copy_status", cmd_copy_status))
-    app.add_handler(CommandHandler("copy_close",  cmd_copy_close_all))
 
     # Target Wallet Manuel
     app.add_handler(CommandHandler("target",        cmd_target))
@@ -3713,7 +4022,8 @@ def main():
     app.add_handler(CommandHandler("ai_start",     cmd_ai_start))
     app.add_handler(CommandHandler("ai_stop",      cmd_ai_stop))
     app.add_handler(CommandHandler("ai_status",    cmd_ai_status))
-    app.add_handler(CommandHandler("ai_close_all", cmd_ai_close_all))
+    app.add_handler(CommandHandler("ai_close_all",  cmd_ai_close_all))
+    app.add_handler(CommandHandler("oracle_stats",  cmd_oracle_stats))
     app.add_handler(CommandHandler("ai_history",   cmd_ai_history))
 
     logger.info("🤖 SakaiBot v4.9 démarré — Maker orders + Module IA HIP-3")
