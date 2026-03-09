@@ -2263,7 +2263,7 @@ async def enable_hip3_abstraction() -> bool:
         exchange = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
         loop = asyncio.get_event_loop()
         # user_dex_abstraction(True) = activer le transfert auto de collateral vers HIP-3 DEXs
-        result = await loop.run_in_executor(None, lambda: exchange.user_dex_abstraction(enabled=True))
+        result = await loop.run_in_executor(None, lambda: exchange.user_dex_abstraction(COPY_BOT_ADDRESS, enabled=True))
         logger.info(f"HIP-3 DEX abstraction activée: {result}")
         return True
     except Exception as e:
