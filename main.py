@@ -143,23 +143,50 @@ TRADER_BLACKLIST = {
 # ============================================================
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 
-AI_HIP3_ASSETS = {
-    # ── Énergie ─────────────────────────────────────────────────────────
-    "xyz:CL":  {"name": "WTI Crude Oil",       "yahoo": "CL=F",    "dex": "xyz", "ticker": "CL"},
-    "xyz:NG":  {"name": "Natural Gas",          "yahoo": "NG=F",    "dex": "xyz", "ticker": "NG"},
-    # ── Métaux précieux ──────────────────────────────────────────────────
-    "GOLD":    {"name": "Gold",                 "yahoo": "GC=F",    "dex": "",    "ticker": "GOLD"},
-    "SILVER":  {"name": "Silver",               "yahoo": "SI=F",    "dex": "",    "ticker": "SILVER"},
-    "xyz:HG":  {"name": "Copper",               "yahoo": "HG=F",    "dex": "xyz", "ticker": "HG"},
-    # ── Indices actions ──────────────────────────────────────────────────
-    "xyz:ES":  {"name": "S&P 500 Futures",      "yahoo": "ES=F",    "dex": "xyz", "ticker": "ES"},
-    "xyz:NQ":  {"name": "Nasdaq 100 Futures",   "yahoo": "NQ=F",    "dex": "xyz", "ticker": "NQ"},
-    "xyz:YM":  {"name": "Dow Jones Futures",    "yahoo": "YM=F",    "dex": "xyz", "ticker": "YM"},
-    # ── Forex ────────────────────────────────────────────────────────────
-    "xyz:6E":  {"name": "EUR/USD Futures",      "yahoo": "EURUSD=X","dex": "xyz", "ticker": "6E"},
-    "xyz:6J":  {"name": "JPY/USD Futures",      "yahoo": "JPY=X",   "dex": "xyz", "ticker": "6J"},
-    "xyz:6B":  {"name": "GBP/USD Futures",      "yahoo": "GBPUSD=X","dex": "xyz", "ticker": "6B"},
+# Mapping ticker HIP-3 → symbole Yahoo Finance (pour comparaison prix TradFi)
+YAHOO_SYMBOLS = {
+    "XYZ100":    "NQ=F",      # XYZ100 tracke le Nasdaq 100
+    "GOLD":      "GC=F",
+    "SILVER":    "SI=F",
+    "CL":        "CL=F",
+    "BRENTOIL":  "BZ=F",
+    "NATGAS":    "NG=F",
+    "COPPER":    "HG=F",
+    "PLATINUM":  "PL=F",
+    "PALLADIUM": "PA=F",
+    "ALUMINIUM": "ALI=F",
+    "URANIUM":   "UX=F",
+    "JPY":       "JPY=X",
+    "EUR":       "EURUSD=X",
+    "DXY":       "DX-Y.NYB",
+    "USAR":      "ES=F",      # US index
+    "JP225":     "^N225",
+    "KR200":     "^KS200",
+    "TSLA":      "TSLA",
+    "AAPL":      "AAPL",
+    "NVDA":      "NVDA",
+    "MSFT":      "MSFT",
+    "GOOGL":     "GOOGL",
+    "AMZN":      "AMZN",
+    "META":      "META",
+    "COIN":      "COIN",
+    "AMD":       "AMD",
+    "INTC":      "INTC",
+    "PLTR":      "PLTR",
+    "HOOD":      "HOOD",
+    "MSTR":      "MSTR",
+    "NFLX":      "NFLX",
+    "COST":      "COST",
+    "LLY":       "LLY",
+    "TSM":       "TSM",
+    "BABA":      "BABA",
+    "MU":        "MU",
+    "RIVN":      "RIVN",
+    "GME":       "GME",
+    "ORCL":      "ORCL",
 }
+
+AI_HIP3_ASSETS: dict = {}   # rempli dynamiquement par ai_discover_hip3_assets()
 
 AI_BOT_NAME        = "ORACLE"   # nom du module IA HIP-3
 AI_MAX_POSITIONS   = 2        # 2 positions max → ~$150/trade
@@ -3063,7 +3090,7 @@ async def ai_discover_hip3_assets() -> dict:
     """
     Interroge l'API HL pour lister tous les assets HIP-3 disponibles sur le DEX 'xyz'.
     Retourne un dict {ticker: markPx} des assets actifs (markPx > 0).
-    Met à jour AI_HIP3_ASSETS avec les assets découverts.
+    Remplace entièrement AI_HIP3_ASSETS avec les assets découverts.
     """
     global AI_HIP3_ASSETS
     discovered = {}
@@ -3079,24 +3106,32 @@ async def ai_discover_hip3_assets() -> dict:
         universe = data[0].get("universe", []) if isinstance(data, list) else []
         ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
 
+        new_assets = {}
         for i, asset in enumerate(universe):
-            name    = asset.get("name", "")
-            if i >= len(ctxs):
+            raw_name = asset.get("name", "")   # ex: "TSLA" ou "xyz:TSLA" selon l'API
+            if not raw_name or i >= len(ctxs):
                 continue
             mark_px = float(ctxs[i].get("markPx", 0) or 0)
-            if mark_px > 0 and name:
-                full_name = f"xyz:{name}"
-                discovered[full_name] = mark_px
-                # Ajouter si pas encore dans AI_HIP3_ASSETS
-                if full_name not in AI_HIP3_ASSETS:
-                    AI_HIP3_ASSETS[full_name] = {
-                        "name":   name,
-                        "yahoo":  None,   # pas de référence TradFi connue
-                        "dex":    "xyz",
-                        "ticker": name,
-                    }
+            if mark_px <= 0:
+                continue
 
-        logger.info(f"🔮 ORACLE — {len(discovered)} assets HIP-3 découverts sur DEX xyz: {list(discovered.keys())}")
+            # Le nom dans universe est le ticker brut (ex: "TSLA")
+            # Le nom complet pour trader est "xyz:TSLA"
+            ticker    = raw_name.split(":")[-1]  # strip tout préfixe éventuel
+            full_name = f"xyz:{ticker}"
+
+            discovered[full_name] = mark_px
+            new_assets[full_name] = {
+                "name":   ticker,
+                "yahoo":  YAHOO_SYMBOLS.get(ticker),  # référence TradFi si connue
+                "dex":    "xyz",
+                "ticker": ticker,
+            }
+
+        # Remplace entièrement la liste d'assets
+        AI_HIP3_ASSETS = new_assets
+        logger.info(f"🔮 ORACLE — {len(discovered)} assets HIP-3 actifs: {list(discovered.keys())}")
+
     except Exception as e:
         logger.warning(f"ai_discover_hip3_assets: {e}")
     return discovered
