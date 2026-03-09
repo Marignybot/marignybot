@@ -3243,29 +3243,28 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
 {{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "explication courte"}}"""
 
     try:
-        import urllib.request as _urllib
-        import urllib.error
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.anthropic.com/v1/messages",
+                json={
+                    "model":      "claude-haiku-4-5-20251001",
+                    "max_tokens": 150,
+                    "messages":   [{"role": "user", "content": prompt}],
+                },
+                headers={
+                    "Content-Type":      "application/json",
+                    "x-api-key":         ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    err = body.get("error", {}).get("message", str(body))
+                    logger.error(f"ai_call_claude {asset_name}: HTTP {resp.status} — {err}")
+                    return {"action": "wait", "confidence": 0, "reason": err[:80]}
 
-        payload = json.dumps({
-            "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 150,
-            "messages": [{"role": "user", "content": prompt}]
-        }).encode()
-
-        req = _urllib.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "Content-Type":      "application/json",
-                "x-api-key":         ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-            }
-        )
-        with _urllib.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read())
-
-        text = result["content"][0]["text"].strip()
-        # Nettoyer les balises markdown éventuelles
+        text = body["content"][0]["text"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
 
