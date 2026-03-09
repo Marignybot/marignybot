@@ -154,23 +154,26 @@ def get_anthropic_key() -> str:
 
 # Mapping ticker HIP-3 → symbole Yahoo Finance (pour comparaison prix TradFi)
 YAHOO_SYMBOLS = {
-    "XYZ100":    "NQ=F",      # XYZ100 tracke le Nasdaq 100
+    # ── Indices ────────────────────────────────────────────────
+    "XYZ100":    "NQ=F",      # Nasdaq 100 futures
+    # ── Matières premières ─────────────────────────────────────
     "GOLD":      "GC=F",
     "SILVER":    "SI=F",
-    "CL":        "CL=F",
-    "BRENTOIL":  "BZ=F",
+    "CL":        "CL=F",      # WTI Crude Oil
+    "BRENTOIL":  "BZ=F",      # Brent Crude Oil
     "NATGAS":    "NG=F",
     "COPPER":    "HG=F",
     "PLATINUM":  "PL=F",
     "PALLADIUM": "PA=F",
-    "ALUMINIUM": "ALI=F",
-    "URANIUM":   "UX=F",
-    "JPY":       "JPY=X",
-    "EUR":       "EURUSD=X",
-    "DXY":       "DX-Y.NYB",
-    "USAR":      "ES=F",      # US index
-    "JP225":     "^N225",
-    "KR200":     "^KS200",
+    # ── Forex ──────────────────────────────────────────────────
+    "JPY":       "JPY=X",     # USD/JPY
+    "EUR":       "EURUSD=X",  # EUR/USD
+    # ── ETFs ───────────────────────────────────────────────────
+    "URNM":      "URNM",      # Sprott Uranium Miners ETF
+    "EWY":       "EWY",       # iShares MSCI South Korea ETF
+    "EWJ":       "EWJ",       # iShares MSCI Japan ETF
+    # ── Actions US ─────────────────────────────────────────────
+    "USAR":      "USAR",      # USA Rare Earth (action, pas ES=F !)
     "TSLA":      "TSLA",
     "AAPL":      "AAPL",
     "NVDA":      "NVDA",
@@ -185,14 +188,18 @@ YAHOO_SYMBOLS = {
     "HOOD":      "HOOD",
     "MSTR":      "MSTR",
     "NFLX":      "NFLX",
-    "COST":      "COST",
-    "LLY":       "LLY",
     "TSM":       "TSM",
     "BABA":      "BABA",
     "MU":        "MU",
     "RIVN":      "RIVN",
-    "GME":       "GME",
     "ORCL":      "ORCL",
+    "CRCL":      "CRCL",      # Circle Internet Group
+    "SNDK":      "SNDK",      # Sandisk Corporation
+    # ── Actions Corée (prix KRW → USD via oracle XYZ) ──────────
+    # Pas de feed Yahoo Finance fiable → exclus du module IA
+    # SKHX  : 000660.KS (SK hynix)
+    # SMSN  : 005930.KS (Samsung Electronics)
+    # HYUNDAI: 005380.KS (Hyundai Motor)
 }
 
 AI_HIP3_ASSETS: dict = {}   # rempli dynamiquement par ai_discover_hip3_assets()
@@ -2992,6 +2999,9 @@ async def ai_discover_hip3_assets() -> dict:
         universe = data[0].get("universe", []) if isinstance(data, list) else []
         ctxs     = data[1] if isinstance(data, list) and len(data) > 1 else []
 
+        # Assets Corée exclus du module IA — pas de feed Yahoo Finance fiable
+        KOREAN_ASSETS = {"SKHX", "SMSN", "HYUNDAI"}
+
         new_assets = {}
         for i, asset in enumerate(universe):
             raw_name = asset.get("name", "")
@@ -3004,10 +3014,21 @@ async def ai_discover_hip3_assets() -> dict:
             ticker    = raw_name.split(":")[-1]
             full_name = f"xyz:{ticker}"
 
+            # Exclure les assets Corée (pas de price feed Yahoo)
+            if ticker in KOREAN_ASSETS:
+                logger.debug(f"IA: {ticker} exclu (asset Corée, pas de feed Yahoo)")
+                continue
+
+            # Exclure si pas de mapping Yahoo Finance (IA ne peut pas comparer TradFi/HL)
+            yahoo = YAHOO_SYMBOLS.get(ticker)
+            if not yahoo:
+                logger.debug(f"IA: {ticker} exclu (pas de mapping Yahoo Finance)")
+                continue
+
             discovered[full_name] = mark_px
             new_assets[full_name] = {
                 "name":   ticker,
-                "yahoo":  YAHOO_SYMBOLS.get(ticker),
+                "yahoo":  yahoo,
                 "dex":    "xyz",
                 "ticker": ticker,
             }
