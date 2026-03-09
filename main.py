@@ -162,7 +162,7 @@ AI_HIP3_ASSETS = {
 }
 
 AI_BOT_NAME        = "ORACLE"   # nom du module IA HIP-3
-AI_MAX_POSITIONS   = 4        # max positions IA simultanées (élargi pour 11 assets)
+AI_MAX_POSITIONS   = 2        # 2 positions max → ~$150/trade
 AI_LEVERAGE        = 3        # levier isolated margin HIP-3
 AI_STOP_LOSS_PCT   = 0.15     # -15% stop dur (filet de sécurité)
 AI_TRAIL_PCT       = 0.07     # 7% trailing stop (suit le peak)
@@ -176,9 +176,10 @@ AI_PARTIAL_TP = [
     (0.40, 0.20),   # +40% → ferme encore 20% du solde
     # Le reste (~20%) est géré par le trailing stop 7%
 ]
-AI_SAFETY_BUFFER   = 0.35     # 35% du wallet intouchable
+AI_FIXED_BUDGET    = 300.0    # budget fixe réservé à ORACLE ($)
+AI_SAFETY_BUFFER   = 0.15     # 15% du wallet intouchable (réserve)
 AI_COPY_RESERVE    = 1.2      # facteur sécurité marge copy
-AI_MIN_WALLET      = 500.0    # pause si wallet < $500
+AI_MIN_WALLET      = 300.0    # pause si wallet < $300
 AI_MIN_PREMIUM     = 0.015    # signal min 1.5% premium/discount
 AI_SCAN_INTERVAL   = 300      # scan toutes les 5 min
 AI_FUNDING_SIGNAL  = 0.0003   # seuil funding 0.03%/h
@@ -3019,17 +3020,21 @@ async def ai_compute_budget() -> float:
         if wallet < AI_MIN_WALLET:
             return 0.0
 
-        # Estimer la marge utilisée par le copy trading
+        # Budget ORACLE = min(budget_fixe, budget_dispo_réel) / slots_restants
+        # Budget fixe : $300 réservés à ORACLE indépendamment du copy
+        # Budget réel : wallet × (1 - 15%) - marge_copy × 1.2
         copy_margin = margin - sum(
             pos.get("usd", 0) / AI_LEVERAGE
             for pos in ai_state["positions"].values()
         )
         copy_margin = max(copy_margin, 0)
 
-        slots_used  = len(ai_state["positions"])
-        slots_free  = max(AI_MAX_POSITIONS - slots_used, 1)
+        slots_used = len(ai_state["positions"])
+        slots_free = max(AI_MAX_POSITIONS - slots_used, 1)
 
-        budget = (wallet * (1 - AI_SAFETY_BUFFER) - copy_margin * AI_COPY_RESERVE) / slots_free
+        budget_reel  = (wallet * (1 - AI_SAFETY_BUFFER) - copy_margin * AI_COPY_RESERVE)
+        budget_total = min(AI_FIXED_BUDGET, max(budget_reel, 0))
+        budget       = budget_total / slots_free
         return max(round(budget, 2), 0.0)
     except Exception as e:
         logger.error(f"ai_compute_budget: {e}")
