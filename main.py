@@ -1949,14 +1949,36 @@ async def _build_hip3_exchange() -> "Exchange | None":
             return None
 
         hip3_meta = {"universe": universe}
-        logger.debug(f"HIP-3 meta: {len(universe)} assets — coin_to_asset prêt")
 
-        return Exchange(
-            wallet,
-            hl_constants.MAINNET_API_URL,
-            account_address=COPY_BOT_ADDRESS,
-            meta=hip3_meta
-        )
+        # Construit coin_to_asset manuellement depuis l'univers XYZ
+        # (le SDK ignore meta= sur certaines versions — on patche après construction)
+        try:
+            exc = Exchange(
+                wallet,
+                hl_constants.MAINNET_API_URL,
+                account_address=COPY_BOT_ADDRESS,
+                meta=hip3_meta
+            )
+        except TypeError:
+            # Version SDK sans kwarg meta → construction sans meta
+            exc = Exchange(
+                wallet,
+                hl_constants.MAINNET_API_URL,
+                account_address=COPY_BOT_ADDRESS,
+            )
+
+        # Patch forcé coin_to_asset depuis l'univers XYZ réel
+        exc.coin_to_asset = {
+            asset["name"]: idx
+            for idx, asset in enumerate(universe)
+            if isinstance(asset, dict) and "name" in asset
+        }
+        logger.debug(f"HIP-3 coin_to_asset: {list(exc.coin_to_asset.keys())}")
+
+        if "BRENTOIL" not in exc.coin_to_asset:
+            logger.warning(f"⚠️ BRENTOIL absent de coin_to_asset — univers: {[a.get('name') for a in universe[:5]]}")
+
+        return exc
     except Exception as e:
         logger.error(f"_build_hip3_exchange: {e}")
         return None
