@@ -2804,11 +2804,11 @@ async def ai_sync_positions_from_hl() -> int:
             None, lambda: info.user_state(COPY_BOT_ADDRESS)
         )
         asset_positions = state_data.get("assetPositions", [])
-        logger.info(f"🔄 Sync — {len(asset_positions)} position(s) sur COPY_BOT_ADDRESS")
-        for p in asset_positions:
+        all_nonzero = [p for p in asset_positions if float(p.get("position", {}).get("szi", 0) or 0) != 0]
+        logger.info(f"🔄 Sync — {len(all_nonzero)} position(s) non-nulles sur COPY_BOT_ADDRESS (total assetPositions={len(asset_positions)})")
+        for p in all_nonzero:
             pos = p.get("position", {})
-            if float(pos.get("szi", 0) or 0) != 0:
-                logger.info(f"   → coin={pos.get('coin')} szi={pos.get('szi')} entry={pos.get('entryPx')}")
+            logger.info(f"   → coin={pos.get('coin')} szi={pos.get('szi')} entry={pos.get('entryPx')} unrealPnl={pos.get('unrealizedPnl')}")
 
         # Contexte meta XYZ pour les prix mark courants
         universe, ctxs = await _get_xyz_meta("xyz")
@@ -2953,8 +2953,9 @@ async def ai_sync_positions_from_hl() -> int:
         return restored
 
     except Exception as e:
-        logger.warning(f"ai_sync_positions_from_hl: {e}")
-        import traceback; logger.debug(traceback.format_exc())
+        import traceback
+        logger.error(f"🔄 ai_sync_positions_from_hl ERREUR: {e}")
+        logger.error(traceback.format_exc())
         return 0
 
 
