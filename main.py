@@ -1591,7 +1591,7 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         if sz * price < 10:
             sz = max(round(11.0 / price, rules["decimals"]), rules["min"])
 
-        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+        sdk_coin = asset  # garde "xyz:BRENTOIL" — SDK attend le nom complet
 
         logger.info(f"Ordre {sdk_coin} size={sz} prix={price} ~${sz*price:.1f} x{leverage}")
 
@@ -1897,7 +1897,7 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
         if sz * ref_price < 10:
             sz = max(round(11.0 / ref_price, rules["decimals"]), rules["min"])
 
-        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+        sdk_coin = asset  # garde "xyz:BRENTOIL" — SDK attend le nom complet
 
         logger.info(f"Market {sdk_coin} {'BUY' if is_buy else 'SELL'} sz={sz} ~${sz*ref_price:.0f}")
 
@@ -1932,59 +1932,63 @@ async def _build_exchange() -> "Exchange | None":
 
 async def _build_hip3_exchange() -> "Exchange | None":
     """
-    Construit un Exchange HIP-3 en réutilisant le cache _get_xyz_meta.
-    Évite un appel API supplémentaire et garantit que coin_to_asset
-    est construit avec le même univers que celui utilisé pour les prix.
+    Construit un Exchange pour les ordres XYZ HIP-3.
+
+    La clé : le SDK HL attend le coin avec préfixe ("xyz:BRENTOIL") et
+    Info doit être initialisé avec perp_dexs=["xyz"] pour construire
+    coin_to_asset correctement. SDK >= 0.20.1 requis.
     """
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return None
     try:
+        from hyperliquid.info import Info as HLInfo
         key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
         wallet = eth_account.Account.from_key(key)
 
-        # Réutilise le cache déjà chargé par le scan — pas d'appel API supplémentaire
-        universe, _ctxs = await _get_xyz_meta("xyz")
-        if not universe:
-            logger.error("_build_hip3_exchange: univers XYZ vide")
-            return None
-
-        hip3_meta = {"universe": universe}
-
-        # Construit coin_to_asset manuellement depuis l'univers XYZ
-        # (le SDK ignore meta= sur certaines versions — on patche après construction)
-        try:
-            exc = Exchange(
-                wallet,
+        # Info avec perp_dexs=["xyz"] → coin_to_asset contiendra "xyz:BRENTOIL" etc.
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(
+            None,
+            lambda: HLInfo(
                 hl_constants.MAINNET_API_URL,
-                account_address=COPY_BOT_ADDRESS,
-                meta=hip3_meta
+                skip_ws=True,
+                perp_dexs=["xyz"],
             )
-        except TypeError:
-            # Version SDK sans kwarg meta → construction sans meta
-            exc = Exchange(
-                wallet,
-                hl_constants.MAINNET_API_URL,
-                account_address=COPY_BOT_ADDRESS,
-            )
+        )
 
-        # Patch forcé coin_to_asset depuis l'univers XYZ réel
-        # Le SDK HL utilise self.info.coin_to_asset en interne — on patche les deux
-        _coin_map = {
-            a["name"]: idx
-            for idx, a in enumerate(universe)
-            if isinstance(a, dict) and "name" in a
-        }
-        exc.coin_to_asset = _coin_map
-        if hasattr(exc, "info") and exc.info is not None:
-            exc.info.coin_to_asset = _coin_map
-        logger.info(f"HIP-3 coin_to_asset ({len(_coin_map)} assets): {list(_coin_map.keys())[:8]}...")
+        # Log pour vérification
+        xyz_keys = [k for k in info.coin_to_asset if k.startswith("xyz:")]
+        logger.info(f"HIP-3 Info coin_to_asset XYZ ({len(xyz_keys)}): {xyz_keys[:6]}...")
+        if "xyz:BRENTOIL" not in info.coin_to_asset:
+            logger.error(f"xyz:BRENTOIL absent! Toutes les clés: {list(info.coin_to_asset.keys())}")
 
-        if "BRENTOIL" not in _coin_map:
-            logger.error(f"⚠️ BRENTOIL absent! Univers: {[a.get('name') for a in universe]}")
-
+        exc = Exchange(
+            wallet,
+            hl_constants.MAINNET_API_URL,
+            account_address=COPY_BOT_ADDRESS,
+            info=info,
+        )
         return exc
+    except TypeError:
+        # Vieux SDK sans kwarg info= → fallback manuel
+        logger.warning("_build_hip3_exchange: SDK ancien, fallback meta=")
+        try:
+            from hyperliquid.info import Info as HLInfo
+            key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
+            wallet = eth_account.Account.from_key(key)
+            universe, _ = await _get_xyz_meta("xyz")
+            exc = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
+            # Patch manuel avec préfixe xyz:
+            cmap = {f"xyz:{a['name']}": 100000 + idx for idx, a in enumerate(universe) if "name" in a}
+            exc.coin_to_asset = cmap
+            if hasattr(exc, "info") and exc.info:
+                exc.info.coin_to_asset = cmap
+            return exc
+        except Exception as e2:
+            logger.error(f"_build_hip3_exchange fallback: {e2}")
+            return None
     except Exception as e:
-        logger.error(f"_build_hip3_exchange: {e}")
+        logger.error(f"_build_hip3_exchange: {e}", exc_info=True)
         return None
 
 
@@ -2057,7 +2061,9 @@ async def place_limit_gtc(
             f"{asset} {'BUY' if is_buy else 'SELL'} sz={sz} limit={limit_px} reason={reason}"
         )
 
-        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
+        # Pour HIP-3 le SDK attend le nom complet "xyz:BRENTOIL" (avec préfixe)
+        sdk_coin = asset if ":" in asset else asset
+        logger.info(f"[ORDER] sdk_coin={sdk_coin} in coin_to_asset: {sdk_coin in exchange.coin_to_asset}")
 
         try:
             result = await loop.run_in_executor(
@@ -3309,18 +3315,20 @@ async def ai_set_leverage_hl(asset: str, leverage: int) -> bool:
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return False
     try:
-        ticker   = asset.split(":")[-1] if ":" in asset else asset
-        is_cross = ticker in AI_CROSS_MARGIN_ASSETS
+        # ticker court pour vérifier cross/isolated, nom complet pour le SDK
+        ticker_short = asset.split(":")[-1] if ":" in asset else asset
+        sdk_name     = asset  # "xyz:BRENTOIL" — SDK attend le nom complet
+        is_cross     = ticker_short in AI_CROSS_MARGIN_ASSETS
         exchange = await _build_hip3_exchange()
         if exchange is None:
             return False
         loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: exchange.update_leverage(leverage, ticker, is_cross)
+            lambda: exchange.update_leverage(leverage, sdk_name, is_cross)
         )
         mode = "cross" if is_cross else "isolated"
-        logger.info(f"✅ Levier {ticker} → x{leverage} {mode} | {result}")
+        logger.info(f"✅ Levier {sdk_name} → x{leverage} {mode} | {result}")
         return True
     except Exception as e:
         logger.warning(f"ai_set_leverage_hl {asset} x{leverage}: {e}")
