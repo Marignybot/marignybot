@@ -198,6 +198,34 @@ AI_HIP3_ASSETS: dict = {}   # rempli dynamiquement par ai_discover_hip3_assets()
 # Cache global XYZ : évite de faire N appels API pour N assets
 # Format: {"universe": [...], "ctxs": [...], "ts": float}
 _xyz_meta_cache: dict = {"universe": [], "ctxs": [], "ts": 0.0}
+_macro_cache: dict    = {"data": {}, "ts": 0.0}
+_MACRO_TTL            = 300.0  # 5 min
+# Termes de recherche news par asset (pour le web_search de Claude)
+AI_NEWS_QUERY = {
+    "BRENTOIL":  "Brent crude oil price news today",
+    "CL":        "WTI crude oil price news today",
+    "NATGAS":    "natural gas price news today",
+    "GOLD":      "gold price news today",
+    "SILVER":    "silver price news today",
+    "COPPER":    "copper price news today",
+    "PLATINUM":  "platinum price news today",
+    "PALLADIUM": "palladium price news today",
+    "XYZ100":    "Nasdaq 100 market news today",
+    "TSLA":      "Tesla stock news today",
+    "NVDA":      "NVIDIA stock news today",
+    "AAPL":      "Apple stock news today",
+    "META":      "Meta stock news today",
+    "MSFT":      "Microsoft stock news today",
+    "GOOGL":     "Alphabet Google stock news today",
+    "AMZN":      "Amazon stock news today",
+    "AMD":       "AMD stock news today",
+    "INTC":      "Intel stock news today",
+    "COIN":      "Coinbase stock news today",
+    "MSTR":      "MicroStrategy Bitcoin stock news today",
+    "JPY":       "USD JPY yen news today",
+    "EUR":       "EUR USD euro news today",
+}
+
 _ai_logged_missing: set = set()  # assets sans Yahoo déjà loggés (évite spam)
 _XYZ_CACHE_TTL = 30  # secondes
 
@@ -3201,6 +3229,104 @@ async def ai_get_funding_rate(coin: str, dex: str = "xyz") -> float | None:
         return None
 
 
+
+async def ai_get_macro_context() -> dict:
+    """
+    Récupère les indicateurs macro clés via Yahoo Finance.
+    Cache 5 min pour éviter de spammer Yahoo à chaque scan.
+    Indicateurs : VIX, DXY, S&P500 (SPY), 10Y UST (^TNX), Or (GC=F)
+    """
+    import time
+    global _macro_cache
+    now = time.time()
+    if now - _macro_cache["ts"] < _MACRO_TTL and _macro_cache["data"]:
+        return _macro_cache["data"]
+
+    tickers = {
+        "VIX":  "^VIX",    # peur / volatilité
+        "DXY":  "DX-Y.NYB", # dollar index
+        "SPY":  "SPY",     # S&P500 ETF
+        "TNX":  "^TNX",    # 10Y treasury yield
+    }
+    data = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            for label, ticker in tickers.items():
+                try:
+                    url = (
+                        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+                        f"?interval=1d&range=5d"
+                    )
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                        j = await r.json()
+                    meta   = j["chart"]["result"][0]["meta"]
+                    closes = j["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+                    closes = [x for x in closes if x is not None]
+                    if len(closes) >= 2:
+                        price   = closes[-1]
+                        prev    = closes[-2]
+                        chg_pct = (price - prev) / prev * 100
+                        data[label] = {"price": round(price, 2), "chg": round(chg_pct, 2)}
+                    elif len(closes) == 1:
+                        data[label] = {"price": round(closes[-1], 2), "chg": 0.0}
+                except Exception:
+                    pass
+        _macro_cache = {"data": data, "ts": now}
+    except Exception as e:
+        logger.debug(f"ai_get_macro_context: {e}")
+    return data
+
+
+def _format_macro_for_prompt(macro: dict, category: str) -> str:
+    """Formate le contexte macro pour le prompt Claude, adapté par catégorie d'asset."""
+    if not macro:
+        return ""
+
+    lines = []
+    vix = macro.get("VIX", {})
+    dxy = macro.get("DXY", {})
+    spy = macro.get("SPY", {})
+    tnx = macro.get("TNX", {})
+
+    if vix:
+        level = "ÉLEVÉ 🔴" if vix["price"] > 25 else ("MODÉRÉ 🟡" if vix["price"] > 18 else "BAS 🟢")
+        lines.append(f"VIX: {vix['price']} ({vix['chg']:+.1f}%) — risque {level}")
+
+    if dxy:
+        lines.append(f"DXY: {dxy['price']} ({dxy['chg']:+.1f}%)")
+
+    if spy:
+        trend = "haussier" if spy["chg"] > 0.5 else ("baissier" if spy["chg"] < -0.5 else "neutre")
+        lines.append(f"S&P500: {spy['chg']:+.1f}% (marché {trend})")
+
+    if tnx:
+        lines.append(f"10Y UST: {tnx['price']:.2f}% ({tnx['chg']:+.2f}%)")
+
+    # Interprétation contextuelle par catégorie
+    hints = []
+    if category == "commodities":
+        if dxy and dxy["chg"] > 0.5:
+            hints.append("DXY en hausse → pression baissière sur commodités")
+        if vix and vix["price"] > 25:
+            hints.append("VIX élevé → risk-off, volatilité accrue sur matières premières")
+    elif category == "stocks":
+        if vix and vix["price"] > 25:
+            hints.append("VIX élevé → conditions défavorables aux actions")
+        if spy and spy["chg"] < -1.0:
+            hints.append("SPY en forte baisse → risk-off généralisé")
+    elif category == "indices":
+        if spy and abs(spy["chg"]) > 1.0:
+            hints.append(f"S&P500 fort mouvement ({spy['chg']:+.1f}%) → momentum directeur")
+    elif category == "fx":
+        if dxy and abs(dxy["chg"]) > 0.3:
+            hints.append(f"DXY {'+fort' if dxy['chg']>0 else 'faible'} → impact sur paires USD")
+
+    result = "\nCONTEXTE MACRO:\n" + "\n".join(f"  {l}" for l in lines)
+    if hints:
+        result += "\n  → " + " | ".join(hints)
+    return result
+
+
 async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
                          funding: float, premium_pct: float,
                          existing_pos: dict | None, score: int = 60) -> dict:
@@ -3228,8 +3354,13 @@ async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
 
     cat      = ai_get_asset_category(f"xyz:{asset_name}")
     thresh   = AI_PREMIUM_THRESHOLD.get(cat, (0.020, 0.040))
+    macro    = await ai_get_macro_context()
+    macro_ctx = _format_macro_for_prompt(macro, cat)
+
+    news_query = AI_NEWS_QUERY.get(asset_name, f"{asset_name} price news today")
 
     prompt = f"""Tu es un arbitragiste spécialisé en convergence TradFi/DeFi (Hyperliquid HIP-3).
+Tu as accès à l'outil web_search. Utilise-le pour chercher les news récentes sur cet asset.
 
 ASSET: {asset_name} | Catégorie: {cat}
 Prix HL (perp):    ${hl_price:.4f}
@@ -3238,21 +3369,23 @@ Premium HL/TradFi: {premium_pct:+.2f}%
 Funding (par heure): {funding*100:.4f}%
 Score composite:   {score}/100
 {pos_context}{history_ctx}
-
+{macro_ctx}
 CONTEXTE:
 - Seuil normal pour cet asset: ±{thresh[0]*100:.1f}%
-- Un score >= 75 déclenche un trade automatique. Tu interviens car le score est ambigu ({score}).
-- Arbitrage de convergence: le prix HL DOIT converger vers TradFi à moyen terme.
-- Ne PAS agir si: spread > ±15% (erreur data), signal < 2 scans consécutifs, marché TradFi fermé.
+- Score >= 75 = trade auto. Tu interviens car score ambigu ({score}).
+- Arbitrage de convergence: le prix HL converge vers TradFi à moyen terme.
 
-QUESTION: Est-ce que ce signal de convergence est fiable? Probabilité de convergence dans 24-48h?
-- LONG si HL sous-coté (premium négatif) et convergence probable
-- SHORT si HL surcoté (premium positif) et convergence probable
-- CLOSE si position ouverte avec signal inversé
-- WAIT si données douteuses, signal trop récent, ou marché agité
+INSTRUCTIONS:
+1. Fais une recherche web: "{news_query}"
+2. Analyse: les news soutiennent-elles ou contredisent-elles la convergence?
+3. Pondère signal technique + macro + actualité et décide:
+   - SHORT si HL surcoté ET news neutres/baissières
+   - LONG si HL sous-coté ET news neutres/haussières
+   - WAIT si news très bullish (renforce le premium) ou événement imprévisible
+   - CLOSE si position ouverte avec signal inversé
 
 Réponds UNIQUEMENT en JSON valide, sans markdown:
-{{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "< 80 chars"}}"""
+{{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "< 100 chars"}}"""
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -3260,7 +3393,8 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
                 "https://api.anthropic.com/v1/messages",
                 json={
                     "model":      "claude-haiku-4-5-20251001",
-                    "max_tokens": 150,
+                    "max_tokens": 800,
+                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
                     "messages":   [{"role": "user", "content": prompt}],
                 },
                 headers={
@@ -3276,14 +3410,17 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
                     logger.error(f"ai_call_claude {asset_name}: HTTP {resp.status} — {err}")
                     return {"action": "wait", "confidence": 0, "reason": err[:80]}
 
-        text = body["content"][0]["text"].strip()
-        text = text.replace("```json", "").replace("```", "").strip()
-        # Extrait uniquement le premier objet JSON (Claude peut ajouter du texte après)
-        brace_start = text.find("{")
-        brace_end   = text.rfind("}")
+        # Cherche le JSON dans tous les blocs text (web_search ajoute des blocs tool_use)
+        full_text = " ".join(
+            b.get("text", "") for b in body.get("content", [])
+            if b.get("type") == "text"
+        ).strip()
+        full_text = full_text.replace("```json", "").replace("```", "").strip()
+        brace_start = full_text.find("{")
+        brace_end   = full_text.rfind("}")
         if brace_start != -1 and brace_end != -1:
-            text = text[brace_start:brace_end + 1]
-        return json.loads(text)
+            full_text = full_text[brace_start:brace_end + 1]
+        return json.loads(full_text)
 
     except Exception as e:
         logger.error(f"ai_call_claude {asset_name}: {e}")
@@ -3687,11 +3824,32 @@ async def ai_scan_loop(app) -> None:
                 confidence = 0
 
                 if score >= AI_SCORE_AUTO_TRADE:
-                    # Trade automatique
-                    action     = direction
-                    confidence = score
-                    reason     = f"Score {score}/100 | premium {premium_pct:+.2f}% | persist {persist['count']}"
-                    logger.info(f"IA {ticker}: trade AUTO {action} score={score}")
+                    # Score élevé → direction claire, mais on valide via news + macro
+                    logger.info(f"IA {ticker}: score AUTO {score} → validation news/macro Claude")
+                    decision   = await ai_call_claude(
+                        cfg["name"], hl_price, tradfi_price,
+                        funding, premium_pct, None, score
+                    )
+                    claude_action = decision.get("action", "wait")
+                    confidence    = decision.get("confidence", score)
+                    reason        = decision.get("reason", f"Score {score}/100 | premium {premium_pct:+.2f}%")
+
+                    if claude_action == "wait":
+                        # Claude bloque le trade AUTO (news contradictoire)
+                        action = "wait"
+                        logger.info(f"IA {ticker}: trade AUTO BLOQUÉ par news/macro — {reason}")
+                    elif claude_action in ("long", "short") and claude_action != direction:
+                        # Claude inverse le signal → on fait confiance au score technique
+                        action     = direction
+                        confidence = score
+                        reason     = f"Score {score} override Claude({claude_action}) | {reason}"
+                        logger.info(f"IA {ticker}: Claude inversé, on garde direction score ({direction})")
+                    else:
+                        # Claude confirme ou suit la direction → on trade
+                        action     = direction
+                        confidence = max(score, confidence)
+                        reason     = f"Score {score} ✓ news | {reason}"
+                        logger.info(f"IA {ticker}: trade AUTO CONFIRMÉ news/macro {action} conf={confidence}%")
 
                 elif score >= AI_SCORE_CLAUDE_MIN:
                     # Cas ambigu → appel Claude
