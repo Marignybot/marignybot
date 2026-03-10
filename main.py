@@ -1968,15 +1968,19 @@ async def _build_hip3_exchange() -> "Exchange | None":
             )
 
         # Patch forcé coin_to_asset depuis l'univers XYZ réel
-        exc.coin_to_asset = {
-            asset["name"]: idx
-            for idx, asset in enumerate(universe)
-            if isinstance(asset, dict) and "name" in asset
+        # Le SDK HL utilise self.info.coin_to_asset en interne — on patche les deux
+        _coin_map = {
+            a["name"]: idx
+            for idx, a in enumerate(universe)
+            if isinstance(a, dict) and "name" in a
         }
-        logger.debug(f"HIP-3 coin_to_asset: {list(exc.coin_to_asset.keys())}")
+        exc.coin_to_asset = _coin_map
+        if hasattr(exc, "info") and exc.info is not None:
+            exc.info.coin_to_asset = _coin_map
+        logger.info(f"HIP-3 coin_to_asset ({len(_coin_map)} assets): {list(_coin_map.keys())[:8]}...")
 
-        if "BRENTOIL" not in exc.coin_to_asset:
-            logger.warning(f"⚠️ BRENTOIL absent de coin_to_asset — univers: {[a.get('name') for a in universe[:5]]}")
+        if "BRENTOIL" not in _coin_map:
+            logger.error(f"⚠️ BRENTOIL absent! Univers: {[a.get('name') for a in universe]}")
 
         return exc
     except Exception as e:
@@ -3283,6 +3287,11 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
 
         text = body["content"][0]["text"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
+        # Extrait uniquement le premier objet JSON (Claude peut ajouter du texte après)
+        brace_start = text.find("{")
+        brace_end   = text.rfind("}")
+        if brace_start != -1 and brace_end != -1:
+            text = text[brace_start:brace_end + 1]
         return json.loads(text)
 
     except Exception as e:
