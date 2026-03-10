@@ -100,6 +100,16 @@ SIZE_RULES = {
     "_default": {"min": 0.001, "decimals": 3, "min_usd": 11.0},
 }
 
+def get_size_rules(asset: str) -> dict:
+    """Retourne les règles de taille pour un asset.
+    Priorité: szDecimals XYZ (meta API) > SIZE_RULES hardcodé > _default."""
+    hip3_cfg = AI_HIP3_ASSETS.get(asset, {})
+    if hip3_cfg.get("szDecimals") is not None:
+        sz_dec = hip3_cfg["szDecimals"]
+        min_sz = hip3_cfg.get("minSz", 10 ** -sz_dec)
+        return {"decimals": sz_dec, "min": min_sz, "min_usd": 10.0}
+    return get_size_rules(asset)
+
 # last_ranked conservé pour /toptraders → /target workflow
 copy_last_ranked: list = []
 
@@ -1613,7 +1623,7 @@ async def place_order(asset: str, is_buy: bool, size: float, reason: str = "", l
         decimals  = max(0, 5 - magnitude)
         limit_px  = float(round(raw_px, decimals))
 
-        rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+        rules = get_size_rules(asset)
         sz    = round(size, rules["decimals"])
         sz    = max(sz, rules["min"])
         if sz * price < 10:
@@ -1919,7 +1929,7 @@ async def place_market_order(asset: str, is_buy: bool, size: float,
         decimals  = max(0, 5 - magnitude)
         limit_px  = float(round(raw_px, decimals))
 
-        rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+        rules = get_size_rules(asset)
         sz    = round(size, rules["decimals"])
         sz    = max(sz, rules["min"])
         if sz * ref_price < 10:
@@ -2012,7 +2022,7 @@ def _round_price(raw: float) -> float:
 
 
 def _round_size(asset: str, size: float, ref_price: float) -> float:
-    rules = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+    rules = get_size_rules(asset)
     sz    = round(size, rules["decimals"])
     sz    = max(sz, rules["min"])
     if sz * ref_price < 10:
@@ -2171,7 +2181,7 @@ async def compute_target_ratio(trader_address: str) -> float | None:
 
 def compute_my_size(asset: str, trader_size: float, trader_price: float,
                     ratio: float) -> float:
-    rules    = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+    rules    = get_size_rules(asset)
     raw_size = trader_size * ratio
     sz       = max(round(raw_size, rules["decimals"]), rules["min"])
     if sz * trader_price < 10:
@@ -2324,8 +2334,8 @@ async def process_target_event(address: str, msg: dict, app) -> None:
 
             trader_pos_size = trader_info.get("open_sizes", {}).get(asset, size)
             close_ratio     = min(size / max(trader_pos_size, 0.0001), 1.0)
-            my_close_size   = round(my_pos["size"] * close_ratio, SIZE_RULES.get(asset, SIZE_RULES["_default"])["decimals"])
-            my_close_size   = max(my_close_size, SIZE_RULES.get(asset, SIZE_RULES["_default"])["min"])
+            my_close_size   = round(my_pos["size"] * close_ratio, get_size_rules(asset)["decimals"])
+            my_close_size   = max(my_close_size, get_size_rules(asset)["min"])
 
             is_close_buy = my_pos["side"] == "short"
             result       = await place_limit_gtc(asset, is_close_buy, my_close_size, dir_fill)
@@ -2336,7 +2346,7 @@ async def process_target_event(address: str, msg: dict, app) -> None:
                 trader_info.get("open_sizes", {}).pop(asset, None)
             else:
                 my_pos["size"] = round(my_pos["size"] - my_close_size,
-                                       SIZE_RULES.get(asset, SIZE_RULES["_default"])["decimals"])
+                                       get_size_rules(asset)["decimals"])
 
             status = "✅" if "error" not in result else "❌"
             label  = trader_info.get("label", address[:16])
@@ -3147,14 +3157,19 @@ async def ai_discover_hip3_assets() -> dict:
             funding = float(ctx.get("funding", 0) or 0)
             full_name = f"xyz:{ticker}"
 
+            sz_dec  = int(asset_meta.get("szDecimals", 3))
+            min_sz  = float(asset_meta.get("minSz", 0)) or (10 ** -sz_dec)
+
             discovered[full_name] = mark_px
             new_assets[full_name] = {
-                "name":    ticker,
-                "yahoo":   yahoo,
-                "dex":     "xyz",
-                "ticker":  ticker,
-                "vol24h":  vol24h,
-                "funding": funding,
+                "name":       ticker,
+                "yahoo":      yahoo,
+                "dex":        "xyz",
+                "ticker":     ticker,
+                "vol24h":     vol24h,
+                "funding":    funding,
+                "szDecimals": sz_dec,
+                "minSz":      min_sz,
             }
 
         AI_HIP3_ASSETS = new_assets
@@ -3375,13 +3390,24 @@ CONTEXTE:
 - Score >= 75 = trade auto. Tu interviens car score ambigu ({score}).
 - Arbitrage de convergence: le prix HL converge vers TradFi à moyen terme.
 
+RÈGLE CRITIQUE — PREMIUM LÉGITIME:
+Le premium HL peut être LÉGITIME (pas une anomalie à shorter) si les news révèlent:
+- Conflit armé, frappe militaire, ou escalade géopolitique majeure (Moyen-Orient, Russie, etc.)
+- Sanction économique soudaine sur un pays producteur
+- Blocage d'infrastructure critique (détroit d'Ormuz, pipeline, port majeur)
+- Catastrophe naturelle affectant la production ou le transport
+- Annonce OPEC de réduction de production surprise
+Dans ces cas → WAIT obligatoire, le premium peut persister plusieurs jours.
+
 INSTRUCTIONS:
 1. Fais une recherche web: "{news_query}"
-2. Analyse: les news soutiennent-elles ou contredisent-elles la convergence?
+2. Vérifie: y a-t-il un événement géopolitique/structurel qui JUSTIFIE ce premium?
+   → Si oui: WAIT (le premium est légitime, pas d'arbitrage possible)
+   → Si non (spike technique, sentiment, rumeur): continue l'analyse
 3. Pondère signal technique + macro + actualité et décide:
-   - SHORT si HL surcoté ET news neutres/baissières
+   - SHORT si HL surcoté ET cause technique/sentiment (pas structurelle)
    - LONG si HL sous-coté ET news neutres/haussières
-   - WAIT si news très bullish (renforce le premium) ou événement imprévisible
+   - WAIT si événement géopolitique majeur, news contradictoires, ou volatilité extrême
    - CLOSE si position ouverte avec signal inversé
 
 Réponds UNIQUEMENT en JSON valide, sans markdown:
@@ -3460,7 +3486,17 @@ async def ai_set_leverage_hl(asset: str, leverage: int) -> bool:
 async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
                            current_price: float, reason: str, app) -> bool:
     leverage = ai_get_leverage(asset)
-    rules    = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+
+    # Priorité : szDecimals XYZ (meta API) > SIZE_RULES hardcodé
+    hip3_cfg = AI_HIP3_ASSETS.get(asset, {})
+    if hip3_cfg.get("szDecimals") is not None:
+        sz_dec  = hip3_cfg["szDecimals"]
+        min_sz  = hip3_cfg.get("minSz", 10 ** -sz_dec)
+        rules   = {"decimals": sz_dec, "min": min_sz, "min_usd": 10.0}
+        logger.debug(f"ai_open_position {asset}: szDecimals={sz_dec} minSz={min_sz} (XYZ meta)")
+    else:
+        rules   = get_size_rules(asset)
+
     my_size  = max(round(budget_usd / current_price, rules["decimals"]), rules["min"])
 
     # ── Forcer le levier isolated AVANT l'ordre ──
@@ -3622,7 +3658,7 @@ async def ai_check_stop_losses(app) -> None:
             if threshold in levels_hit:
                 continue
             if pnl_pct_now >= threshold * 100:
-                rules         = SIZE_RULES.get(asset, SIZE_RULES["_default"])
+                rules         = get_size_rules(asset)
                 close_size    = round(pos["size"] * close_ratio, rules["decimals"])
                 close_size    = max(close_size, rules["min"])
                 close_usd     = close_size * price
