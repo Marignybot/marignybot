@@ -132,7 +132,7 @@ EVENING_MIN_UTC           = 0
 # ============================================================
 TRADEBOT_MIN_TRADES      = 1     # [v4.5] log(n) gere nativement score=0 pour 0 trade
 TRADEBOT_MAX_TRADES_DAY  = 36   # [v6.0] filtre dur scalper: > 250 trades/semaine (≈36/j) → pénalité score
-TRADEBOT_MAX_DRAWDOWN    = 65.0   # filtre dur MDD (v4.8: pénalisé fortement par mdd_factor au-dessus de 40%)
+TRADEBOT_MAX_DRAWDOWN    = 85.0   # filtre dur MDD (v4.9: HL dominé par traders agressifs, MDD médian élevé)
 TRADEBOT_MIN_AGE_DAYS    = 60     # v4.2: 90→60j (HL plateforme récente)
 TRADEBOT_EXCELLENT_RATIO = 5.0
 
@@ -1278,96 +1278,100 @@ def rank_and_score_traders(traders: list) -> list:
 
     avant = len(traders)
 
+    # ── Filtres durs v7 : swing trader WR+MDD oriented ─────────────────────
+    # MDD : éliminer les catastrophes (> 85%)
     traders = [t for t in traders if t.get("mdd", 999) <= TRADEBOT_MAX_DRAWDOWN]
-    traders = [t for t in traders if t.get("winrate", 0) >= 45]
-    traders = [t for t in traders if t.get("pnl_at", 0) > 0]
-
+    # WR minimum 50% (swing traders peuvent avoir peu de trades → tolérance)
+    traders = [t for t in traders if t.get("winrate", 0) >= 50]
+    # Pas de lucky shot : PnL 7j ne peut pas représenter > 90% du PnL 30j
     avant_oww = len(traders)
-    traders = [t for t in traders if t.get("pnl_7j", 0) <= t.get("pnl", 1e9)]
-    logger.info(f"Filtre one-week-wonder: {avant_oww - len(traders)} exclus")
+    traders = [t for t in traders if not (
+        t.get("pnl_7j", 0) > 0
+        and t.get("pnl", 0) > 0
+        and t.get("pnl_7j", 0) / max(t.get("pnl", 1), 1) > 0.90
+    )]
+    logger.info(f"Filtre lucky-shot: {avant_oww - len(traders)} exclus")
+    # PnL 30j doit être positif (performance récente)
+    traders = [t for t in traders if t.get("pnl", 0) > 0]
 
-    logger.info(f"Filtres v6: {len(traders)}/{avant} traders retenus")
+    logger.info(f"Filtres v7: {len(traders)}/{avant} traders retenus")
     if not traders:
         return []
 
-    def compute_score_v6(t):
+    def compute_score_v7(t):
+        """
+        Score v7 — orienté swing trader : WR + MDD prioritaires
+        Formule : WR_score × MDD_score × PnL_score × Swing_bonus
+        Poids : WR 40% | MDD 35% | PnL_momentum 25%
+        """
         pnl_7j      = t.get("pnl_7j", 0)
         pnl_30j     = t.get("pnl", 0)
-        pnl_at      = t.get("pnl_at", 0)
-        capital     = max(t.get("capital", 1), 1)
         mdd         = t.get("mdd", 100)
         winrate     = t.get("winrate", 0)
         winrate_30  = t.get("winrate_30j", 0)
         n_trades_7j = t.get("n_trades_7j", 0)
-        age_days    = max(t.get("age_days", 365), 1)
-        margin_used = t.get("margin_ratio", 0.0)
 
-        annualized_roi = (pnl_at / capital) * (365.0 / age_days) * 100
-        seuil_annuel   = 50.0 * min(age_days / 90.0, 1.0)
-
-        if annualized_roi <= 0:
-            return 0.0
-        elif annualized_roi >= seuil_annuel * 2:
-            annualized_factor = 1.0
-        elif annualized_roi >= seuil_annuel:
-            annualized_factor = 0.6 + 0.4 * (annualized_roi / (seuil_annuel * 2))
-        else:
-            annualized_factor = max(0.1, 0.3 * (annualized_roi / max(seuil_annuel, 1)))
-
-        if pnl_30j <= 0:
-            momentum_factor = 0.5
-        else:
-            semaine_ratio = pnl_7j / max(pnl_30j, 1)
-            if semaine_ratio >= 0.25:
-                momentum_factor = 1.0
-            elif semaine_ratio >= 0.10:
-                momentum_factor = 0.75 + semaine_ratio
-            elif semaine_ratio >= 0:
-                momentum_factor = 0.75
-            else:
-                momentum_factor = 0.5
-
-        if pnl_7j > 0 and pnl_30j > 0:
-            ratio       = pnl_30j / max(pnl_7j, 1)
-            consistency = min(ratio / 4.0, 1.0)
-        else:
-            consistency = 0.5
-
-        # winrate et winrate_30 sont maintenant calculés depuis fills réels
-        # → on prend le meilleur des deux (7j ou 30j selon disponibilité)
+        # ── WR score (poids 40%) ─────────────────────────────────────────
         best_wr = max(winrate, winrate_30) / 100.0
         if best_wr >= 0.80:
-            wr_factor = 1.0                          # excellent (ex: 99%)
-        elif best_wr >= 0.65:
-            wr_factor = min(best_wr * 1.15, 1.0)
+            wr_score = 1.0          # exceptionnel
+        elif best_wr >= 0.70:
+            wr_score = 0.85 + (best_wr - 0.70) * 1.5
+        elif best_wr >= 0.60:
+            wr_score = 0.65 + (best_wr - 0.60) * 2.0
         elif best_wr >= 0.50:
-            wr_factor = best_wr
-        elif best_wr >= 0.45:
-            wr_factor = best_wr ** 1.5
+            wr_score = 0.40 + (best_wr - 0.50) * 2.5
         else:
-            wr_factor = best_wr ** 2
+            return 0.0              # déjà filtré mais sécurité
 
-        mdd_factor = max(0.02, 1.0 - (mdd / 85.0) ** 1.8)
-
-        if n_trades_7j <= 250:
-            scalper_factor = 1.0
-        elif n_trades_7j <= 500:
-            scalper_factor = 1.0 - 0.8 * ((n_trades_7j - 250) / 250.0)
+        # ── MDD score (poids 35%) ────────────────────────────────────────
+        if mdd <= 15:
+            mdd_score = 1.0         # excellent risk management
+        elif mdd <= 30:
+            mdd_score = 0.85 - (mdd - 15) * 0.01
+        elif mdd <= 50:
+            mdd_score = 0.60 - (mdd - 30) * 0.015
+        elif mdd <= 70:
+            mdd_score = 0.30 - (mdd - 50) * 0.01
         else:
-            scalper_factor = max(0.05, 0.2 * (250.0 / n_trades_7j))
+            mdd_score = max(0.05, 0.10 - (mdd - 70) * 0.003)
 
-        if margin_used <= 0.60:
-            margin_factor = 1.0
-        elif margin_used <= 0.80:
-            margin_factor = 1.0 - 0.5 * ((margin_used - 0.60) / 0.20)
+        # ── PnL momentum (poids 25%) ─────────────────────────────────────
+        # PnL 7j ET 30j positifs = bon momentum
+        if pnl_30j <= 0:
+            pnl_score = 0.2
+        elif pnl_7j <= 0:
+            pnl_score = 0.5         # 30j positif mais semaine négative
         else:
-            margin_factor = max(0.2, 0.5 - 1.5 * (margin_used - 0.80))
+            # Régularité : ratio 7j/30j idéal entre 20-40%
+            ratio_7_30 = pnl_7j / max(pnl_30j, 1)
+            if 0.15 <= ratio_7_30 <= 0.50:
+                pnl_score = 1.0     # gain régulier
+            elif ratio_7_30 > 0.50:
+                pnl_score = 0.7     # semaine trop dominante (lucky shot partiel)
+            else:
+                pnl_score = 0.6     # semaine faible mais 30j bon
 
-        score = (annualized_factor * momentum_factor * consistency
-                 * wr_factor * mdd_factor * scalper_factor * margin_factor)
+        # ── Bonus swing trader ────────────────────────────────────────────
+        # Peu de trades = swing → bonus
+        # Trop de trades = scalper → malus
+        if n_trades_7j == 0:
+            swing_bonus = 0.8       # inactif cette semaine
+        elif n_trades_7j <= 20:
+            swing_bonus = 1.2       # swing parfait (1-3 trades/jour)
+        elif n_trades_7j <= 50:
+            swing_bonus = 1.1       # swing correct
+        elif n_trades_7j <= 150:
+            swing_bonus = 1.0       # normal
+        elif n_trades_7j <= 250:
+            swing_bonus = 0.75      # un peu actif
+        else:
+            swing_bonus = max(0.2, 0.75 - (n_trades_7j - 250) / 500.0)  # scalper
+
+        score = (0.40 * wr_score + 0.35 * mdd_score + 0.25 * pnl_score) * swing_bonus
         return max(score, 0.0)
 
-    raw_scores = [compute_score_v6(t) for t in traders]
+    raw_scores = [compute_score_v7(t) for t in traders]
     max_raw = max(raw_scores) if raw_scores else 1.0
     if max_raw <= 0:
         max_raw = 1.0
@@ -1382,9 +1386,11 @@ def rank_and_score_traders(traders: list) -> list:
 def apply_exclusion_filters(traders: list) -> list:
     filtered = [
         t for t in traders
-        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN and t.get("pnl_at", 0) > 0
+        if t["mdd"] <= TRADEBOT_MAX_DRAWDOWN
+        and t.get("pnl_7j", 0) > -50000   # exclure catastrophes
+        and t.get("n_trades_7j", 0) >= 3   # minimum d'activité
     ]
-    logger.info(f"Après filtres: {len(filtered)}/{len(traders)} traders retenus")
+    logger.info(f"Après filtres: {len(filtered)}/{len(traders)} traders retenus (MDD<={TRADEBOT_MAX_DRAWDOWN}%)")
     return filtered
 
 
