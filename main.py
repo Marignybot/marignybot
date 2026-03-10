@@ -2674,6 +2674,88 @@ def ai_save_state() -> None:
         logger.error(f"ai_save_state: {e}")
 
 
+async def ai_sync_positions_from_hl() -> int:
+    """
+    Au démarrage, récupère les positions ouvertes sur HL pour le wallet ORACLE
+    et les injecte dans ai_state["positions"] pour éviter les doublons après redéploiement.
+    Retourne le nombre de positions récupérées.
+    """
+    if not _HL_SDK_AVAILABLE:
+        return 0
+    try:
+        info = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: HLInfo(MAINNET_API_URL, skip_ws=True, perp_dexs=["xyz"])
+        )
+        state_data = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: info.user_state(HYPERLIQUID_ADDRESS)
+        )
+        asset_positions = state_data.get("assetPositions", [])
+
+        # Construire un mapping ticker → asset complet depuis AI_HIP3_ASSETS
+        ticker_to_asset = {v["ticker"]: k for k, v in AI_HIP3_ASSETS.items()}
+
+        restored = 0
+        for pos_wrap in asset_positions:
+            pos = pos_wrap.get("position", {})
+            coin = pos.get("coin", "")
+            szi  = float(pos.get("szi", 0) or 0)
+            if szi == 0:
+                continue
+
+            # coin peut être "xyz:BRENTOIL" ou "BRENTOIL"
+            ticker = coin.split(":")[-1]
+            asset  = f"xyz:{ticker}"
+
+            # Ignorer si pas dans notre univers ORACLE
+            if asset not in AI_HIP3_ASSETS and ticker not in ticker_to_asset:
+                continue
+
+            if asset not in AI_HIP3_ASSETS:
+                asset = ticker_to_asset.get(ticker, asset)
+
+            # Déjà dans ai_state → on ne touche pas
+            if asset in ai_state["positions"]:
+                continue
+
+            entry_px = float(pos.get("entryPx", 0) or 0)
+            side     = "long" if szi > 0 else "short"
+            size     = abs(szi)
+            leverage = ai_get_leverage(asset)
+            usd      = round(size * entry_px, 2)
+            stop_pct = AI_STOP_LOSS_PCT
+            stop_px  = round(
+                entry_px * (1 - stop_pct) if side == "long"
+                else entry_px * (1 + stop_pct), 4
+            )
+
+            ai_state["positions"][asset] = {
+                "side":            side,
+                "size":            size,
+                "entry":           entry_px,
+                "peak":            entry_px,
+                "stop":            stop_px,
+                "usd":             usd,
+                "time":            datetime.now().strftime("%d/%m %H:%M"),
+                "entry_time":      datetime.now(timezone.utc).isoformat(),
+                "trail_pct":       ai_get_trail_pct(asset),
+                "tp_levels_hit":   [],
+                "reinforce_count": 0,
+                "entry_premium":   0.0,
+                "restored":        True,   # flag pour savoir que c'est une position restaurée
+            }
+            restored += 1
+            logger.info(f"🔄 Position restaurée depuis HL: {asset} {side.upper()} sz={size} entry={entry_px}")
+
+        if restored > 0:
+            ai_save_state()
+            logger.info(f"🔄 {restored} position(s) restaurée(s) depuis Hyperliquid")
+        return restored
+
+    except Exception as e:
+        logger.warning(f"ai_sync_positions_from_hl: {e}")
+        return 0
+
+
 def ai_load_state() -> None:
     try:
         if not os.path.exists(AI_STATE_FILE):
@@ -4104,6 +4186,15 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🔍 Découverte des assets HIP-3...", parse_mode="Markdown")
     discovered = await ai_discover_hip3_assets()
+
+    # Synchroniser les positions déjà ouvertes sur HL (évite doublons après redéploiement)
+    restored = await ai_sync_positions_from_hl()
+    if restored > 0:
+        await update.message.reply_text(
+            f"🔄 *{restored} position(s) restaurée(s)* depuis Hyperliquid\n"
+            f"_Le bot reprend le suivi sans réouvrir de positions existantes._",
+            parse_mode="Markdown"
+        )
 
     budget     = await ai_compute_budget()
     active_str = " • ".join(f"{k} (${v:.2f})" for k, v in discovered.items()) if discovered else "aucun trouvé"
