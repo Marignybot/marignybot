@@ -2820,6 +2820,13 @@ async def ai_sync_positions_from_hl() -> int:
 
         ticker_to_asset = {v["ticker"]: k for k, v in AI_HIP3_ASSETS.items()}
 
+        # Effacer les positions chargées depuis ai_state.json (état stale)
+        # On va les reconstruire proprement depuis HL ci-dessous
+        stale = list(ai_state["positions"].keys())
+        if stale:
+            logger.info(f"🔄 Effacement de {len(stale)} position(s) stale du JSON: {stale}")
+            ai_state["positions"].clear()
+
         restored = 0
         for pos_wrap in asset_positions:
             pos  = pos_wrap.get("position", {})
@@ -2831,11 +2838,11 @@ async def ai_sync_positions_from_hl() -> int:
             ticker = coin.split(":")[-1]
             asset  = f"xyz:{ticker}"
 
-            if asset not in AI_HIP3_ASSETS and ticker not in ticker_to_asset:
-                continue
+            # Matching flexible : avec ou sans préfixe xyz:
             if asset not in AI_HIP3_ASSETS:
                 asset = ticker_to_asset.get(ticker, asset)
-            if asset in ai_state["positions"]:
+            if asset not in AI_HIP3_ASSETS:
+                logger.info(f"🔄 Sync — asset ignoré (hors univers ORACLE): coin={coin}")
                 continue
 
             entry_px   = float(pos.get("entryPx", 0) or 0)
