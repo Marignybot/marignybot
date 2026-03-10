@@ -2048,7 +2048,7 @@ async def place_limit_gtc(
 
         # Pour HIP-3 le SDK attend le nom complet "xyz:BRENTOIL" (avec préfixe)
         sdk_coin = asset if ":" in asset else asset
-        logger.info(f"[ORDER] sdk_coin={sdk_coin} in coin_to_asset: {sdk_coin in exchange.coin_to_asset}")
+        logger.info(f"[ORDER] sdk_coin={sdk_coin} in info.coin_to_asset: {sdk_coin in exchange.info.coin_to_asset}")
 
         try:
             result = await loop.run_in_executor(
