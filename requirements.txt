@@ -2,4 +2,5 @@ python-telegram-bot[job-queue]==20.7
 aiohttp==3.9.5
 websockets
 eth-account
-hyperliquid-python-sdk
+hyperliquid-python-sdk>=0.20.1
+anthropic
