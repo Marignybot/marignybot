@@ -3968,34 +3968,9 @@ async def cmd_ai_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ============================================================
 def main():
-    token = TELEGRAM_TOKEN
-    base  = f"https://api.telegram.org/bot{token}"
-
-    # ── Attente initiale Railway zero-downtime ────────────────
-    logger.info("⏳ Attente 30s — libération du slot Telegram (Railway zero-downtime)...")
-    time_module.sleep(30)
-
-    # ── [FIX v4.9] Slot stealing agressif ────────────────────
-    # timeout=30 : on TIENT le slot 30 secondes via long-poll
-    # → l'ancienne instance reçoit un 409, cesse de poller, meurt proprement
-    # timeout=0 (ancienne valeur) retournait immédiatement → l'ancienne instance
-    # reprenait le slot dans la foulée → ping-pong 409 infini
-    for attempt in range(20):
-        try:
-            urllib.request.urlopen(
-                f"{base}/deleteWebhook?drop_pending_updates=true", timeout=5
-            )
-            # Long-poll timeout=30 → bloque l'ancienne instance pendant 30s
-            urllib.request.urlopen(
-                f"{base}/getUpdates?offset=-1&timeout=30&limit=1", timeout=35
-            )
-            logger.info(f"✅ Slot Telegram libéré (attempt {attempt+1})")
-            break
-        except Exception as e:
-            logger.warning(f"Init HTTP attempt {attempt+1}/20: {e}")
-            time_module.sleep(5)
-
-    time_module.sleep(5)  # laisser le slot "refroidir"
+    # Attente courte pour laisser Railway tuer l'ancien conteneur
+    logger.info("⏳ Attente 10s avant démarrage...")
+    time_module.sleep(10)
 
     app = (
         Application.builder()
@@ -4007,28 +3982,10 @@ def main():
         .build()
     )
 
-    # ── [FIX v4.9] Error handler — vol actif du slot ─────────
-    # Au lieu de juste dormir 45s (l'ancienne instance reprenait le slot),
-    # on lance un thread qui fait getUpdates timeout=30 → bloque l'ancien
     async def error_handler(update, context):
         if isinstance(context.error, Conflict):
-            logger.warning("⚠️ Conflit — vol du slot Telegram en cours...")
-
-            def _steal_slot():
-                for i in range(5):
-                    try:
-                        urllib.request.urlopen(
-                            f"{base}/getUpdates?offset=-1&timeout=30&limit=1",
-                            timeout=35
-                        )
-                        logger.info(f"✅ Slot volé (error_handler tentative {i+1})")
-                        break
-                    except Exception as e:
-                        logger.warning(f"Vol slot tentative {i+1}/5: {e}")
-                        time_module.sleep(3)
-
-            threading.Thread(target=_steal_slot, daemon=True).start()
-            await asyncio.sleep(35)
+            logger.warning("⚠️ Conflit Telegram détecté — nouvelle tentative dans 5s...")
+            await asyncio.sleep(5)
         else:
             logger.error(f"Erreur: {context.error}")
 
