@@ -2803,12 +2803,28 @@ async def ai_sync_positions_from_hl() -> int:
         state_data = await asyncio.get_event_loop().run_in_executor(
             None, lambda: info.user_state(COPY_BOT_ADDRESS)
         )
+        # Logger toutes les clés de state_data pour voir où sont les positions XYZ
+        logger.info(f"🔄 Clés state_data COPY_BOT: {list(state_data.keys())}")
         asset_positions = state_data.get("assetPositions", [])
         all_nonzero = [p for p in asset_positions if float(p.get("position", {}).get("szi", 0) or 0) != 0]
         logger.info(f"🔄 Sync — {len(all_nonzero)} position(s) non-nulles sur COPY_BOT_ADDRESS (total assetPositions={len(asset_positions)})")
         for p in all_nonzero:
             pos = p.get("position", {})
             logger.info(f"   → coin={pos.get('coin')} szi={pos.get('szi')} entry={pos.get('entryPx')} unrealPnl={pos.get('unrealizedPnl')}")
+
+        # Vérifier aussi HYPERLIQUID_ADDRESS — la position XYZ est peut-être là
+        state_master = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: info.user_state(HYPERLIQUID_ADDRESS)
+        )
+        master_positions = state_master.get("assetPositions", [])
+        master_nonzero = [p for p in master_positions if float(p.get("position", {}).get("szi", 0) or 0) != 0]
+        logger.info(f"🔄 Sync — {len(master_nonzero)} position(s) non-nulles sur HYPERLIQUID_ADDRESS")
+        for p in master_nonzero:
+            pos = p.get("position", {})
+            logger.info(f"   → coin={pos.get('coin')} szi={pos.get('szi')} entry={pos.get('entryPx')} unrealPnl={pos.get('unrealizedPnl')}")
+
+        # Merger les deux listes pour le matching
+        asset_positions = asset_positions + master_positions
 
         # Contexte meta XYZ pour les prix mark courants
         universe, ctxs = await _get_xyz_meta("xyz")
