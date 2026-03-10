@@ -9,7 +9,7 @@ SakaiBot v4.9 — Bot Telegram Hyperliquid
   - [OPT] MAKER orders partout (place_limit_gtc) : ouverture, renfort, allègement, clôture normale
   - [OPT] LIMIT_MAKER_OFFSET=0.03% du mid-price → statut maker, fees ~0 voire rebate -0.01%
   - [OPT] Retry loop (LIMIT_MAX_RETRIES=3 × LIMIT_RETRY_WAIT=8s) + annulation + fallback market
-  - [OPT] force_market=True pour /copy_close et /target_stop (urgence sortie rapide)
+  - [OPT] force_market=True pour /target_stop (urgence sortie rapide)
   - [OPT] place_market_order conservé UNIQUEMENT pour stop-loss urgence et fallback interne
   v4.2:
   - [FIX] Seuil MDD: 60% → 85% (HL dominé par traders agressifs, MDD médian 97%)
@@ -536,18 +536,24 @@ def volume_signal(volumes: list) -> str:
 
 
 def calc_mdd(hist: list) -> float:
-    """[OPT] Helper MDD extrait — évite la duplication dans fetch_portfolio."""
+    """MDD peak-to-trough relatif sur la série.
+    Utilise le peak glissant (pas le point de départ) pour éviter
+    le bug sur les comptes qui ont grandi depuis quasi zéro."""
     if not hist:
         return 0.0
-    pk = mdd = 0.0
-    pk = hist[0]
+    # Filtrer les valeurs nulles ou négatives (artefacts API)
+    hist = [v for v in hist if v > 0]
+    if len(hist) < 2:
+        return 0.0
+    pk  = hist[0]
+    mdd = 0.0
     for v in hist:
         if v > pk:
             pk = v
-        dd = (pk - v) / pk * 100 if pk > 0 else 0
+        dd = (pk - v) / pk * 100
         if dd > mdd:
             mdd = dd
-    return mdd
+    return round(mdd, 2)
 
 
 def build_token_analysis(symbol: str, change: float, ohlcv: dict) -> str:
@@ -1168,9 +1174,28 @@ async def fetch_top_traders_hl() -> list:
                     base_30j   = max(cap_30 - pnl_30j, 1)
                     roi_30j    = min((pnl_30j / base_30j) * 100, 2000)
 
-                    # WinRate 30j
-                    wins_30j    = sum(1 for i in range(1, len(pnl_h30)) if pnl_h30[i] > pnl_h30[i-1])
-                    winrate_30j = (wins_30j / max(len(pnl_h30) - 1, 1)) * 100
+                    # WinRate 30j — depuis fills réels (même logique que Inspector)
+                    cutoff_30j = now_ms - (30 * 86400 * 1000)
+                    if isinstance(fills, list):
+                        fills_30j    = [f for f in fills if isinstance(f, dict)
+                                        and f.get("time", 0) >= cutoff_30j
+                                        and float(f.get("closedPnl", 0) or 0) != 0]
+                        fills_at_wr  = [f for f in fills if isinstance(f, dict)
+                                        and float(f.get("closedPnl", 0) or 0) != 0]
+                    else:
+                        fills_30j = fills_at_wr = []
+
+                    if len(fills_30j) >= 5:
+                        wins_30j    = sum(1 for f in fills_30j if float(f.get("closedPnl", 0)) > 0)
+                        winrate_30j = (wins_30j / len(fills_30j)) * 100
+                    elif len(fills_at_wr) >= 5:
+                        # Peu de trades sur 30j (swing trader) → winrate all-time
+                        wins_at_wr  = sum(1 for f in fills_at_wr if float(f.get("closedPnl", 0)) > 0)
+                        winrate_30j = (wins_at_wr / len(fills_at_wr)) * 100
+                    else:
+                        # Fallback proxy pnlHistory
+                        wins_30j    = sum(1 for i in range(1, len(pnl_h30)) if pnl_h30[i] > pnl_h30[i-1])
+                        winrate_30j = (wins_30j / max(len(pnl_h30) - 1, 1)) * 100
 
                     # AllTime PnL
                     pnl_hat = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
@@ -1190,9 +1215,17 @@ async def fetch_top_traders_hl() -> list:
                         )
                         return None
 
-                    if winrate_7j < 45.0:
+                    # Filtre winrate : assoupli pour swing traders (peu de trades 7j)
+                    # Si < 5 fills sur 7j, on utilise le winrate all-time comme référence
+                    wr_reference = winrate_7j
+                    if len(fills_7j) < 5 and fills_at_wr:
+                        wins_at  = sum(1 for f in fills_at_wr if float(f.get("closedPnl", 0)) > 0)
+                        wr_reference = (wins_at / len(fills_at_wr)) * 100
+                        logger.info(f"{address[:12]}: swing trader ({len(fills_7j)} trades/7j) → WR ref all-time {wr_reference:.0f}%")
+
+                    if wr_reference < 45.0:
                         logger.info(
-                            f"Exclu {address[:12]}: WR {winrate_7j:.0f}% < 45% — incopiable"
+                            f"Exclu {address[:12]}: WR {wr_reference:.0f}% < 45% — incopiable"
                         )
                         return None
 
@@ -1209,8 +1242,8 @@ async def fetch_top_traders_hl() -> list:
                         "roi":          round(roi_30j, 1),
                         "roe_at":       round(roe_at, 1),
                         "mdd":          round(worst_mdd, 1),
-                        "winrate":      round(winrate_7j, 1),
-                        "winrate_30j":  round(winrate_30j, 1),
+                        "winrate":      round(wr_reference, 1),   # 7j fills ou all-time si swing
+                        "winrate_30j":  round(winrate_30j, 1),    # 30j fills réels
                         "n_trades_7j":  n_trades_7j,
                         "n_trades_at":  n_trades_at,
                         "roi_30j":      round(roi_30j, 1),
@@ -1300,9 +1333,13 @@ def rank_and_score_traders(traders: list) -> list:
         else:
             consistency = 0.5
 
+        # winrate et winrate_30 sont maintenant calculés depuis fills réels
+        # → on prend le meilleur des deux (7j ou 30j selon disponibilité)
         best_wr = max(winrate, winrate_30) / 100.0
-        if best_wr >= 0.65:
-            wr_factor = min(best_wr * 1.25, 1.0)
+        if best_wr >= 0.80:
+            wr_factor = 1.0                          # excellent (ex: 99%)
+        elif best_wr >= 0.65:
+            wr_factor = min(best_wr * 1.15, 1.0)
         elif best_wr >= 0.50:
             wr_factor = best_wr
         elif best_wr >= 0.45:
@@ -1497,9 +1534,39 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m30 = get_window_stats("perpMonth",   "month")
         at  = get_window_stats("perpAllTime", "allTime")
 
-        week_data = windows.get("perpWeek") or windows.get("week", {})
-        week_pnl  = [float(p[1]) for p in week_data.get("pnlHistory", []) if isinstance(p, list)]
-        winrate   = (sum(1 for p in week_pnl if p > 0) / max(len(week_pnl), 1)) * 100
+        # ── Win Rate : fills réels prioritaires, sinon estimation portfolio ──────
+        fills_with_pnl = [float(f.get("closedPnl", 0)) for f in (fills if isinstance(fills, list) else [])
+                          if isinstance(f, dict) and float(f.get("closedPnl", 0) or 0) != 0]
+        n_fills = len(fills_with_pnl)
+
+        if n_fills >= 10:
+            # Assez de trades pour un winrate fiable
+            winrate = (sum(1 for p in fills_with_pnl if p > 0) / n_fills) * 100
+            winrate_source = f"{n_fills} trades fermés"
+        elif n_fills > 0:
+            # Peu de trades récents (swing trader, hold > 2j) — on complète avec portfolio
+            # Utilise le ratio PnL positif sur toutes les fenêtres disponibles
+            at_data  = windows.get("perpAllTime") or windows.get("allTime", {})
+            at_pnl_h = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
+            if len(at_pnl_h) > 1:
+                # Compte les incréments positifs dans l'historique AllTime (proxy trades gagnants)
+                increments = [at_pnl_h[i] - at_pnl_h[i-1] for i in range(1, len(at_pnl_h))]
+                pos_inc    = [x for x in increments if abs(x) > 0.01]  # filtre bruit
+                winrate    = (sum(1 for x in pos_inc if x > 0) / max(len(pos_inc), 1)) * 100
+            else:
+                winrate = (sum(1 for p in fills_with_pnl if p > 0) / n_fills) * 100
+            winrate_source = f"{n_fills} trades + historique"
+        else:
+            # Aucun fill disponible → estimation depuis historique AllTime
+            at_data  = windows.get("perpAllTime") or windows.get("allTime", {})
+            at_pnl_h = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
+            if len(at_pnl_h) > 1:
+                increments = [at_pnl_h[i] - at_pnl_h[i-1] for i in range(1, len(at_pnl_h))]
+                pos_inc    = [x for x in increments if abs(x) > 0.01]
+                winrate    = (sum(1 for x in pos_inc if x > 0) / max(len(pos_inc), 1)) * 100
+            else:
+                winrate = 50.0  # neutre si aucune donnée
+            winrate_source = "historique estimé"
 
         now_ms       = datetime.now().timestamp() * 1000
         last_fill_ts = None
@@ -1532,12 +1599,60 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "lev":   p.get("leverage", {}).get("value", "?"),
                     })
 
-        roi_score = min(100.0, m30["roi"] / 5)
-        score     = round(
-            score_consistency(m30["consist"]) * 0.35 +
-            score_drawdown(m30["mdd"])        * 0.30 +
-            score_winrate(winrate)            * 0.20 +
-            roi_score                         * 0.15, 1
+        # ── MDD : peak glissant déjà corrigé dans calc_mdd ──────────────────────
+        # On prend la fenêtre la plus représentative (min entre 30j et AllTime si AllTime fiable)
+        best_mdd = min(w7["mdd"], m30["mdd"])
+        if best_mdd <= 0:
+            best_mdd = m30["mdd"]
+
+        # ── Consistance : adapté aux swing traders (hold > 1 jour) ───────────────
+        # La consistance classique (% jours positifs) pénalise les traders qui
+        # tiennent des positions plusieurs jours (flottant négatif pendant le hold)
+        # On mesure plutôt la régularité du PnL sur différentes échelles
+        avg_hold  = 2.69  # valeur par défaut, amélioration future possible
+        if avg_hold >= 1.5:
+            # Swing trader : la consistance doit être mesurée sur des incréments
+            # plus larges que 1 jour. On utilise l'historique AllTime.
+            at_data  = windows.get("perpAllTime") or windows.get("allTime", {})
+            at_pnl_h = [float(p[1]) for p in at_data.get("pnlHistory", []) if isinstance(p, list)]
+            if len(at_pnl_h) > 4:
+                # Grouper par blocs de N points ≈ avg_hold
+                step = max(2, int(avg_hold))
+                chunks = [at_pnl_h[i:i+step] for i in range(0, len(at_pnl_h)-step, step)]
+                pos_chunks = sum(1 for c in chunks if len(c) > 1 and c[-1] > c[0])
+                best_consist = (pos_chunks / max(len(chunks), 1)) * 100
+            else:
+                best_consist = max(d1["consist"], w7["consist"], m30["consist"])
+        else:
+            # Day trader : consistance classique (% jours positifs)
+            best_consist = max(d1["consist"], w7["consist"], m30["consist"])
+
+        # Bonus consistance si AllTime PnL très positif et MDD raisonnable
+        if at["pnl"] > 100_000 and best_mdd < 35:
+            best_consist = max(best_consist, 55.0)
+
+        # ── ROI : pondération court/long terme ────────────────────────────────────
+        roi_30j = m30["roi"]
+        roi_at  = min(at["roi"], 2000.0)  # cap 2000% pour éviter 9999% artefact
+
+        # Si 30j négatif mais AllTime excellent → le 30j est un drawdown temporaire
+        if roi_30j <= 0 and roi_at > 200:
+            roi_score = min(100.0, roi_at / 30.0)   # AllTime dominant
+        elif roi_30j > 0:
+            roi_score = min(100.0, (roi_30j / 3.0) * 0.4 + (roi_at / 30.0) * 0.6)
+        else:
+            roi_score = 0.0
+
+        # ── Profit Factor depuis fills ─────────────────────────────────────────────
+        gains  = sum(p for p in fills_with_pnl if p > 0)
+        losses = abs(sum(p for p in fills_with_pnl if p < 0))
+        profit_factor = round(gains / losses, 1) if losses > 0 else (999.0 if gains > 0 else 0.0)
+
+        score = round(
+            score_consistency(best_consist) * 0.30 +
+            score_drawdown(best_mdd)        * 0.25 +
+            score_winrate(winrate)          * 0.30 +
+            roi_score                       * 0.15, 1
         )
         verdict = "🟢 FORT" if score >= 65 else ("🟡 MOYEN" if score >= 45 else "🔴 FAIBLE")
 
@@ -1554,9 +1669,11 @@ async def cmd_inspector(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{'AllTime':<12} ${at['pnl']:>+10,.0f} {at['roi']:>7.1f}% {at['mdd']:>5.1f}%",
             "",
             "🎯 *QUALITÉ (base 30j)*",
-            f"Score ETF:   *{score}/100* {verdict}",
-            f"Win Rate:    {winrate:.0f}%",
-            f"Consistance: {m30['consist']:.0f}%",
+            f"Score:       *{score}/100* {verdict}",
+            f"Win Rate:    {winrate:.0f}% ({winrate_source})",
+            f"Consistance: {best_consist:.0f}% | MDD: {best_mdd:.1f}%",
+            f"ROE 30j:     {roi_30j:.1f}% | ROE AllTime: {min(at['roi'],9999):.0f}%",
+            f"Profit Factor: {profit_factor if profit_factor < 999 else '>999'}",
             f"Capital:     ${m30['capital']:,.0f}",
         ]
 
@@ -1705,9 +1822,9 @@ async def cmd_tb_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     msg = (
-        "🔍 *SakaiBot — Module TradeBot (Analyse)*\n\n"
-        "Analyse les meilleurs traders Hyperliquid pour t'aider\n"
-        "à sélectionner un wallet à copier via /target.\n\n"
+        "🏆 *TradeBot — Analyse & Sélection*\n\n"
+        "Identifie les meilleurs traders Hyperliquid.\n"
+        "Une fois le trader trouvé → copie via /target.\n\n"
         "📐 *Scoring:*\n"
         "   Score = (PnL\\_7j / MDD) × WR\\_7j × log(trades\\_7j)\n"
         "   Bonus ×1.2 si PnL\\_30j > 0 ET ROI\\_30j ≥ 20%\n\n"
@@ -1742,15 +1859,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /peur — Fear & Greed Index\n\n"
         "📈 *Mes Positions*\n"
         "   /positions — Wallets Master + Bot\n\n"
-        "🏆 *TradeBot — Copy Trading*\n"
-        "   /toptraders — Analyser Top 5 multi-asset\n"
+        "🏆 *TradeBot — Analyse & Sélection*\n"
+        "   /toptraders — Top 5 traders (scoring v6)\n"
         "   /inspector — Analyser un wallet\n"
-        "   /copy\\_start — Démarrer la copie (Top 5)\n"
-        "   /copy\\_stop — Arrêter la copie\n"
-        "   /copy\\_status — Statut en temps réel\n"
-        "   /copy\\_close — Fermer toutes les positions\n"
-        "   /tb\\_historique — Historique des sélections\n"
-        "   /tb\\_aide — Aide Copy Trading\n\n"
+        "   /tb\\_aide — Aide scoring\n\n"
         "🎯 *Target Wallet Manuel*\n"
         "   /target 0x... [label] — Surveiller + répliquer\n"
         "   /target\\_sync 0x... — Copier positions existantes\n"
@@ -4484,7 +4596,6 @@ def main():
     app.add_handler(CommandHandler("tb_aide",       cmd_tb_aide))
     app.add_handler(CommandHandler("inspector",     cmd_inspector))
 
-    # Copy Trading v4.1
 
     # Target Wallet Manuel
     app.add_handler(CommandHandler("target",        cmd_target))
