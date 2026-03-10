@@ -1958,35 +1958,20 @@ async def _build_hip3_exchange() -> "Exchange | None":
 
         # Log pour vérification
         xyz_keys = [k for k in info.coin_to_asset if k.startswith("xyz:")]
-        logger.info(f"HIP-3 Info coin_to_asset XYZ ({len(xyz_keys)}): {xyz_keys[:6]}...")
+        logger.info(f"HIP-3 Info XYZ ({len(xyz_keys)}): {xyz_keys[:6]}...")
         if "xyz:BRENTOIL" not in info.coin_to_asset:
-            logger.error(f"xyz:BRENTOIL absent! Toutes les clés: {list(info.coin_to_asset.keys())}")
+            logger.error(f"xyz:BRENTOIL absent! Clés: {list(info.coin_to_asset.keys())}")
 
+        # Construire Exchange sans info= (SDK n'a pas ce kwarg), puis remplacer exc.info
         exc = Exchange(
             wallet,
             hl_constants.MAINNET_API_URL,
             account_address=COPY_BOT_ADDRESS,
-            info=info,
         )
+        # Remplacement de exc.info par notre Info correctement configuré
+        exc.info = info
+        logger.info(f"HIP-3 exc.info remplacé — xyz:BRENTOIL: {info.coin_to_asset.get('xyz:BRENTOIL', 'ABSENT')}")
         return exc
-    except TypeError:
-        # Vieux SDK sans kwarg info= → fallback manuel
-        logger.warning("_build_hip3_exchange: SDK ancien, fallback meta=")
-        try:
-            from hyperliquid.info import Info as HLInfo
-            key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
-            wallet = eth_account.Account.from_key(key)
-            universe, _ = await _get_xyz_meta("xyz")
-            exc = Exchange(wallet, hl_constants.MAINNET_API_URL, account_address=COPY_BOT_ADDRESS)
-            # Patch manuel avec préfixe xyz:
-            cmap = {f"xyz:{a['name']}": 100000 + idx for idx, a in enumerate(universe) if "name" in a}
-            exc.coin_to_asset = cmap
-            if hasattr(exc, "info") and exc.info:
-                exc.info.coin_to_asset = cmap
-            return exc
-        except Exception as e2:
-            logger.error(f"_build_hip3_exchange fallback: {e2}")
-            return None
     except Exception as e:
         logger.error(f"_build_hip3_exchange: {e}", exc_info=True)
         return None
