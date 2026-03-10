@@ -2799,10 +2799,16 @@ async def ai_sync_positions_from_hl() -> int:
         info = await asyncio.get_event_loop().run_in_executor(
             None, lambda: HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["xyz"])
         )
+        # ORACLE ouvre ses positions via _build_hip3_exchange qui utilise COPY_BOT_ADDRESS
         state_data = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: info.user_state(HYPERLIQUID_ADDRESS)
+            None, lambda: info.user_state(COPY_BOT_ADDRESS)
         )
         asset_positions = state_data.get("assetPositions", [])
+        logger.info(f"🔄 Sync — {len(asset_positions)} position(s) sur COPY_BOT_ADDRESS")
+        for p in asset_positions:
+            pos = p.get("position", {})
+            if float(pos.get("szi", 0) or 0) != 0:
+                logger.info(f"   → coin={pos.get('coin')} szi={pos.get('szi')} entry={pos.get('entryPx')}")
 
         # Contexte meta XYZ pour les prix mark courants
         universe, ctxs = await _get_xyz_meta("xyz")
@@ -2880,7 +2886,7 @@ async def ai_sync_positions_from_hl() -> int:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         HYPERLIQUID_API_UI,
-                        json={"type": "userFills", "user": HYPERLIQUID_ADDRESS},
+                        json={"type": "userFills", "user": COPY_BOT_ADDRESS},
                         timeout=aiohttp.ClientTimeout(total=10)
                     ) as resp:
                         fills = await resp.json() if resp.status == 200 else []
