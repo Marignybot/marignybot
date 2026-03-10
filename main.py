@@ -2788,9 +2788,9 @@ def ai_save_state() -> None:
 
 async def ai_sync_positions_from_hl() -> int:
     """
-    Au démarrage, récupère les positions ouvertes sur HL pour le wallet ORACLE
-    et les injecte dans ai_state["positions"] pour éviter les doublons après redéploiement.
-    Retourne le nombre de positions récupérées.
+    Restauration intelligente des positions après redéploiement.
+    Reconstruit l'état complet (peak, stop trailing, TP déjà exécutés, entry_time)
+    depuis le prix courant et les données HL réelles.
     """
     if not _HL_SDK_AVAILABLE:
         return 0
@@ -2803,68 +2803,136 @@ async def ai_sync_positions_from_hl() -> int:
         )
         asset_positions = state_data.get("assetPositions", [])
 
-        # Construire un mapping ticker → asset complet depuis AI_HIP3_ASSETS
+        # Contexte meta XYZ pour les prix mark courants
+        universe, ctxs = await _get_xyz_meta("xyz")
+        mark_prices = {}
+        for i, a in enumerate(universe):
+            name = a.get("name", "")
+            if i < len(ctxs):
+                mark_prices[name] = float(ctxs[i].get("markPx", 0) or 0)
+
         ticker_to_asset = {v["ticker"]: k for k, v in AI_HIP3_ASSETS.items()}
 
         restored = 0
         for pos_wrap in asset_positions:
-            pos = pos_wrap.get("position", {})
+            pos  = pos_wrap.get("position", {})
             coin = pos.get("coin", "")
             szi  = float(pos.get("szi", 0) or 0)
             if szi == 0:
                 continue
 
-            # coin peut être "xyz:BRENTOIL" ou "BRENTOIL"
             ticker = coin.split(":")[-1]
             asset  = f"xyz:{ticker}"
 
-            # Ignorer si pas dans notre univers ORACLE
             if asset not in AI_HIP3_ASSETS and ticker not in ticker_to_asset:
                 continue
-
             if asset not in AI_HIP3_ASSETS:
                 asset = ticker_to_asset.get(ticker, asset)
-
-            # Déjà dans ai_state → on ne touche pas
             if asset in ai_state["positions"]:
                 continue
 
-            entry_px = float(pos.get("entryPx", 0) or 0)
-            side     = "long" if szi > 0 else "short"
-            size     = abs(szi)
-            leverage = ai_get_leverage(asset)
-            usd      = round(size * entry_px, 2)
-            stop_pct = AI_STOP_LOSS_PCT
-            stop_px  = round(
-                entry_px * (1 - stop_pct) if side == "long"
-                else entry_px * (1 + stop_pct), 4
-            )
+            entry_px   = float(pos.get("entryPx", 0) or 0)
+            mark_px    = mark_prices.get(f"xyz:{ticker}", 0) or mark_prices.get(coin, 0) or entry_px
+            side       = "long" if szi > 0 else "short"
+            size       = abs(szi)
+            leverage   = ai_get_leverage(asset)
+            usd        = round(size * entry_px, 2)
+            trail_pct  = ai_get_trail_pct(asset)
+
+            # ── PnL actuel pour reconstruire l'état ──────────────────────
+            if side == "long":
+                pnl_pct = (mark_px - entry_px) / entry_px if entry_px > 0 else 0
+            else:
+                pnl_pct = (entry_px - mark_px) / entry_px if entry_px > 0 else 0
+
+            # ── Peak : meilleur prix atteint estimé depuis l'entrée ───────
+            # On utilise le unrealizedPnl fourni par HL pour reconstituer le peak
+            unrealized = float(pos.get("unrealizedPnl", 0) or 0)
+            if side == "long":
+                # Si la position gagne, le mark courant EST le peak minimum
+                peak = mark_px if pnl_pct >= 0 else entry_px
+            else:
+                # Pour un short, le peak est le prix le plus BAS atteint
+                peak = mark_px if pnl_pct >= 0 else entry_px
+
+            # ── Stop reconstruit depuis le peak réel ─────────────────────
+            if side == "long":
+                trail_stop  = round(peak * (1 - trail_pct), 4)
+                hard_stop   = round(entry_px * (1 - AI_STOP_LOSS_PCT), 4)
+                stop_px     = max(trail_stop, hard_stop)   # stop le plus serré gagne
+            else:
+                trail_stop  = round(peak * (1 + trail_pct), 4)
+                hard_stop   = round(entry_px * (1 + AI_STOP_LOSS_PCT), 4)
+                stop_px     = min(trail_stop, hard_stop)
+
+            # ── TP partiels déjà exécutés ─────────────────────────────────
+            # Si le PnL actuel dépasse un seuil TP, ce niveau a déjà été exécuté
+            # (la taille restante sur HL est la preuve que la position a été réduite)
+            tp_hit = []
+            for tp_threshold, _ in AI_PARTIAL_TP:
+                if pnl_pct >= tp_threshold:
+                    tp_hit.append(tp_threshold)
+
+            # ── entry_time : on cherche le vrai timestamp dans les fills ─────
+            entry_time_iso = None
+            try:
+                fills = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: info.user_fills_by_time(
+                        HYPERLIQUID_ADDRESS,
+                        start_time=int((datetime.now(timezone.utc) - timedelta(hours=72)).timestamp() * 1000)
+                    )
+                )
+                # Cherche le dernier fill d'ouverture sur cet asset dans le bon sens
+                open_dir = "B" if side == "long" else "A"  # B=buy, A=sell (pour open)
+                for fill in sorted(fills, key=lambda x: x.get("time", 0), reverse=True):
+                    fill_coin = fill.get("coin", "").split(":")[-1]
+                    if fill_coin != ticker:
+                        continue
+                    if fill.get("dir", "") and open_dir in fill.get("dir", ""):
+                        fill_ts_ms = fill.get("time", 0)
+                        if fill_ts_ms:
+                            entry_time_iso = datetime.fromtimestamp(
+                                fill_ts_ms / 1000, tz=timezone.utc
+                            ).isoformat()
+                            logger.info(f"🔄 entry_time réel récupéré pour {asset}: {entry_time_iso}")
+                            break
+            except Exception as ef:
+                logger.debug(f"fills lookup failed for {asset}: {ef}")
+            # Fallback si fills indisponibles : on part de now-1h (conservateur)
+            if not entry_time_iso:
+                entry_time_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+                logger.debug(f"entry_time fallback -1h pour {asset}")
 
             ai_state["positions"][asset] = {
                 "side":            side,
                 "size":            size,
                 "entry":           entry_px,
-                "peak":            entry_px,
+                "peak":            peak,
                 "stop":            stop_px,
                 "usd":             usd,
                 "time":            datetime.now().strftime("%d/%m %H:%M"),
-                "entry_time":      datetime.now(timezone.utc).isoformat(),
-                "trail_pct":       ai_get_trail_pct(asset),
-                "tp_levels_hit":   [],
+                "entry_time":      entry_time_iso,
+                "trail_pct":       trail_pct,
+                "tp_levels_hit":   tp_hit,
                 "reinforce_count": 0,
                 "entry_premium":   0.0,
-                "restored":        True,   # flag pour savoir que c'est une position restaurée
+                "restored":        True,
             }
             restored += 1
-            logger.info(f"🔄 Position restaurée depuis HL: {asset} {side.upper()} sz={size} entry={entry_px}")
+            logger.info(
+                f"🔄 Restauré {asset} {side.upper()} sz={size} entry={entry_px:.4f} "
+                f"mark={mark_px:.4f} PnL={pnl_pct*100:+.2f}% "
+                f"peak={peak:.4f} stop={stop_px:.4f} TP_hit={tp_hit}"
+            )
 
         if restored > 0:
             ai_save_state()
-            logger.info(f"🔄 {restored} position(s) restaurée(s) depuis Hyperliquid")
+            logger.info(f"🔄 {restored} position(s) restaurée(s) avec état complet")
         return restored
 
     except Exception as e:
         logger.warning(f"ai_sync_positions_from_hl: {e}")
+        import traceback; logger.debug(traceback.format_exc())
         return 0
 
 
@@ -4290,23 +4358,55 @@ async def cmd_ai_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ Module IA déjà actif.", parse_mode="Markdown")
         return
 
-    ai_state["active"] = True
-
-    if ai_state.get("scan_task") and not ai_state["scan_task"].done():
-        ai_state["scan_task"].cancel()
-    ai_state["scan_task"] = asyncio.create_task(ai_scan_loop(context.application))
-
+    # ── Étape 1 : découverte assets (avant d'activer le scan) ──────────────
     await update.message.reply_text("🔍 Découverte des assets HIP-3...", parse_mode="Markdown")
     discovered = await ai_discover_hip3_assets()
 
-    # Synchroniser les positions déjà ouvertes sur HL (évite doublons après redéploiement)
+    # ── Étape 2 : restauration positions AVANT de lancer le scan ─────────
+    # (évite que le scan ouvre des doublons pendant la restauration)
     restored = await ai_sync_positions_from_hl()
     if restored > 0:
-        await update.message.reply_text(
-            f"🔄 *{restored} position(s) restaurée(s)* depuis Hyperliquid\n"
-            f"_Le bot reprend le suivi sans réouvrir de positions existantes._",
-            parse_mode="Markdown"
-        )
+        # Notif détaillée pour chaque position restaurée
+        lines_notif = [f"🔄 *{restored} position(s) restaurée(s) depuis Hyperliquid*\n"]
+        for asset, pos in ai_state["positions"].items():
+            if not pos.get("restored"):
+                continue
+            side    = pos["side"].upper()
+            entry   = pos["entry"]
+            stop    = pos["stop"]
+            peak    = pos["peak"]
+            trail   = pos["trail_pct"] * 100
+            tp_done = pos.get("tp_levels_hit", [])
+            name    = asset.split(":")[-1]
+            # Prix courant si dispo
+            cur_px  = ai_state["hip3_prices"].get(asset, peak)
+            if cur_px > 0:
+                if pos["side"] == "long":
+                    pnl_pct = (cur_px - entry) / entry * 100
+                else:
+                    pnl_pct = (entry - cur_px) / entry * 100
+                pnl_str = f"{pnl_pct:+.2f}%"
+            else:
+                pnl_str = "?"
+            tp_str = f"TP {', '.join(str(int(t*100))+'%' for t in tp_done)} exécuté" if tp_done else "aucun TP partiel"
+            lines_notif.append(
+                f"• *{name}* {side}\n"
+                f"  Entrée: ${entry:.4f} | Prix actuel: ${cur_px:.4f} | PnL: {pnl_str}\n"
+                f"  Peak: ${peak:.4f} | Stop: ${stop:.4f} (trail {trail:.1f}%)\n"
+                f"  {tp_str}"
+            )
+        lines_notif.append("\n_Le bot reprend le suivi complet de ces positions._")
+        await update.message.reply_text("\n".join(lines_notif), parse_mode="Markdown")
+        # Effacer le flag "restored" après notification (plus utile ensuite)
+        for pos in ai_state["positions"].values():
+            pos.pop("restored", None)
+        ai_save_state()
+
+    # ── Étape 3 : activation du scan seulement maintenant ────────────────
+    ai_state["active"] = True
+    if ai_state.get("scan_task") and not ai_state["scan_task"].done():
+        ai_state["scan_task"].cancel()
+    ai_state["scan_task"] = asyncio.create_task(ai_scan_loop(context.application))
 
     budget     = await ai_compute_budget()
     active_str = " • ".join(f"{k} (${v:.2f})" for k, v in discovered.items()) if discovered else "aucun trouvé"
