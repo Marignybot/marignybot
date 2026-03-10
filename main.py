@@ -301,6 +301,12 @@ AI_BUDGET_BY_SCORE = [
     (50,  40.0),   # score >= 50 → $40  notionnel (avec validation Claude)
 ]
 AI_SCORE_AUTO_TRADE  = 75   # score min pour trade sans Claude
+AI_REINFORCE_SCORE   = 85   # score min pour renforcer une position existante
+AI_REINFORCE_MAX     = 2    # nombre max de renforcements par position
+AI_REINFORCE_RATIO   = 0.5  # taille du renforcement = X * budget initial
+AI_REINFORCE_MIN_PREM_DELTA = 0.005  # premium doit avoir augmenté de +0.5% depuis entrée
+AI_REINFORCE_MAX_SPREAD_PCT = 0.15   # pas de renforcement si premium > 15% (data error)
+AI_REINFORCE_MIN_PREM_GROW  = 0.005  # premium doit avoir grandi vs entrée pour averaging down
 AI_SCORE_CLAUDE_MIN  = 50   # score min pour appeler Claude
 AI_SCORE_WAIT        = 49   # score max → WAIT sans appel
 
@@ -3483,6 +3489,74 @@ async def ai_set_leverage_hl(asset: str, leverage: int) -> bool:
         return False
 
 
+async def ai_reinforce_position(asset: str, is_buy: bool, current_price: float,
+                               reason: str, app) -> bool:
+    """Renforce une position existante avec 50% du budget initial."""
+    pos = ai_state["positions"].get(asset)
+    if not pos:
+        return False
+
+    reinforce_count = pos.get("reinforce_count", 0)
+    if reinforce_count >= AI_REINFORCE_MAX:
+        logger.info(f"ai_reinforce {asset}: max renforcements atteints ({AI_REINFORCE_MAX})")
+        return False
+
+    budget_initial = pos.get("usd", 0)
+    add_budget     = round(budget_initial * AI_REINFORCE_RATIO, 2)
+    if add_budget < 15:
+        logger.info(f"ai_reinforce {asset}: budget trop faible ${add_budget}")
+        return False
+
+    leverage = ai_get_leverage(asset)
+    hip3_cfg = AI_HIP3_ASSETS.get(asset, {})
+    if hip3_cfg.get("szDecimals") is not None:
+        sz_dec = hip3_cfg["szDecimals"]
+        min_sz = hip3_cfg.get("minSz", 10 ** -sz_dec)
+        rules  = {"decimals": sz_dec, "min": min_sz, "min_usd": 10.0}
+    else:
+        rules  = get_size_rules(asset)
+
+    add_size = max(round(add_budget / current_price, rules["decimals"]), rules["min"])
+
+    result = await place_limit_gtc(asset, is_buy, add_size, f"REINFORCE#{reinforce_count+1}:{reason}")
+    if "error" in result:
+        logger.warning(f"ai_reinforce {asset}: ordre échoué — {result['error']}")
+        return False
+
+    # Recalcul prix moyen pondéré
+    old_size  = pos["size"]
+    old_entry = pos["entry"]
+    new_size  = round(old_size + add_size, rules["decimals"])
+    new_entry = round((old_entry * old_size + current_price * add_size) / new_size, 4)
+    side      = pos["side"]
+    new_stop  = round(new_entry * (1 - AI_STOP_LOSS_PCT) if side == "long"
+                      else new_entry * (1 + AI_STOP_LOSS_PCT), 4)
+    new_usd   = round(budget_initial + add_budget, 2)
+
+    ai_state["positions"][asset].update({
+        "size":            new_size,
+        "entry":           new_entry,
+        "stop":            new_stop,
+        "usd":             new_usd,
+        "reinforce_count": reinforce_count + 1,
+        "peak":            current_price,
+    })
+    ai_save_state()
+
+    margin_used = round(add_budget / leverage, 2)
+    await send_copy_notification(app,
+        f"🔮 *ORACLE — Renforcement #{reinforce_count+1}*\n"
+        f"Asset:   *{asset.split(':')[-1]}* x{leverage}\n"
+        f"Side:    {'📈 LONG' if is_buy else '📉 SHORT'}\n"
+        f"Ajout:   ${add_budget:.0f} notionnel ({add_size} unités) | Marge: ${margin_used:.1f}\n"
+        f"Nouveau total: ${new_usd:.0f} | Entry moy: ${new_entry:.4f}\n"
+        f"Nouveau stop: ${new_stop:.4f}\n"
+        f"Raison:  _{reason}_"
+    )
+    logger.info(f"✅ Renforcement {asset} #{reinforce_count+1} | size {old_size}→{new_size} | entry {old_entry}→{new_entry}")
+    return True
+
+
 async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
                            current_price: float, reason: str, app) -> bool:
     leverage = ai_get_leverage(asset)
@@ -3517,17 +3591,23 @@ async def ai_open_position(asset: str, is_buy: bool, budget_usd: float,
     leverage   = ai_get_leverage(asset)
     stop_price = current_price * (1 - AI_STOP_LOSS_PCT) if is_buy else current_price * (1 + AI_STOP_LOSS_PCT)
 
+    # Récupère le premium au moment de l'entrée (pour évaluer le renforcement plus tard)
+    hip3_cfg_entry = AI_HIP3_ASSETS.get(asset, {})
+    entry_prem = abs(round((current_price - current_price) / current_price, 4))  # sera mis à jour après
+
     ai_state["positions"][asset] = {
-        "side":          side,
-        "size":          my_size,
-        "entry":         current_price,
-        "peak":          current_price,
-        "stop":          round(stop_price, 4),
-        "usd":           budget_usd,
-        "time":          datetime.now().strftime("%d/%m %H:%M"),
-        "entry_time":    datetime.now(timezone.utc).isoformat(),
-        "trail_pct":     ai_get_trail_pct(asset),
-        "tp_levels_hit": [],
+        "side":            side,
+        "size":            my_size,
+        "entry":           current_price,
+        "peak":            current_price,
+        "stop":            round(stop_price, 4),
+        "usd":             budget_usd,
+        "time":            datetime.now().strftime("%d/%m %H:%M"),
+        "entry_time":      datetime.now(timezone.utc).isoformat(),
+        "trail_pct":       ai_get_trail_pct(asset),
+        "tp_levels_hit":   [],
+        "reinforce_count": 0,
+        "entry_premium":   0.0,   # mis à jour par le scan loop après ouverture
     }
     ai_save_state()
 
@@ -3832,13 +3912,68 @@ async def ai_scan_loop(app) -> None:
                     persist["count"] = 0
                     persist["direction"] = ""
 
-                # ── Position existante : vérifier signal inversé ──
+                # ── Position existante : signal inversé ou renforcement ──
                 if existing_pos:
                     pos_dir = existing_pos["side"]
+
                     # Signal inversé fort → fermeture
                     if abs_prem >= threshold and direction != pos_dir:
                         logger.info(f"IA {ticker}: signal inversé {pos_dir}→{direction} → fermeture")
                         await ai_close_position(asset, hl_price, f"SIGNAL_INVERSÉ ({premium_pct:+.2f}%)", app)
+                        continue
+
+                    # ── Évaluation renforcement ──
+                    reinforce_count = existing_pos.get("reinforce_count", 0)
+                    entry_price     = existing_pos.get("entry", hl_price)
+                    entry_premium   = existing_pos.get("entry_premium", abs_prem)
+
+                    # ── Logique premium-based pour renforcement / averaging down ──
+                    # On regarde l'état de l'ÉCART, pas le PnL flottant
+                    premium_grew   = abs_prem >= entry_premium + AI_REINFORCE_MIN_PREM_GROW
+                    premium_sane   = abs_prem < AI_REINFORCE_MAX_SPREAD_PCT  # évite data error
+                    can_reinforce  = reinforce_count < AI_REINFORCE_MAX
+
+                    # Si PnL négatif, vérifier que le premium s'est élargi (thèse encore valide)
+                    # Si PnL positif, renforcer si premium encore fort
+                    if pos_dir == "long":
+                        pnl_pct = (hl_price - entry_price) / entry_price
+                    else:
+                        pnl_pct = (entry_price - hl_price) / entry_price
+
+                    if pnl_pct < 0:
+                        # Position en perte → averaging down seulement si premium s'est ÉLARGI
+                        eligible = premium_grew and premium_sane and can_reinforce
+                        mode = "averaging down"
+                    else:
+                        # Position gagnante → renforcer si premium encore présent
+                        eligible = abs_prem >= entry_premium and premium_sane and can_reinforce
+                        mode = "pyramiding"
+
+                    if eligible:
+                        # Recalculer score si pas encore fait
+                        if not 'score' in dir():
+                            hl_vol = float(cfg.get("vol24h", 0))
+                            score  = ai_compute_signal_score(asset, premium_pct, hl_vol, direction, tradfi_price)
+
+                        if score >= AI_REINFORCE_SCORE:
+                            logger.info(f"IA {ticker}: {mode} candidat score={score} prem={abs_prem:.2%} entry_prem={entry_premium:.2%} pnl={pnl_pct:.2%}")
+                            decision = await ai_call_claude(
+                                cfg["name"], hl_price, tradfi_price,
+                                funding, premium_pct, existing_pos, score
+                            )
+                            if decision.get("action") in ("long", "short") and decision.get("confidence", 0) >= 70:
+                                is_buy = (pos_dir == "long")
+                                await ai_reinforce_position(
+                                    asset, is_buy, hl_price,
+                                    decision.get("reason", f"Premium {abs_prem:.2%} +renforcement"), app
+                                )
+                            else:
+                                logger.info(f"IA {ticker}: renforcement refusé par Claude — {decision.get('reason','')}")
+                        else:
+                            logger.debug(f"IA {ticker}: score {score} insuffisant pour renforcer (min {AI_REINFORCE_SCORE})")
+                    else:
+                        logger.debug(f"IA {ticker}: pas de renforcement — prem_delta={abs_prem-entry_premium:.3f} pnl={pnl_pct:.2%} count={reinforce_count}")
+
                     continue  # pas de nouvelle entrée si déjà en position
 
                 # ── Pas assez de premium → skip ──
@@ -3918,7 +4053,11 @@ async def ai_scan_loop(app) -> None:
                         continue
 
                     is_buy = action == "long"
-                    await ai_open_position(asset, is_buy, budget, hl_price, reason, app)
+                    opened = await ai_open_position(asset, is_buy, budget, hl_price, reason, app)
+                    # Stocker le premium au moment de l'entrée pour évaluer renforcement
+                    if opened and asset in ai_state["positions"]:
+                        ai_state["positions"][asset]["entry_premium"] = abs_prem
+                        ai_save_state()
 
                 # ── Mise à jour prix précédent (momentum) ──
                 ai_state["prev_prices"][asset] = tradfi_price
