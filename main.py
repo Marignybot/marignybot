@@ -210,13 +210,30 @@ AI_TRAIL_PCT_MAX   = 0.07     # trailing max 7%
 
 # Leviers par catégorie d'asset
 AI_LEVERAGE_MAP = {
-    "commodities": 10,  # GOLD, SILVER, CL, BRENTOIL, NATGAS, COPPER, PLATINUM, PALLADIUM
-    "indices":     10,  # XYZ100
-    "stocks":      10,  # TSLA, AAPL, NVDA, MSFT, etc.
-    "etf":         10,  # URNM, EWY, EWJ
-    "fx":          10,  # JPY, EUR
+    "commodities": 10,
+    "indices":     10,
+    "stocks":      10,
+    "etf":         10,
+    "fx":          10,
 }
-AI_LEVERAGE = 10  # fallback
+AI_LEVERAGE = 10  # fallback global
+
+# Levier par asset (max réel / 2) — source: docs.trade.xyz/specification-index
+AI_LEVERAGE_BY_ASSET = {
+    "GOLD": 10, "SILVER": 10, "CL": 10, "BRENTOIL": 10,
+    "NATGAS": 5, "COPPER": 10, "PLATINUM": 10, "PALLADIUM": 10,
+    "XYZ100": 10, "JPY": 10, "EUR": 10,
+    "TSLA": 10, "NVDA": 10, "AAPL": 10, "META": 10, "MSFT": 10, "GOOGL": 10,
+    "INTC": 10, "PLTR": 10, "COIN": 10, "HOOD": 10, "ORCL": 10,
+    "AMZN": 10, "AMD": 10, "MU": 10, "SNDK": 10, "MSTR": 10,
+    "CRCL": 10, "NFLX": 10, "TSM": 10, "RIVN": 10, "BABA": 10, "USAR": 10,
+    "URNM": 5, "EWY": 10, "EWJ": 10,
+}
+
+# Assets en Cross Margin — update_leverage doit passer is_cross=True
+AI_CROSS_MARGIN_ASSETS = {
+    "GOLD", "SILVER", "XYZ100", "TSLA", "NVDA", "AAPL", "META", "MSFT", "GOOGL"
+}
 
 # Paliers TP partiel (seuil_pnl_fraction, % position à fermer)
 AI_PARTIAL_TP = [
@@ -1914,20 +1931,26 @@ async def _build_exchange() -> "Exchange | None":
 
 
 async def _build_hip3_exchange() -> "Exchange | None":
+    """
+    Construit un Exchange HIP-3 en réutilisant le cache _get_xyz_meta.
+    Évite un appel API supplémentaire et garantit que coin_to_asset
+    est construit avec le même univers que celui utilisé pour les prix.
+    """
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return None
     try:
         key    = HL_PRIVATE_KEY if HL_PRIVATE_KEY.startswith("0x") else "0x" + HL_PRIVATE_KEY
         wallet = eth_account.Account.from_key(key)
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                HYPERLIQUID_API,
-                json={"type": "metaAndAssetCtxs", "dex": "xyz"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                data = await resp.json()
-        hip3_meta = {"universe": data[0].get("universe", [])} if isinstance(data, list) else {"universe": []}
-        logger.info(f"HIP-3 meta: {len(hip3_meta['universe'])} assets dans coin_to_asset")
+
+        # Réutilise le cache déjà chargé par le scan — pas d'appel API supplémentaire
+        universe, _ctxs = await _get_xyz_meta("xyz")
+        if not universe:
+            logger.error("_build_hip3_exchange: univers XYZ vide")
+            return None
+
+        hip3_meta = {"universe": universe}
+        logger.debug(f"HIP-3 meta: {len(universe)} assets — coin_to_asset prêt")
+
         return Exchange(
             wallet,
             hl_constants.MAINNET_API_URL,
@@ -2621,8 +2644,11 @@ def ai_get_asset_category(asset: str) -> str:
 
 
 def ai_get_leverage(asset: str) -> int:
-    """Retourne le levier adapté à la catégorie de l'asset."""
-    cat = ai_get_asset_category(asset)
+    """Retourne le levier configuré (par asset > par catégorie > fallback)."""
+    ticker = asset.split(":")[-1] if ":" in asset else asset
+    if ticker in AI_LEVERAGE_BY_ASSET:
+        return AI_LEVERAGE_BY_ASSET[ticker]
+    cat = ai_get_asset_category(ticker)
     return AI_LEVERAGE_MAP.get(cat, AI_LEVERAGE)
 
 
@@ -3244,23 +3270,26 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
 
 async def ai_set_leverage_hl(asset: str, leverage: int) -> bool:
     """
-    Appelle exchange.update_leverage() sur HL pour forcer le levier isolated
-    sur cet asset AVANT d'ouvrir une position. Sans cet appel, HL utilise
-    le levier par défaut du compte (souvent x1 ou x3).
+    Appelle exchange.update_leverage() sur HL pour forcer le levier.
+    - Assets Cross Margin (GOLD, NVDA, etc.) → is_cross=True
+    - Assets Strict Isolated → is_cross=False
+    Source: https://docs.trade.xyz/consolidated-resources/specification-index
     """
     if not HL_PRIVATE_KEY or not _HL_SDK_AVAILABLE:
         return False
     try:
+        ticker   = asset.split(":")[-1] if ":" in asset else asset
+        is_cross = ticker in AI_CROSS_MARGIN_ASSETS
         exchange = await _build_hip3_exchange()
         if exchange is None:
             return False
-        sdk_coin = asset.split(":")[-1] if ":" in asset else asset
-        loop = asyncio.get_event_loop()
+        loop   = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: exchange.update_leverage(leverage, sdk_coin, False)  # False = isolated
+            lambda: exchange.update_leverage(leverage, ticker, is_cross)
         )
-        logger.info(f"✅ Levier {sdk_coin} → x{leverage} isolated | {result}")
+        mode = "cross" if is_cross else "isolated"
+        logger.info(f"✅ Levier {ticker} → x{leverage} {mode} | {result}")
         return True
     except Exception as e:
         logger.warning(f"ai_set_leverage_hl {asset} x{leverage}: {e}")
