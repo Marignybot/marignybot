@@ -201,7 +201,14 @@ YAHOO_SYMBOLS = {
 
 # Tous les assets XYZ avec un mapping Yahoo Finance sont éligibles.
 # Pour restreindre à un sous-ensemble, remplir ce set (vide = tout accepter).
-AI_ORACLE_WHITELIST: set = set()  # vide = pas de filtre
+AI_ORACLE_WHITELIST: set = {
+    # ✅ Tradeables confirmés (premium régulièrement > seuil)
+    "BRENTOIL", "CL",
+    # ⚠️ Potentiels (proches du seuil, garder sous surveillance)
+    "NATGAS", "CRCL", "PALLADIUM",
+    # 📈 Actions volatiles (gardées pour événements earnings/news)
+    "TSLA", "NVDA", "MSTR", "COIN", "HOOD", "PLTR", "SNDK",
+}  # vide = tous les assets
 
 AI_HIP3_ASSETS: dict = {}   # rempli dynamiquement par ai_discover_hip3_assets()
 
@@ -307,7 +314,7 @@ AI_REINFORCE_RATIO   = 0.5  # taille du renforcement = X * budget initial
 AI_REINFORCE_MIN_PREM_DELTA = 0.005  # premium doit avoir augmenté de +0.5% depuis entrée
 AI_REINFORCE_MAX_SPREAD_PCT = 0.15   # pas de renforcement si premium > 15% (data error)
 AI_REINFORCE_MIN_PREM_GROW  = 0.005  # premium doit avoir grandi vs entrée pour averaging down
-AI_SCORE_CLAUDE_MIN  = 50   # score min pour appeler Claude
+AI_SCORE_CLAUDE_MIN  = 70   # [v4.9] économie API : seulement cas vraiment ambigus   # score min pour appeler Claude
 AI_SCORE_WAIT        = 49   # score max → WAIT sans appel
 
 AI_FIXED_BUDGET    = 300.0    # budget notionnel total réservé à ORACLE ($)
@@ -354,6 +361,7 @@ AI_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_sta
 # État runtime du module IA
 ai_state = {
     "active":      False,
+    "claude_cache": {},   # {ticker: {"time": datetime, "decision": {...}}}
     "positions":   {},    # {asset: {"side","size","entry","stop","usd","entry_time","trail_pct"}}
     "history":     [],    # 20 derniers trades
     "scan_task":   None,
@@ -3655,6 +3663,57 @@ def _format_macro_for_prompt(macro: dict, category: str) -> str:
     return result
 
 
+# ── Cache news RSS ────────────────────────────────────────────────────────────
+_news_cache: dict = {}   # {asset: {"time": datetime, "headlines": [str]}}
+_NEWS_CACHE_TTL = 900    # 15 minutes
+
+async def ai_fetch_news_rss(asset_name: str) -> str:
+    """Récupère les titres news via Google News RSS — gratuit, sans clé API."""
+    import xml.etree.ElementTree as ET
+
+    # Vérifier cache 15min
+    cached = _news_cache.get(asset_name, {})
+    if cached and (datetime.now() - cached["time"]).total_seconds() < _NEWS_CACHE_TTL:
+        headlines = cached["headlines"]
+        logger.info(f"[NEWS] {asset_name}: cache ({len(headlines)} titres)")
+        return _format_headlines(headlines)
+
+    query = AI_NEWS_QUERY.get(asset_name, f"{asset_name} price news")
+    url   = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8),
+                                   headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[NEWS] {asset_name}: HTTP {resp.status}")
+                    return ""
+                xml_text = await resp.text()
+
+        root = ET.fromstring(xml_text)
+        headlines = []
+        for item in root.findall(".//item")[:5]:   # 5 titres max
+            title = item.findtext("title", "").strip()
+            if title:
+                # Nettoyer le suffixe " - Source" ajouté par Google News
+                title = title.rsplit(" - ", 1)[0]
+                headlines.append(title)
+
+        _news_cache[asset_name] = {"time": datetime.now(), "headlines": headlines}
+        logger.info(f"[NEWS] {asset_name}: {len(headlines)} titres récupérés")
+        return _format_headlines(headlines)
+
+    except Exception as e:
+        logger.warning(f"[NEWS] {asset_name}: erreur RSS — {e}")
+        return ""
+
+
+def _format_headlines(headlines: list) -> str:
+    if not headlines:
+        return "Aucune news disponible."
+    return "\n".join(f"• {h}" for h in headlines)
+
+
 async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
                          funding: float, premium_pct: float,
                          existing_pos: dict | None, score: int = 60) -> dict:
@@ -3685,10 +3744,10 @@ async def ai_call_claude(asset_name: str, hl_price: float, tradfi_price: float,
     macro    = await ai_get_macro_context()
     macro_ctx = _format_macro_for_prompt(macro, cat)
 
-    news_query = AI_NEWS_QUERY.get(asset_name, f"{asset_name} price news today")
+    # News gratuites via Google News RSS (cache 15min)
+    news_headlines = await ai_fetch_news_rss(asset_name)
 
     prompt = f"""Tu es un arbitragiste spécialisé en convergence TradFi/DeFi (Hyperliquid HIP-3).
-Tu as accès à l'outil web_search. Utilise-le pour chercher les news récentes sur cet asset.
 
 ASSET: {asset_name} | Catégorie: {cat}
 Prix HL (perp):    ${hl_price:.4f}
@@ -3698,6 +3757,9 @@ Funding (par heure): {funding*100:.4f}%
 Score composite:   {score}/100
 {pos_context}{history_ctx}
 {macro_ctx}
+NEWS RÉCENTES ({asset_name}):
+{news_headlines}
+
 CONTEXTE:
 - Seuil normal pour cet asset: ±{thresh[0]*100:.1f}%
 - Score >= 75 = trade auto. Tu interviens car score ambigu ({score}).
@@ -3713,15 +3775,10 @@ Le premium HL peut être LÉGITIME (pas une anomalie à shorter) si les news ré
 Dans ces cas → WAIT obligatoire, le premium peut persister plusieurs jours.
 
 INSTRUCTIONS:
-1. Fais une recherche web: "{news_query}"
-2. Vérifie: y a-t-il un événement géopolitique/structurel qui JUSTIFIE ce premium?
-   → Si oui: WAIT (le premium est légitime, pas d'arbitrage possible)
-   → Si non (spike technique, sentiment, rumeur): continue l'analyse
-3. Pondère signal technique + macro + actualité et décide:
-   - SHORT si HL surcoté ET cause technique/sentiment (pas structurelle)
-   - LONG si HL sous-coté ET news neutres/haussières
-   - WAIT si événement géopolitique majeur, news contradictoires, ou volatilité extrême
-   - CLOSE si position ouverte avec signal inversé
+- SHORT si HL surcoté (premium > seuil) ET pas de raison structurelle connue
+- LONG si HL sous-coté ET signal haussier
+- WAIT si macro défavorable, volatilité extrême, ou incertitude élevée
+- CLOSE si position ouverte avec signal inversé
 
 Réponds UNIQUEMENT en JSON valide, sans markdown:
 {{"action": "long"|"short"|"close"|"wait", "confidence": 0-100, "reason": "< 100 chars"}}"""
@@ -3732,8 +3789,7 @@ Réponds UNIQUEMENT en JSON valide, sans markdown:
                 "https://api.anthropic.com/v1/messages",
                 json={
                     "model":      "claude-haiku-4-5-20251001",
-                    "max_tokens": 800,
-                    "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                    "max_tokens": 150,
                     "messages":   [{"role": "user", "content": prompt}],
                 },
                 headers={
@@ -4303,12 +4359,21 @@ async def ai_scan_loop(app) -> None:
 
                 if score >= AI_SCORE_AUTO_TRADE:
                     # Score élevé → direction claire, mais on valide via news + macro
-                    logger.info(f"IA {ticker}: score AUTO {score} → validation news/macro Claude")
-                    decision   = await ai_call_claude(
-                        cfg["name"], hl_price, tradfi_price,
-                        funding, premium_pct, None, score
-                    )
-                    claude_action = decision.get("action", "wait")
+                    # Cache 10min pour éviter appels répétitifs
+                    _cache     = ai_state["claude_cache"].get(ticker, {})
+                    _cache_age = (datetime.now() - _cache.get("time", datetime.min)).total_seconds()
+                    if _cache_age < 600 and _cache.get("decision"):
+                        decision      = _cache["decision"]
+                        claude_action = decision.get("action", "wait")
+                        logger.info(f"IA {ticker}: Claude cache ({int(_cache_age)}s) → {claude_action}")
+                    else:
+                        logger.info(f"IA {ticker}: score AUTO {score} → validation news/macro Claude")
+                        decision   = await ai_call_claude(
+                            cfg["name"], hl_price, tradfi_price,
+                            funding, premium_pct, None, score
+                        )
+                        ai_state["claude_cache"][ticker] = {"time": datetime.now(), "decision": decision}
+                        claude_action = decision.get("action", "wait")
                     confidence    = decision.get("confidence", score)
                     reason        = decision.get("reason", f"Score {score}/100 | premium {premium_pct:+.2f}%")
 
