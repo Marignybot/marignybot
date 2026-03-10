@@ -252,9 +252,9 @@ _XYZ_CACHE_TTL = 30  # secondes
 AI_BOT_NAME        = "ORACLE"   # nom du module IA HIP-3
 AI_MAX_POSITIONS   = 3        # 3 positions max simultanées
 AI_STOP_LOSS_PCT   = 0.04     # -4% stop dur (x10 levier → -40% marge max)
-AI_TAKE_PROFIT_PCT = 0.04     # +4% TP dur (si trailing pas déclenché)
+AI_TAKE_PROFIT_PCT = 0.07     # +7% TP dur (si trailing pas déclenché)
 AI_TRAIL_PCT_MIN   = 0.015    # trailing min 1.5% (cohérent avec stop/TP 4%)
-AI_TRAIL_PCT_MAX   = 0.07     # trailing max 7%
+AI_TRAIL_PCT_MAX   = 0.09     # trailing max 9%
 
 # Leviers par catégorie d'asset
 AI_LEVERAGE_MAP = {
@@ -1891,6 +1891,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   /ai\\_status — Positions + PnL en temps réel\n"
         "   /ai\\_close\\_all — Fermer toutes les positions IA\n"
         "   /ai\\_history — 10 derniers trades IA\n\n"
+        "💰 *NEO — Funding Rate Farming*\n"
+        "   /neo\\_start — Démarrer le farming (BTC•ETH•SOL•HYPE)\n"
+        "   /neo\\_stop — Arrêter le scan\n"
+        "   /neo\\_status — Positions + PnL + funding actuel\n"
+        "   /neo\\_close — Fermer toutes les positions NEO\n\n"
         "🔔 *Alertes*\n"
         "   /alertes — Activer les alertes auto\n"
         "   /desactiver\\_alertes — Stopper les alertes\n\n"
@@ -4777,18 +4782,18 @@ async def cmd_ai_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── Config Funding ────────────────────────────────────────────────────────────
-FUNDING_ASSETS        = ["BTC", "ETH", "SOL", "HYPE"]
-FUNDING_ENTRY_RATE    = 0.0004   # 0.04%/h minimum pour entrer (~35% APR)
-FUNDING_EXIT_RATE     = 0.0002   # 0.02%/h — en dessous on sort
-FUNDING_STOP_LOSS_PCT = 0.03     # -3% stop dur sur le prix
-FUNDING_NOTIONAL      = 100.0    # $100 notionnel par position
-FUNDING_LEVERAGE      = 5        # x5 leverage → marge $20 par position
-FUNDING_MAX_POSITIONS = 2        # max 2 positions simultanées
-FUNDING_SCAN_INTERVAL = 300      # scan toutes les 5 minutes
-FUNDING_NEGATIVE_EXIT = True     # sortir si funding devient négatif
+NEO_ASSETS        = ["BTC", "ETH", "SOL", "HYPE"]
+NEO_ENTRY_RATE    = 0.0004   # 0.04%/h minimum pour entrer (~35% APR)
+NEO_EXIT_RATE     = 0.0002   # 0.02%/h — en dessous on sort
+NEO_STOP_LOSS_PCT = 0.03     # -3% stop dur sur le prix
+NEO_NOTIONAL      = 100.0    # $100 notionnel par position
+NEO_LEVERAGE      = 5        # x5 leverage → marge $20 par position
+NEO_MAX_POSITIONS = 2        # max 2 positions simultanées
+NEO_SCAN_INTERVAL = 300      # scan toutes les 5 minutes
+NEO_NEGATIVE_EXIT = True     # sortir si funding devient négatif
 
 # ── État runtime Funding ──────────────────────────────────────────────────────
-funding_state: dict = {
+neo_state: dict = {
     "active":    False,
     "positions": {},   # {asset: {entry, side, notional, entry_time, funding_at_entry}}
     "task":      None,
@@ -4797,7 +4802,7 @@ funding_state: dict = {
 
 # ── Helpers Funding ───────────────────────────────────────────────────────────
 
-async def funding_get_rates() -> dict:
+async def neo_get_rates() -> dict:
     """Récupère les funding rates actuels pour tous les assets crypto HL."""
     try:
         async with aiohttp.ClientSession() as session:
@@ -4813,22 +4818,21 @@ async def funding_get_rates() -> dict:
         rates    = {}
         for i, asset_info in enumerate(universe):
             name = asset_info.get("name", "")
-            if name in FUNDING_ASSETS and i < len(ctxs):
+            if name in NEO_ASSETS and i < len(ctxs):
                 ctx = ctxs[i]
                 funding_hourly = float(ctx.get("funding", 0))
                 mark_px        = float(ctx.get("markPx", 0))
                 rates[name]    = {"funding": funding_hourly, "mark_px": mark_px}
         return rates
     except Exception as e:
-        logger.error(f"[FUNDING] funding_get_rates erreur: {e}")
+        logger.error(f"[NEO] neo_get_rates erreur: {e}")
         return {}
 
 
-async def funding_open_position(asset: str, mark_px: float, funding_rate: float) -> bool:
+async def neo_open_position(asset: str, mark_px: float, funding_rate: float) -> bool:
     """Ouvre un SHORT sur HYPERLIQUID_ADDRESS pour farmer le funding."""
     try:
-        exchange = funding_build_exchange()
-        size     = round(FUNDING_NOTIONAL / mark_px, 6)
+        size     = round(NEO_NOTIONAL / mark_px, 6)
 
         # Appliquer levier sur HYPERLIQUID_ADDRESS
         pk  = os.getenv("HL_PRIVATE_KEY", "")
@@ -4837,9 +4841,9 @@ async def funding_open_position(asset: str, mark_px: float, funding_rate: float)
         exchange = Exchange(wallet, hl_constants.MAINNET_API_URL,
                             account_address=HYPERLIQUID_ADDRESS)
         lev_result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: exchange.update_leverage(FUNDING_LEVERAGE, asset, is_cross=False)
+            None, lambda: exchange.update_leverage(NEO_LEVERAGE, asset, is_cross=False)
         )
-        logger.info(f"[FUNDING] Levier {asset} x{FUNDING_LEVERAGE}: {lev_result}")
+        logger.info(f"[NEO] Levier {asset} x{NEO_LEVERAGE}: {lev_result}")
 
         # Ordre market SHORT via IOC (même pattern que place_market_order)
         slippage  = 0.98   # SHORT → on accepte légèrement moins
@@ -4849,39 +4853,39 @@ async def funding_open_position(asset: str, mark_px: float, funding_rate: float)
         result = await asyncio.get_event_loop().run_in_executor(
             None, lambda: exchange.order(asset, False, sz, limit_px, {"limit": {"tif": "Ioc"}})
         )
-        logger.info(f"[FUNDING] Ordre SHORT {asset}: {result}")
+        logger.info(f"[NEO] Ordre SHORT {asset}: {result}")
         statuses = result.get("response", {}).get("data", {}).get("statuses", [])
         status = bool(statuses and ("filled" in statuses[0] or "resting" in statuses[0]))
         if status:
-            funding_state["positions"][asset] = {
+            neo_state["positions"][asset] = {
                 "entry":           mark_px,
                 "side":            "short",
-                "notional":        FUNDING_NOTIONAL,
+                "notional":        NEO_NOTIONAL,
                 "entry_time":      datetime.now().isoformat(),
                 "funding_at_entry": round(funding_rate * 100, 4),
             }
-            logger.info(f"[FUNDING] ✅ SHORT {asset} ouvert @ ${mark_px:.4f} | funding={funding_rate*100:.4f}%/h")
+            logger.info(f"[NEO] ✅ SHORT {asset} ouvert @ ${mark_px:.4f} | funding={funding_rate*100:.4f}%/h")
             return True
         else:
-            logger.error(f"[FUNDING] Échec ouverture {asset}: {result}")
+            logger.error(f"[NEO] Échec ouverture {asset}: {result}")
             return False
     except Exception as e:
-        logger.error(f"[FUNDING] funding_open_position {asset}: {e}")
+        logger.error(f"[NEO] neo_open_position {asset}: {e}")
         return False
 
 
-async def funding_close_position(asset: str, reason: str) -> bool:
+async def neo_close_position(asset: str, reason: str) -> bool:
     """Ferme la position SHORT sur un asset."""
     try:
-        pos    = funding_state["positions"].get(asset, {})
+        pos    = neo_state["positions"].get(asset, {})
         entry  = pos.get("entry", 0)
         # Récupérer le prix mark actuel
-        rates  = await funding_get_rates()
+        rates  = await neo_get_rates()
         mark   = rates.get(asset, {}).get("mark_px", entry)
         if mark <= 0:
             mark = entry
         rules  = get_size_rules(asset)
-        size   = max(round(FUNDING_NOTIONAL / max(entry, 0.0001), rules["decimals"]), rules["min"])
+        size   = max(round(NEO_NOTIONAL / max(entry, 0.0001), rules["decimals"]), rules["min"])
 
         # Fermeture SHORT = BUY avec slippage
         pk  = os.getenv("HL_PRIVATE_KEY", "")
@@ -4894,29 +4898,29 @@ async def funding_close_position(asset: str, reason: str) -> bool:
             None, lambda: exchange.order(asset, True, size, limit_px,
                                          {"limit": {"tif": "Ioc"}})
         )
-        logger.info(f"[FUNDING] Fermeture {asset}: {result}")
-        funding_state["positions"].pop(asset, None)
-        logger.info(f"[FUNDING] ✅ Fermé {asset} — {reason}")
+        logger.info(f"[NEO] Fermeture {asset}: {result}")
+        neo_state["positions"].pop(asset, None)
+        logger.info(f"[NEO] ✅ Fermé {asset} — {reason}")
         return True
     except Exception as e:
-        logger.error(f"[FUNDING] funding_close_position {asset}: {e}")
+        logger.error(f"[NEO] neo_close_position {asset}: {e}")
         return False
 
 
 # ── Scan loop Funding ─────────────────────────────────────────────────────────
 
-async def funding_scan_loop(app):
+async def neo_scan_loop(app):
     """Loop principale : scan funding rates, ouvre/ferme positions."""
-    logger.info("[FUNDING] 💰 Scan loop démarrée")
+    logger.info("[NEO] 💰 Scan loop démarrée")
 
-    while funding_state["active"]:
+    while neo_state["active"]:
         try:
-            rates = await funding_get_rates()
+            rates = await neo_get_rates()
             if not rates:
-                await asyncio.sleep(FUNDING_SCAN_INTERVAL)
+                await asyncio.sleep(NEO_SCAN_INTERVAL)
                 continue
 
-            open_positions = funding_state["positions"]
+            open_positions = neo_state["positions"]
             n_positions    = len(open_positions)
 
             # ── Vérifier positions ouvertes → sortir si nécessaire ───────────
@@ -4932,23 +4936,23 @@ async def funding_scan_loop(app):
                 should_close = False
                 close_reason = ""
 
-                if FUNDING_NEGATIVE_EXIT and funding < 0:
+                if NEO_NEGATIVE_EXIT and funding < 0:
                     should_close = True
                     close_reason = f"funding négatif ({funding*100:.4f}%/h)"
-                elif funding < FUNDING_EXIT_RATE:
+                elif funding < NEO_EXIT_RATE:
                     should_close = True
-                    close_reason = f"funding trop bas ({funding*100:.4f}%/h < {FUNDING_EXIT_RATE*100:.4f}%)"
-                elif pnl_pct < -FUNDING_STOP_LOSS_PCT:
+                    close_reason = f"funding trop bas ({funding*100:.4f}%/h < {NEO_EXIT_RATE*100:.4f}%)"
+                elif pnl_pct < -NEO_STOP_LOSS_PCT:
                     should_close = True
                     close_reason = f"stop-loss -3% (pnl={pnl_pct*100:.2f}%)"
 
                 if should_close:
-                    closed = await funding_close_position(asset, close_reason)
+                    closed = await neo_close_position(asset, close_reason)
                     if closed:
                         # Notification Telegram
                         pnl_str = f"{pnl_pct*100:+.2f}%"
                         msg = (
-                            f"💰 *FUNDING — Position fermée*\n"
+                            f"💰 *NEO — Position fermée*\n"
                             f"Asset: `{asset}` | PnL prix: {pnl_str}\n"
                             f"Raison: {close_reason}"
                         )
@@ -4959,31 +4963,31 @@ async def funding_scan_loop(app):
                     n_positions -= 1
 
             # ── Chercher nouvelles opportunités ──────────────────────────────
-            if n_positions < FUNDING_MAX_POSITIONS:
+            if n_positions < NEO_MAX_POSITIONS:
                 candidates = [
                     (asset, info)
                     for asset, info in rates.items()
-                    if asset not in funding_state["positions"]
-                    and info["funding"] >= FUNDING_ENTRY_RATE
+                    if asset not in neo_state["positions"]
+                    and info["funding"] >= NEO_ENTRY_RATE
                     and info["mark_px"] > 0
                 ]
                 # Trier par funding décroissant
                 candidates.sort(key=lambda x: x[1]["funding"], reverse=True)
 
                 for asset, info in candidates:
-                    if len(funding_state["positions"]) >= FUNDING_MAX_POSITIONS:
+                    if len(neo_state["positions"]) >= NEO_MAX_POSITIONS:
                         break
                     funding_r = info["funding"]
                     mark_px   = info["mark_px"]
-                    logger.info(f"[FUNDING] 🎯 {asset} funding={funding_r*100:.4f}%/h → ouverture SHORT")
+                    logger.info(f"[NEO] 🎯 {asset} funding={funding_r*100:.4f}%/h → ouverture SHORT")
 
-                    opened = await funding_open_position(asset, mark_px, funding_r)
+                    opened = await neo_open_position(asset, mark_px, funding_r)
                     if opened:
                         apr_est = funding_r * 24 * 365 * 100
                         msg = (
-                            f"💰 *FUNDING — Position ouverte*\n"
-                            f"Asset:   `{asset}` SHORT x{FUNDING_LEVERAGE}\n"
-                            f"Notionnel: ${FUNDING_NOTIONAL:.0f} | Marge: ${FUNDING_NOTIONAL/FUNDING_LEVERAGE:.0f}\n"
+                            f"💰 *NEO — Position ouverte*\n"
+                            f"Asset:   `{asset}` SHORT x{NEO_LEVERAGE}\n"
+                            f"Notionnel: ${NEO_NOTIONAL:.0f} | Marge: ${NEO_NOTIONAL/NEO_LEVERAGE:.0f}\n"
                             f"Entrée:  ${mark_px:.4f}\n"
                             f"Funding: {funding_r*100:.4f}%/h (~{apr_est:.0f}% APR estimé)\n"
                             f"Stop:    -3% prix | Sortie: funding < 0.02%/h"
@@ -4996,73 +5000,73 @@ async def funding_scan_loop(app):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[FUNDING] scan_loop erreur: {e}")
+            logger.error(f"[NEO] scan_loop erreur: {e}")
 
-        await asyncio.sleep(FUNDING_SCAN_INTERVAL)
+        await asyncio.sleep(NEO_SCAN_INTERVAL)
 
-    logger.info("[FUNDING] Scan loop arrêtée")
+    logger.info("[NEO] Scan loop arrêtée")
 
 
 # ── Commandes Telegram Funding ────────────────────────────────────────────────
 
-async def cmd_funding_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_neo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    if funding_state["active"]:
-        await update.message.reply_text("💰 FUNDING déjà actif.")
+    if neo_state["active"]:
+        await update.message.reply_text("💰 NEO déjà actif.")
         return
 
-    funding_state["active"] = True
+    neo_state["active"] = True
     app = context.application
-    task = asyncio.create_task(funding_scan_loop(app))
-    funding_state["task"] = task
+    task = asyncio.create_task(neo_scan_loop(app))
+    neo_state["task"] = task
 
-    assets_str = " • ".join(FUNDING_ASSETS)
+    assets_str = " • ".join(NEO_ASSETS)
     msg = (
-        f"💰 *FUNDING FARMING démarré*\n"
+        f"💰 *NEO — Funding Farming démarré*\n"
         f"Wallet: `{HYPERLIQUID_ADDRESS[:10]}...` (master)\n"
         f"Assets: {assets_str}\n"
-        f"Seuil entrée: >{FUNDING_ENTRY_RATE*100:.2f}%/h | Sortie: <{FUNDING_EXIT_RATE*100:.2f}%/h\n"
-        f"Notionnel: ${FUNDING_NOTIONAL:.0f} | Levier: x{FUNDING_LEVERAGE} | Max: {FUNDING_MAX_POSITIONS} positions\n"
-        f"Stop-loss: -3% prix | Scan: toutes les {FUNDING_SCAN_INTERVAL//60}min"
+        f"Seuil entrée: >{NEO_ENTRY_RATE*100:.2f}%/h | Sortie: <{NEO_EXIT_RATE*100:.2f}%/h\n"
+        f"Notionnel: ${NEO_NOTIONAL:.0f} | Levier: x{NEO_LEVERAGE} | Max: {NEO_MAX_POSITIONS} positions\n"
+        f"Stop-loss: -3% prix | Scan: toutes les {NEO_SCAN_INTERVAL//60}min"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_funding_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_neo_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    if not funding_state["active"]:
-        await update.message.reply_text("💰 FUNDING déjà inactif.")
+    if not neo_state["active"]:
+        await update.message.reply_text("💰 NEO déjà inactif.")
         return
 
-    funding_state["active"] = False
-    if funding_state["task"]:
-        funding_state["task"].cancel()
-        funding_state["task"] = None
+    neo_state["active"] = False
+    if neo_state["task"]:
+        neo_state["task"].cancel()
+        neo_state["task"] = None
 
-    n = len(funding_state["positions"])
+    n = len(neo_state["positions"])
     await update.message.reply_text(
-        f"💰 FUNDING arrêté.\n"
-        f"{'⚠️ ' + str(n) + ' position(s) encore ouvertes — utilise /funding_close pour tout fermer.' if n else 'Aucune position ouverte.'}"
+        f"💰 NEO arrêté.\n"
+        f"{'⚠️ ' + str(n) + ' position(s) encore ouvertes — utilise /neo_close pour tout fermer.' if n else 'Aucune position ouverte.'}"
     )
 
 
-async def cmd_funding_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_neo_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
-    status = "🟢 ACTIF" if funding_state["active"] else "⏸ INACTIF"
-    positions = funding_state["positions"]
+    status = "🟢 ACTIF" if neo_state["active"] else "⏸ INACTIF"
+    positions = neo_state["positions"]
 
-    lines = [f"💰 *FUNDING FARMING — {status}*"]
-    lines.append(f"Max positions: {FUNDING_MAX_POSITIONS} | Seuil: >{FUNDING_ENTRY_RATE*100:.2f}%/h")
+    lines = [f"💰 *NEO — Funding Farming — {status}*"]
+    lines.append(f"Max positions: {NEO_MAX_POSITIONS} | Seuil: >{NEO_ENTRY_RATE*100:.2f}%/h")
 
     if positions:
-        lines.append(f"\n*Positions ouvertes ({len(positions)}/{FUNDING_MAX_POSITIONS}):*")
+        lines.append(f"\n*Positions ouvertes ({len(positions)}/{NEO_MAX_POSITIONS}):*")
         # Récupérer les rates actuels pour afficher PnL
         try:
-            rates = await funding_get_rates()
+            rates = await neo_get_rates()
         except Exception:
             rates = {}
 
@@ -5083,12 +5087,12 @@ async def cmd_funding_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_funding_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_neo_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ferme toutes les positions funding manuellement."""
     if not is_authorized(update):
         return
 
-    positions = list(funding_state["positions"].keys())
+    positions = list(neo_state["positions"].keys())
     if not positions:
         await update.message.reply_text("💰 Aucune position funding à fermer.")
         return
@@ -5096,7 +5100,7 @@ async def cmd_funding_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💰 Fermeture de {len(positions)} position(s)...")
     closed = 0
     for asset in positions:
-        ok = await funding_close_position(asset, "fermeture manuelle")
+        ok = await neo_close_position(asset, "fermeture manuelle")
         if ok:
             closed += 1
 
@@ -5150,11 +5154,11 @@ def main():
     app.add_handler(CommandHandler("target_stop",   cmd_target_stop))
     app.add_handler(CommandHandler("target_status", cmd_target_status))
 
-    # Module FUNDING FARMING
-    app.add_handler(CommandHandler("funding_start",  cmd_funding_start))
-    app.add_handler(CommandHandler("funding_stop",   cmd_funding_stop))
-    app.add_handler(CommandHandler("funding_status", cmd_funding_status))
-    app.add_handler(CommandHandler("funding_close",  cmd_funding_close))
+    # Module NEO — Funding Farming
+    app.add_handler(CommandHandler("neo_start",  cmd_neo_start))
+    app.add_handler(CommandHandler("neo_stop",   cmd_neo_stop))
+    app.add_handler(CommandHandler("neo_status", cmd_neo_status))
+    app.add_handler(CommandHandler("neo_close",  cmd_neo_close))
 
     # Module IA HIP-3
     app.add_handler(CommandHandler("ai_start",     cmd_ai_start))
