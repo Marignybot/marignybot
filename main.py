@@ -2795,8 +2795,9 @@ async def ai_sync_positions_from_hl() -> int:
     if not _HL_SDK_AVAILABLE:
         return 0
     try:
+        from hyperliquid.info import Info as HLInfo
         info = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: HLInfo(MAINNET_API_URL, skip_ws=True, perp_dexs=["xyz"])
+            None, lambda: HLInfo(hl_constants.MAINNET_API_URL, skip_ws=True, perp_dexs=["xyz"])
         )
         state_data = await asyncio.get_event_loop().run_in_executor(
             None, lambda: info.user_state(HYPERLIQUID_ADDRESS)
@@ -2873,32 +2874,40 @@ async def ai_sync_positions_from_hl() -> int:
                 if pnl_pct >= tp_threshold:
                     tp_hit.append(tp_threshold)
 
-            # ── entry_time : on cherche le vrai timestamp dans les fills ─────
+            # ── entry_time : on cherche le vrai timestamp via l'API REST fills ──
             entry_time_iso = None
             try:
-                fills = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: info.user_fills_by_time(
-                        HYPERLIQUID_ADDRESS,
-                        start_time=int((datetime.now(timezone.utc) - timedelta(hours=72)).timestamp() * 1000)
-                    )
-                )
-                # Cherche le dernier fill d'ouverture sur cet asset dans le bon sens
-                open_dir = "B" if side == "long" else "A"  # B=buy, A=sell (pour open)
-                for fill in sorted(fills, key=lambda x: x.get("time", 0), reverse=True):
-                    fill_coin = fill.get("coin", "").split(":")[-1]
-                    if fill_coin != ticker:
-                        continue
-                    if fill.get("dir", "") and open_dir in fill.get("dir", ""):
-                        fill_ts_ms = fill.get("time", 0)
-                        if fill_ts_ms:
-                            entry_time_iso = datetime.fromtimestamp(
-                                fill_ts_ms / 1000, tz=timezone.utc
-                            ).isoformat()
-                            logger.info(f"🔄 entry_time réel récupéré pour {asset}: {entry_time_iso}")
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        HYPERLIQUID_API_UI,
+                        json={"type": "userFills", "user": HYPERLIQUID_ADDRESS},
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        fills = await resp.json() if resp.status == 200 else []
+
+                if isinstance(fills, list):
+                    # Cherche le dernier fill d'ouverture sur cet asset
+                    # dir: "Open Long" / "Open Short" / "Close Long" / "Close Short"
+                    open_kw = "Open Long" if side == "long" else "Open Short"
+                    # Filtrer sur les 72h max
+                    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=72)).timestamp() * 1000)
+                    for fill in sorted(fills, key=lambda x: x.get("time", 0), reverse=True):
+                        if fill.get("time", 0) < cutoff_ms:
                             break
+                        fill_coin = fill.get("coin", "").split(":")[-1]
+                        if fill_coin != ticker:
+                            continue
+                        if open_kw in fill.get("dir", ""):
+                            fill_ts_ms = fill.get("time", 0)
+                            if fill_ts_ms:
+                                entry_time_iso = datetime.fromtimestamp(
+                                    fill_ts_ms / 1000, tz=timezone.utc
+                                ).isoformat()
+                                logger.info(f"🔄 entry_time réel pour {asset}: {entry_time_iso}")
+                                break
             except Exception as ef:
                 logger.debug(f"fills lookup failed for {asset}: {ef}")
-            # Fallback si fills indisponibles : on part de now-1h (conservateur)
+            # Fallback si fills indisponibles : now - 1h (conservateur pour timeout 48h)
             if not entry_time_iso:
                 entry_time_iso = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
                 logger.debug(f"entry_time fallback -1h pour {asset}")
